@@ -534,11 +534,58 @@ fn resolve_one(snap: &StaticSnap, path: &str) -> StaticHit {
     }
 }
 
+/// 静态文件内存缓存：小文件整体驻留内存，命中后零磁盘读。
+/// 以 (mtime, size) 做失效校验（仍在 spawn_blocking 内 stat，代价远小于 read）。
+const FILE_CACHE_MAX_FILE: u64 = 1024 * 1024; // 单文件上限 1MB
+const FILE_CACHE_MAX_ENTRIES: usize = 512; // 缓存条目上限
+
+type FileCacheInner = HashMap<
+    std::path::PathBuf,
+    (u64, u64, std::sync::Arc<Vec<u8>>), // (mtime_secs, size, body)
+>;
+static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<FileCacheInner>> =
+    std::sync::OnceLock::new();
+
+fn file_cache() -> &'static std::sync::RwLock<FileCacheInner> {
+    FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
 fn file_hit(path: &std::path::Path, code: u16) -> StaticHit {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return StaticHit::NotFound;
+    };
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if size <= FILE_CACHE_MAX_FILE {
+        if let Some((m, sz, body)) = file_cache().read().unwrap().get(path) {
+            if *m == mtime && *sz == size {
+                return StaticHit::File {
+                    code,
+                    mime: mime_of(path).to_string(),
+                    body: (**body).clone(),
+                };
+            }
+        }
+    }
+
+    let body = std::fs::read(path).unwrap_or_default();
+    if size <= FILE_CACHE_MAX_FILE {
+        let mut cache = file_cache().write().unwrap();
+        if cache.len() >= FILE_CACHE_MAX_ENTRIES {
+            cache.clear(); // 简单淘汰：满即清空，热文件下一轮自动回填
+        }
+        cache.insert(path.to_path_buf(), (mtime, size, std::sync::Arc::new(body.clone())));
+    }
     StaticHit::File {
         code,
         mime: mime_of(path).to_string(),
-        body: std::fs::read(path).unwrap_or_default(),
+        body,
     }
 }
 
