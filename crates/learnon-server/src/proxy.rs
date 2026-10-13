@@ -102,11 +102,21 @@ impl ProxyEngine {
         };
         // upstream 负载均衡：guard 存活期间连接计数 +1，并用于健康检查上报
         let mut guard_holder: Option<UpstreamGuard> = None;
+        let mut tried: Vec<usize> = Vec::new();
+        let mut max_attempts = 2;
         let backend = if let Some(up) = self.pool.get(&host_part) {
-            let g = up.acquire(&ctx.remote_addr);
-            let addr = (*g).clone();
-            guard_holder = Some(g);
-            addr
+            max_attempts = up.server_count().max(1).min(8);
+            match up.acquire(&ctx.remote_addr, &tried) {
+                Some(g) => {
+                    tried.push(g.idx());
+                    let addr = (*g).clone();
+                    guard_holder = Some(g);
+                    addr
+                }
+                // 对齐 nginx：全组没有可选节点时是 502 + "no live upstreams"，
+                // 不是把请求硬塞给已经摘除的节点
+                None => return Err(format!("no live upstreams: {host_part}")),
+            }
         } else {
             host_part.clone()
         };
@@ -188,12 +198,18 @@ impl ProxyEngine {
 
         let mut backend = backend;
         let mut last_err = String::new();
-        for attempt in 0..2 {
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 if let Some(up) = self.pool.get(&host_part) {
-                    let g = up.acquire(&ctx.remote_addr);
-                    backend = (*g).clone();
-                    guard_holder = Some(g);
+                    match up.acquire(&ctx.remote_addr, &tried) {
+                        Some(g) => {
+                            tried.push(g.idx());
+                            backend = (*g).clone();
+                            guard_holder = Some(g);
+                        }
+                        // 可选节点已经都试过一轮，不再继续换
+                        None => break,
+                    }
                 }
                 log_warn!("upstream {host_part} 换节点重试: {backend}");
             }
@@ -219,7 +235,7 @@ impl ProxyEngine {
                 Ok(Err(e)) => {
                     note(&guard_holder, false);
                     last_err = format!("代理请求失败 {backend}: {e} | 根因: {}", error_root(&e));
-                    if idempotent && on_error && attempt == 0 {
+                    if idempotent && on_error && attempt + 1 < max_attempts {
                         continue;
                     }
                     return Err(last_err);
@@ -227,7 +243,7 @@ impl ProxyEngine {
                 Err(_) => {
                     note(&guard_holder, false);
                     last_err = format!("proxy_read_timeout ({:?}) 超时: {backend}", opts.timeouts.read);
-                    if idempotent && on_timeout && attempt == 0 {
+                    if idempotent && on_timeout && attempt + 1 < max_attempts {
                         continue;
                     }
                     return Err(last_err);

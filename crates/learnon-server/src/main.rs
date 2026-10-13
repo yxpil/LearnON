@@ -305,6 +305,9 @@ async fn run(
         })
     };
 
+    // 主动健康检查：配了 health_check 的 upstream 各起一个后台探测任务
+    let health = pool.spawn_health_checks(rx.clone());
+
     let signals = spawn_signal_handlers(tx.clone());
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -333,6 +336,9 @@ async fn run(
     // 所有 accept 循环在停机信号后置位并排空在途连接，这里等它们自然结束
     while tasks.join_next().await.is_some() {}
     maintain.abort();
+    for h in health {
+        h.abort();
+    }
     if let Some(s) = signals {
         s.abort();
     }
