@@ -1,0 +1,32 @@
+[package]
+name = "learnon-server"
+description = "LearnON: a gateway server like Nginx, 100% in Rust (reverse proxy, load balancing, rewrite, virtual hosts)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "learnon"
+path = "src/main.rs"
+
+# 自签名证书签发工具：cargo run --bin lon-gencert -- cert.pem key.pem
+[[bin]]
+name = "lon-gencert"
+path = "src/gencert.rs"
+
+[dependencies]
+learnon-config = { path = "../learnon-config" }
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+regex.workspace = true
+chrono.workspace = true
+mlua.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true

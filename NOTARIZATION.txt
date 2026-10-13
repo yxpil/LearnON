@@ -1,0 +1,29 @@
+LearnON 仓库时间戳公证（OpenTimestamps）
+=============================================
+
+公证对象
+  GitHub 仓库   : https://github.com/yxpil/LearnON
+  Commit SHA-1 : bd2059e049a078c54b2df8ecb2e3491e4bb4d61c
+  摘要 (sha256(commit id)) : 969d22186808850fe8a018e8ca97c806277b1efad375679081fe67e2c54c53eb
+
+回执文件（.ots，OpenTimestamps 标准格式）
+  commit-a.ots             <- https://a.pool.opentimestamps.org
+  commit-b.ots             <- https://b.pool.opentimestamps.org
+  commit-ots.ots           <- https://ots.btc.catallaxy.com
+  commit-eternitywall.ots  <- https://a.pool.eternitywall.com
+
+含义
+  以上 4 个独立日历服务器已在各自响应中签下"看到该摘要"的时间证明，
+  回执约数小时至数日内被聚合写入比特币区块链（区块头锚定），
+  此后时间点将获得去中心化、不可篡改的公证——任何人都可独立验证，
+  不依赖 GitHub、不依赖任何签名者在线。
+
+验证方法
+  1) 计算 commit id 的 sha256，应等于上述摘要；
+  2) 用官方客户端校验回执：ots verify commit-a.ots
+     （或浏览器上传 .ots 至 https://opentimestamps.org/verify/）
+  3) 完全落链后（upgrade：ots upgrade commit-a.ots）会显示 Bitcoin block height。
+
+时间
+  本地公证发起时间：2026-10-13T20:57+08:00（UTC+8）
+  GitHub 首次提交可追溯至本仓库首个 commit 的服务器时间戳。

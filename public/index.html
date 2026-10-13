@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>LearnON Gateway - OpenResty in Rust</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; color: #222; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+    h1 { border-bottom: 2px solid #eee; padding-bottom: 8px; }
+    li { margin: 6px 0; }
+    table { border-collapse: collapse; } td, th { border: 1px solid #ddd; padding: 4px 10px; }
+    .logo-band { background: #000; border-radius: 12px; padding: 4px 0; text-align: center; margin-bottom: 18px; }
+    .logo-band img { height: 72px; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div class="logo-band"><img src="/static/logo.png" alt="LearnON"></div>
+  <h1>LearnON 网关正在运行 🦀</h1>
+  <p>Rust 从零实现的 Nginx/OpenResty 风格网关：反代 + 负载均衡 + 健康检查 + rewrite + Lua/Rust 脚本层 + 共享字典。</p>
+  <table>
+    <tr><th>路由</th><th>功能</th></tr>
+    <tr><td><a href="/hello"><code>GET /hello</code></a></td><td>content_by_lua 内联脚本</td></tr>
+    <tr><td><a href="/api/time"><code>GET /api/time</code></a></td><td>rewrite_by_lua_file + content_by_lua_file + ngx.sleep 异步</td></tr>
+    <tr><td><a href="/api/protected"><code>GET /api/protected</code></a></td><td>access_by_lua 鉴权（header: x-token: secret123）</td></tr>
+    <tr><td><a href="/proxy/ping"><code>GET /proxy/*</code></a></td><td>proxy_pass 反代 + upstream 负载均衡 + 被动健康检查</td></tr>
+    <tr><td><a href="/count"><code>GET /count</code></a></td><td>ngx.shared.DICT 共享字典原子计数（跨请求）</td></tr>
+    <tr><td><a href="/go"><code>GET /go</code></a></td><td>ngx.redirect 302 外部重定向</td></tr>
+    <tr><td><a href="/inner"><code>GET /inner</code></a></td><td>ngx.exec 内部重定向（客户端无感跳到 /hello）</td></tr>
+    <tr><td><a href="/api/tools"><code>GET /api/tools</code></a></td><td>ngx.re 正则 / escape_uri 编解码 / 请求体读取</td></tr>
+    <tr><td><a href="/old/thing"><code>GET /old/thing</code></a></td><td>rewrite last -> /new/thing</td></tr>
+    <tr><td><a href="/health"><code>GET /health</code></a></td><td>return 200</td></tr>
+    <tr><td><a href="/jump"><code>GET /jump</code></a></td><td>return 301 外部重定向</td></tr>
+    <tr><td><a href="/user/42"><code>GET /user/42</code></a></td><td>正则 location ~ ^/user/(\d+)$</td></tr>
+    <tr><td><a href="/api/info"><code>GET /api/info</code></a></td><td>content_by_rust 原生模块</td></tr>
+    <tr><td><a href="/static/"><code>GET /static/</code></a></td><td>静态文件（本页）</td></tr>
+  </table>
+</body>
+</html>
