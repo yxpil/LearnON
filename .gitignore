@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 本地生成的测试证书（用 lon-gencert 重新生成）
+/certs/
+
+# 运行日志
+/logs/
+*.log
+
+# 临时脚本与输出
+_*.py
+_*.txt
+*.out
+
+# 系统文件
+Thumbs.db
+.DS_Store
