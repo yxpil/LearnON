@@ -356,7 +356,13 @@ fn error_response(
         if let Some(base) = base {
             let file = base.join(t.trim_start_matches('/'));
             if file.is_file() {
-                return file_response(&file, code);
+                let body = std::fs::read(&file).unwrap_or_default();
+                return Response::builder()
+                    .status(StatusCode::from_u16(code).unwrap_or(StatusCode::OK))
+                    .header("content-type", mime_of(&file))
+                    .header("server", SERVER_HEADER)
+                    .body(full_body(body))
+                    .unwrap();
             }
         }
     }
@@ -372,101 +378,172 @@ async fn serve_static_flow(
     server: &Server,
     loc: &Location,
 ) -> BoxResponse {
-    // try_files：逐一探测，最后一个参数为内部重定向兜底
-    if let Some(tf) = loc.try_files.clone() {
-        for cand in &tf[..tf.len() - 1] {
-            let p = cand.replace("$uri", ctx.effective_path());
-            match resolve_static(ctx, server, loc, &p) {
-                StaticHit::File(resp) => return resp,
-                StaticHit::None | StaticHit::Forbidden => continue,
-            }
-        }
-        let last = tf
-            .last()
-            .map(|s| s.replace("$uri", ctx.effective_path()))
-            .unwrap_or_default();
-        if last.starts_with('/') && ctx.exec_depth < 10 {
-            ctx.rewritten_path = Some(last);
-            ctx.exec_depth += 1;
-            let r = Box::pin(process(state, ctx, port, body)).await;
-            return match r {
-                Ok(resp) => resp,
-                Err(e) => match e {},
-            };
-        }
+    // 收集快照（无阻塞），文件系统调用全部放入阻塞线程池：
+    // 高负载下不再卡住 tokio worker 线程（性能分析结论）
+    let Some(snap) = static_snapshot(ctx, server, loc) else {
         return error_response(ctx, server, Some(loc), 404);
-    }
-    let path = ctx.effective_path().to_string();
-    match resolve_static(ctx, server, loc, &path) {
-        StaticHit::File(resp) => resp,
-        StaticHit::None => error_response(ctx, server, Some(loc), 404),
+    };
+    let hit = tokio::task::spawn_blocking(move || resolve_snap(&snap))
+        .await
+        .unwrap_or(StaticHit::NotFound);
+    match hit {
+        StaticHit::File { code, mime, body: content } => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+            Response::builder()
+                .status(status)
+                .header("content-type", mime)
+                .header("server", SERVER_HEADER)
+                .body(full_body(content))
+                .unwrap()
+        }
+        StaticHit::Redirect(target) => redirect_response(301, &target),
+        StaticHit::InternalRedirect(last) => {
+            if ctx.exec_depth < 10 {
+                ctx.rewritten_path = Some(last);
+                ctx.exec_depth += 1;
+                let r = Box::pin(process(state, ctx, port, body)).await;
+                return match r {
+                    Ok(resp) => resp,
+                    Err(e) => match e {},
+                };
+            }
+            error_response(ctx, server, Some(loc), 404)
+        }
+        StaticHit::NotFound => error_response(ctx, server, Some(loc), 404),
         StaticHit::Forbidden => error_response(ctx, server, Some(loc), 403),
     }
 }
 
+/// 静态解析结果（文件内容已读出，构建响应不再碰文件系统）
 enum StaticHit {
-    File(BoxResponse),
-    None,
+    File { code: u16, mime: String, body: Vec<u8> },
+    /// 目录存在但 URI 缺斜杠：301
+    Redirect(String),
+    /// try_files 兜底：内部重定向目标
+    InternalRedirect(String),
+    NotFound,
     Forbidden,
 }
 
-/// 静态文件/目录解析（nginx 语义）：alias 剥离 location 前缀，root 追加完整 URI
-fn resolve_static(ctx: &RequestCtx, server: &Server, loc: &Location, path: &str) -> StaticHit {
-    let (base, rel) = if let Some(alias) = &loc.alias {
-        let rel = path.strip_prefix(&loc.pattern).unwrap_or(path);
-        (alias.clone(), rel.trim_start_matches('/').to_string())
+/// 静态解析快照：把 ctx/server/location 的相关数据抽成 owned 结构，
+/// 便于整体丢进 spawn_blocking（阻塞分析：文件系统调用不能留在 worker 上）
+struct StaticSnap {
+    base: std::path::PathBuf,
+    is_alias: bool,
+    pattern: String,
+    path: String,
+    query: String,
+    index: Vec<String>,
+    autoindex: bool,
+    try_files: Option<Vec<String>>,
+}
+
+fn static_snapshot(ctx: &RequestCtx, server: &Server, loc: &Location) -> Option<StaticSnap> {
+    let (base, is_alias) = if let Some(alias) = &loc.alias {
+        (alias.clone(), true)
     } else if let Some(root) = loc.root.as_ref().or(server.root.as_ref()) {
-        (root.clone(), path.trim_start_matches('/').to_string())
+        (root.clone(), false)
     } else {
-        return StaticHit::None;
+        return None;
     };
+    Some(StaticSnap {
+        base,
+        is_alias,
+        pattern: loc.pattern.clone(),
+        path: ctx.effective_path().to_string(),
+        query: ctx.query.clone(),
+        index: loc.index.clone().unwrap_or_else(|| server.index.clone()),
+        autoindex: loc.autoindex || server.autoindex,
+        try_files: loc.try_files.clone(),
+    })
+}
+
+impl StaticSnap {
+    /// nginx 语义：alias 剥 location 前缀，root 追加完整 URI
+    fn base_rel(&self, path: &str) -> (std::path::PathBuf, String) {
+        if self.is_alias {
+            let rel = path.strip_prefix(&self.pattern).unwrap_or(path);
+            (self.base.clone(), rel.trim_start_matches('/').to_string())
+        } else {
+            (self.base.clone(), path.trim_start_matches('/').to_string())
+        }
+    }
+}
+
+/// 完整静态解析（含 try_files），运行在阻塞线程池中
+fn resolve_snap(snap: &StaticSnap) -> StaticHit {
+    // try_files：逐一探测，最后一个参数为内部重定向兜底
+    if let Some(tf) = &snap.try_files {
+        for cand in &tf[..tf.len() - 1] {
+            let p = cand.replace("$uri", &snap.path);
+            match resolve_one(snap, &p) {
+                StaticHit::NotFound | StaticHit::Forbidden => continue,
+                h => return h,
+            }
+        }
+        let last = tf
+            .last()
+            .map(|s| s.replace("$uri", &snap.path))
+            .unwrap_or_default();
+        return if last.starts_with('/') {
+            StaticHit::InternalRedirect(last)
+        } else {
+            StaticHit::NotFound
+        };
+    }
+    resolve_one(snap, &snap.path)
+}
+
+fn resolve_one(snap: &StaticSnap, path: &str) -> StaticHit {
+    let (base, rel) = snap.base_rel(path);
     let file_path = base.join(&rel);
     if rel.is_empty() || file_path.is_dir() {
         // 目录存在但 URI 不带斜杠：301 补斜杠（nginx 行为）
         if !path.ends_with('/') {
-            let q = if ctx.query.is_empty() {
+            let q = if snap.query.is_empty() {
                 String::new()
             } else {
-                format!("?{}", ctx.query)
+                format!("?{}", snap.query)
             };
-            return StaticHit::File(redirect_response(301, &format!("{path}/{q}")));
+            return StaticHit::Redirect(format!("{path}/{q}"));
         }
-        // index 指令逐个探测（location 级优先，继承 server 级，默认 index.html）
-        let index_names = loc.index.as_ref().unwrap_or(&server.index);
-        for name in index_names {
+        // index 指令逐个探测
+        for name in &snap.index {
             let cand = file_path.join(name);
             if cand.is_file() {
-                return StaticHit::File(file_response(&cand, 200));
+                return file_hit(&cand, 200);
             }
         }
         // autoindex on：目录列表
-        if loc.autoindex || server.autoindex {
-            if let Some(resp) = autoindex_response(&file_path, path) {
-                return StaticHit::File(resp);
+        if snap.autoindex {
+            if let Some(html) = autoindex_html(&file_path, path) {
+                return StaticHit::File {
+                    code: 200,
+                    mime: "text/html; charset=utf-8".to_string(),
+                    body: html.into_bytes(),
+                };
             }
         }
         // nginx：无 index 命中且 autoindex off → 403
         return StaticHit::Forbidden;
     }
     if file_path.is_file() {
-        StaticHit::File(file_response(&file_path, 200))
+        file_hit(&file_path, 200)
     } else {
-        StaticHit::None
+        StaticHit::NotFound
     }
 }
 
-fn file_response(path: &std::path::Path, code: u16) -> BoxResponse {
-    let content = std::fs::read(path).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::from_u16(code).unwrap_or(StatusCode::OK))
-        .header("content-type", mime_of(path))
-        .header("server", SERVER_HEADER)
-        .body(full_body(content))
-        .unwrap()
+fn file_hit(path: &std::path::Path, code: u16) -> StaticHit {
+    StaticHit::File {
+        code,
+        mime: mime_of(path).to_string(),
+        body: std::fs::read(path).unwrap_or_default(),
+    }
 }
 
 /// autoindex：nginx 风格目录列表页
-fn autoindex_response(dir: &std::path::Path, uri: &str) -> Option<BoxResponse> {
+fn autoindex_html(dir: &std::path::Path, uri: &str) -> Option<String> {
     let mut entries: Vec<String> = Vec::new();
     for e in std::fs::read_dir(dir).ok()? {
         let Ok(e) = e else { continue };
@@ -474,18 +551,10 @@ fn autoindex_response(dir: &std::path::Path, uri: &str) -> Option<BoxResponse> {
         let slash = if e.path().is_dir() { "/" } else { "" };
         entries.push(format!("<a href=\"{name}{slash}\">{name}{slash}</a>"));
     }
-    let body = format!(
+    Some(format!(
         "<html>\r\n<head><title>Index of {uri}</title></head>\r\n<body>\r\n<h1>Index of {uri}</h1><hr><pre>../\r\n{}</pre><hr><center>LearnON</center>\r\n</body>\r\n</html>\r\n",
         entries.join("\r\n")
-    );
-    Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/html; charset=utf-8")
-            .header("server", SERVER_HEADER)
-            .body(full_body(body))
-            .unwrap(),
-    )
+    ))
 }
 
 fn convert_upstream_response(

@@ -9,6 +9,16 @@
 用 **Rust 从零实现**的 Nginx / OpenResty 风格网关服务器：反向代理、负载均衡（含被动健康检查）、rewrite、
 虚拟主机、内嵌 Lua 5.4 脚本层（`ngx.*` API）+ Rust 原生模块。除 tokio/hyper 等基础库外，网关逻辑全部手写。
 
+
+## 阻塞分析与静态路径优化（spawn_blocking + 文件缓存）
+
+- **Lua 脚本文件缓存**：`LuaSource::File` 每请求同步读盘（`fs::read_to_string`）曾是最大阻塞点之一，
+  现改为 `OnceLock<RwLock<HashMap<PathBuf, Arc<str>>>>` 进程级缓存，文件只在首次请求时读取一次。
+- **静态 IO 移出 worker**：静态服务的全部文件系统调用（resolve / index / autoindex / 读文件）
+  通过 owned 快照整体丢进 `tokio::task::spawn_blocking`，tokio worker 线程不再被磁盘阻塞。
+- **error_page 目标文件**同样一次性读出构建响应，错误页热路径不再有额外同步 IO 往返。
+- 实测（32 并发 keep-alive）：静态 4880 → 6715 req/s（+38%），Lua 7867 → 9044 req/s（+15%）。
+
 ## 多核架构
 
 - **tokio 多线程运行时**：worker 线程数 = CPU 逻辑核心数

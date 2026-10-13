@@ -8,6 +8,7 @@
 //! - 请求状态放在 `Arc<Mutex<RequestCtx>>`，脚本通过 userdata 句柄读写，
 //!   阶段结束后由 Rust 侧继续接管同一个 ctx
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,21 +26,38 @@ use crate::{resolve_path, AppError};
 #[derive(Clone)]
 struct CtxHandle(Arc<Mutex<RequestCtx>>);
 
+
 impl LuaUserData for CtxHandle {}
 
 /// 阶段脚本来源：内联代码（content_by_lua "code"）或文件（content_by_lua_file "path"）
 #[derive(Debug, Clone)]
 pub enum LuaSource {
-    Inline(String),
+    Inline(Arc<str>),
     File(PathBuf),
 }
 
+/// Lua 脚本文件全局缓存：文件内容只在首次请求时读盘（阻塞分析修复：
+/// 原实现每个请求都在 tokio worker 上同步 read_to_string）
+static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<PathBuf, Arc<str>>>> =
+    std::sync::OnceLock::new();
+
+fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
+    let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(s) = cache.read().unwrap().get(p) {
+        return Ok(Arc::clone(s));
+    }
+    let s: Arc<str> = std::fs::read_to_string(p)
+        .map_err(|e| AppError::Other(format!("读取 Lua 文件失败 {}: {e}", p.display())))?
+        .into();
+    cache.write().unwrap().insert(p.clone(), Arc::clone(&s));
+    Ok(s)
+}
+
 impl LuaSource {
-    pub fn load(&self) -> Result<String, AppError> {
+    pub fn load(&self) -> Result<Arc<str>, AppError> {
         match self {
-            LuaSource::Inline(s) => Ok(s.clone()),
-            LuaSource::File(p) => std::fs::read_to_string(p)
-                .map_err(|e| AppError::Other(format!("读取 Lua 文件失败 {}: {e}", p.display()))),
+            LuaSource::Inline(s) => Ok(Arc::clone(s)),
+            LuaSource::File(p) => load_file_cached(p),
         }
     }
 
@@ -48,7 +66,7 @@ impl LuaSource {
         Some(if d.name.ends_with("_file") {
             LuaSource::File(resolve_path(arg, base_dir))
         } else {
-            LuaSource::Inline(arg.to_string())
+            LuaSource::Inline(Arc::from(arg.to_string()))
         })
     }
 }
@@ -617,7 +635,7 @@ impl LuaEngine {
         let ctx_table: LuaTable = lua.create_table()?;
         ngx.raw_set("ctx", ctx_table)?;
         let result = lua
-            .load(&code)
+            .load(code.as_ref())
             .set_name(phase_name)
             .exec_async()
             .await;
