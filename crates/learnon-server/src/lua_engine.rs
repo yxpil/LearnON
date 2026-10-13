@@ -9,6 +9,7 @@
 //!   阶段结束后由 Rust 侧继续接管同一个 ctx
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mlua::prelude::*;
@@ -53,8 +54,10 @@ impl LuaSource {
 }
 
 pub struct LuaEngine {
-    lua: Lua,
-    exec_lock: tokio::sync::Mutex<()>,
+    /// Lua VM 池：每 CPU 核心一个独立 VM，多请求并行执行（对标 OpenResty 每 worker 一个 VM）
+    vms: Vec<Arc<tokio::sync::Mutex<Lua>>>,
+    /// 轮询游标（无锁）
+    counter: AtomicUsize,
 }
 
 // ---------- 编解码工具（无第三方依赖的 base64 / percent-encoding） ----------
@@ -195,15 +198,10 @@ fn push_args_table(lua: &Lua, args: Vec<(String, LuaArgValue)>) -> LuaResult<Lua
 
 impl LuaEngine {
     pub fn new(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
-        let lua = Lua::new();
         let dicts = SharedDicts::parse_all(config);
-        Self::install_api(&lua, &dicts)?;
-        let engine = LuaEngine {
-            lua,
-            exec_lock: tokio::sync::Mutex::new(()),
-        };
 
-        // init_by_lua / init_by_lua_file：服务器启动时执行一次
+        // init_by_lua / init_by_lua_file：收集脚本（每个 VM 各执行一次，对标每 worker 一次 init）
+        let mut inits: Vec<(String, String)> = Vec::new();
         for name in ["init_by_lua", "init_by_lua_file"] {
             if let Some(d) = config.find(name) {
                 let Some(arg) = d.arg(0) else { continue };
@@ -213,11 +211,32 @@ impl LuaEngine {
                 } else {
                     arg.to_string()
                 };
-                engine.lua.load(&code).set_name(name).exec()?;
-                println!("[learnon] 已执行 {name}");
+                inits.push((name.to_string(), code));
             }
         }
-        Ok(engine)
+
+        // VM 数量 = CPU 核心数（1~16 封顶）
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let mut vms = Vec::with_capacity(n);
+        for _ in 0..n {
+            let lua = Lua::new();
+            Self::install_api(&lua, &dicts)?;
+            for (name, code) in &inits {
+                lua.load(code).set_name(name).exec()?;
+            }
+            vms.push(Arc::new(tokio::sync::Mutex::new(lua)));
+        }
+        for (name, _) in &inits {
+            println!("[learnon] 已执行 {name}（x{n} VM）");
+        }
+        println!("[learnon] Lua VM 池就绪：{n} 个实例（每核心一个，多请求并行执行）");
+        Ok(LuaEngine {
+            vms,
+            counter: AtomicUsize::new(0),
+        })
     }
 
     fn install_api(lua: &Lua, dicts: &SharedDicts) -> Result<(), AppError> {
@@ -585,21 +604,24 @@ impl LuaEngine {
         src: &LuaSource,
         ctx: Arc<Mutex<RequestCtx>>,
     ) -> Result<(), AppError> {
-        let _guard = self.exec_lock.lock().await;
+        // 无锁轮询取一个 VM；同一 VM 内串行、VM 之间完全并行
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.vms.len();
+        let vm = Arc::clone(&self.vms[idx]);
+        let vm = vm.lock().await;
+        let lua = &*vm;
         let code = src.load()?;
 
-        self.lua.set_named_registry_value("__ctx", CtxHandle(ctx))?;
+        lua.set_named_registry_value("__ctx", CtxHandle(ctx))?;
         // ngx.ctx：每请求一张真实表（对标 OpenResty 的 ngx.ctx）
-        let ngx: LuaTable = self.lua.globals().get("ngx")?;
-        let ctx_table: LuaTable = self.lua.create_table()?;
+        let ngx: LuaTable = lua.globals().get("ngx")?;
+        let ctx_table: LuaTable = lua.create_table()?;
         ngx.raw_set("ctx", ctx_table)?;
-        let result = self
-            .lua
+        let result = lua
             .load(&code)
             .set_name(phase_name)
             .exec_async()
             .await;
-        let _ = self.lua.unset_named_registry_value("__ctx");
+        let _ = lua.unset_named_registry_value("__ctx");
 
         result.map_err(|e| {
             eprintln!("[learnon] {phase_name} 脚本错误: {e}");

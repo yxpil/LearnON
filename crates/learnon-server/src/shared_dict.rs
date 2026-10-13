@@ -49,28 +49,45 @@ pub struct SharedZone {
     inner: Arc<ZoneInner>,
 }
 
-#[derive(Debug, Default)]
+const SHARDS: usize = 16;
+
+#[derive(Debug)]
 struct ZoneInner {
-    map: Mutex<HashMap<String, Entry>>,
+    /// 按 key 哈希分成 16 片，各片独立锁：多核并发读写互不阻塞
+    shards: Vec<Mutex<HashMap<String, Entry>>>,
+}
+
+impl ZoneInner {
+    fn new() -> Self {
+        ZoneInner {
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
+    fn shard(&self, key: &str) -> &Mutex<HashMap<String, Entry>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        &self.shards[(h.finish() as usize) % SHARDS]
+    }
 }
 
 impl SharedZone {
     fn new(name: &str) -> Self {
         SharedZone {
             name: name.to_string(),
-            inner: Arc::new(ZoneInner::default()),
+            inner: Arc::new(ZoneInner::new()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let now = now_epoch();
-        let map = self.inner.map.lock().unwrap();
+        let map = self.inner.shard(key).lock().unwrap();
         map.get(key).filter(|e| e.alive(now)).map(|e| e.value.clone())
     }
 
     /// 含过期项的读取（对标 get_stale）
     pub fn get_stale(&self, key: &str) -> Option<Vec<u8>> {
-        let map = self.inner.map.lock().unwrap();
+        let map = self.inner.shard(key).lock().unwrap();
         map.get(key).map(|e| e.value.clone())
     }
 
@@ -78,7 +95,7 @@ impl SharedZone {
         let now = now_epoch();
         let expires_at = ex.map(|t| now + t);
         self.inner
-            .map
+            .shard(key)
             .lock()
             .unwrap()
             .insert(key.to_string(), Entry { value, expires_at });
@@ -87,7 +104,7 @@ impl SharedZone {
     /// 不存在（或已过期）时才写入；返回是否成功
     pub fn add(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> bool {
         let now = now_epoch();
-        let mut map = self.inner.map.lock().unwrap();
+        let mut map = self.inner.shard(key).lock().unwrap();
         if map.get(key).is_some_and(|e| e.alive(now)) {
             return false;
         }
@@ -99,7 +116,7 @@ impl SharedZone {
     /// 已存在（未过期）时才覆盖；返回是否成功
     pub fn replace(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> bool {
         let now = now_epoch();
-        let mut map = self.inner.map.lock().unwrap();
+        let mut map = self.inner.shard(key).lock().unwrap();
         if !map.get(key).is_some_and(|e| e.alive(now)) {
             return false;
         }
@@ -109,13 +126,13 @@ impl SharedZone {
     }
 
     pub fn delete(&self, key: &str) {
-        self.inner.map.lock().unwrap().remove(key);
+        self.inner.shard(key).lock().unwrap().remove(key);
     }
 
     /// 原子自增整数值；项不存在时若给了 init 则初始化为 init
     pub fn incr(&self, key: &str, delta: i64, init: Option<i64>) -> Result<i64, String> {
         let now = now_epoch();
-        let mut map = self.inner.map.lock().unwrap();
+        let mut map = self.inner.shard(key).lock().unwrap();
         let entry = map.get_mut(key);
         match entry {
             Some(e) if e.alive(now) => {
@@ -147,7 +164,7 @@ impl SharedZone {
     /// 剩余存活时间：None=不存在，Some(-1.0)=永不过期，Some(x)=剩余秒数
     pub fn ttl(&self, key: &str) -> Option<f64> {
         let now = now_epoch();
-        let map = self.inner.map.lock().unwrap();
+        let map = self.inner.shard(key).lock().unwrap();
         map.get(key).map(|e| match e.expires_at {
             None => -1.0,
             Some(t) => (t - now).max(0.0),
@@ -155,7 +172,9 @@ impl SharedZone {
     }
 
     pub fn flush_all(&self) {
-        self.inner.map.lock().unwrap().clear();
+        for s in &self.inner.shards {
+            s.lock().unwrap().clear();
+        }
     }
 }
 

@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use learnon_config::Directive;
@@ -46,16 +47,14 @@ pub struct UpstreamServer {
     pub conns: AtomicUsize,
     /// 当前失败计数
     fails: AtomicUsize,
-    /// 摘除截止时间（epoch 秒）
-    down_until: Mutex<Option<f64>>,
+    /// 摘除截止时间（epoch 毫秒；0 = 可用）——原子读写，热路径无锁
+    down_until: AtomicU64,
 }
 
 impl UpstreamServer {
-    fn available(&self, now: f64) -> bool {
-        match *self.down_until.lock().unwrap() {
-            Some(t) if now < t => false,
-            _ => true,
-        }
+    fn available_millis(&self, now_millis: u64) -> bool {
+        let until = self.down_until.load(Ordering::Relaxed);
+        until == 0 || now_millis >= until
     }
 
     fn note_success(&self) {
@@ -65,7 +64,8 @@ impl UpstreamServer {
     fn note_failure(&self) {
         let n = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= self.max_fails.max(1) {
-            *self.down_until.lock().unwrap() = Some(now_epoch() + self.fail_timeout);
+            let until = (now_epoch() * 1000.0) as u64 + (self.fail_timeout * 1000.0) as u64;
+            self.down_until.store(until, Ordering::Relaxed);
             self.fails.store(0, Ordering::Relaxed);
             eprintln!(
                 "[learnon] upstream 节点 {} 连续失败 {n} 次，摘除 {:.0}s",
@@ -80,20 +80,20 @@ pub struct Upstream {
     pub name: String,
     pub servers: Vec<UpstreamServer>,
     pub lb: LoadBalance,
-    /// 加权轮询游标
-    cursor: Mutex<usize>,
+    /// 加权轮询游标（无锁原子计数）
+    cursor: AtomicUsize,
 }
 
 impl Upstream {
     /// 按负载均衡策略选一个可用后端，并把连接数 +1；guard drop 时 -1。
     /// 所有节点都被摘除时兜底全量参与（避免完全不可用）。
     pub fn acquire(self: &Arc<Self>, client_ip: &str) -> UpstreamGuard {
-        let now = now_epoch();
+        let now = (now_epoch() * 1000.0) as u64;
         let mut candidates: Vec<usize> = self
             .servers
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.available(now))
+            .filter(|(_, s)| s.available_millis(now))
             .map(|(i, _)| i)
             .collect();
         if candidates.is_empty() {
@@ -113,16 +113,15 @@ impl Upstream {
     }
 
     fn pick_round_robin(&self, candidates: &[usize]) -> usize {
-        // 平滑加权轮询（简化版：按候选集总权重展开游标）
+        // 加权轮询：原子 fetch_add 游标，无锁
         let total: usize = candidates.iter().map(|&i| self.servers[i].weight).sum();
-        let mut c = self.cursor.lock().unwrap();
-        *c = (*c + 1) % total.max(1);
-        let mut acc = 0;
+        let c = self.cursor.fetch_add(1, Ordering::Relaxed) % total.max(1);
+        let mut target = c;
         for &i in candidates {
-            acc += self.servers[i].weight;
-            if *c < acc {
+            if target < self.servers[i].weight {
                 return i;
             }
+            target -= self.servers[i].weight;
         }
         candidates[0]
     }
@@ -237,7 +236,7 @@ impl UpstreamPool {
                         fail_timeout,
                         conns: AtomicUsize::new(0),
                         fails: AtomicUsize::new(0),
-                        down_until: Mutex::new(None),
+                        down_until: AtomicU64::new(0),
                     });
                 }
                 "least_conn" => lb = LoadBalance::LeastConn,
@@ -252,7 +251,7 @@ impl UpstreamPool {
             name,
             servers,
             lb,
-            cursor: Mutex::new(0),
+            cursor: AtomicUsize::new(0),
         })
     }
 

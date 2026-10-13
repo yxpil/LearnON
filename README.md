@@ -9,6 +9,17 @@
 用 **Rust 从零实现**的 Nginx / OpenResty 风格网关服务器：反向代理、负载均衡（含被动健康检查）、rewrite、
 虚拟主机、内嵌 Lua 5.4 脚本层（`ngx.*` API）+ Rust 原生模块。除 tokio/hyper 等基础库外，网关逻辑全部手写。
 
+## 多核架构
+
+- **tokio 多线程运行时**：worker 线程数 = CPU 逻辑核心数
+- **Lua VM 池**：每个 CPU 核心一个独立 Lua VM（对标 OpenResty 每 worker 一个 VM），多请求完全并行执行脚本，全局无单点锁；`init_by_lua` 在每个 VM 各执行一次（与 nginx 每 worker 初始化一次语义一致）
+- **ngx.shared.DICT 16 分片**：按 key 哈希分片，各片独立锁，多核并发读写互不阻塞
+- **无锁热路径**：轮询游标 / 节点健康状态 / VM 选择均为原子操作
+- **异步访问日志**：专用写线程 + 缓冲批量落盘，请求热路径只做一次无锁投递
+- **proxy_next_upstream**：上游连接级失败自动换下一节点重试一次（陈旧连接池命中自愈）
+- **TCP_NODELAY**：所有入站连接默认禁用 Nagle
+
+
 ## 功能对照表
 
 | Nginx / OpenResty | LearnON (Rust) | 位置 |

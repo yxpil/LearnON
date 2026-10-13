@@ -121,7 +121,13 @@ fn main() {
         base_dir: base_dir.clone(),
     });
 
+    // 多核：worker 线程数 = CPU 逻辑核心数（与 Lua VM 池一一对齐）
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name("learnon-worker")
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");

@@ -60,15 +60,16 @@ impl ProxyEngine {
         } else {
             host_part.clone()
         };
-        let note = |ok: bool| {
-            if let Some(g) = &guard_holder {
+        // 健康上报：模块级函数避免闭包借用与 async 冲突
+        fn note(guard_holder: &Option<UpstreamGuard>, ok: bool) {
+            if let Some(g) = guard_holder {
                 if ok {
                     g.note_success();
                 } else {
                     g.note_failure();
                 }
             }
-        };
+        }
         let out_path = match uri_part {
             Some(repl) => {
                 let rel = match ctx.effective_path().strip_prefix(loc_prefix) {
@@ -91,14 +92,7 @@ impl ProxyEngine {
             format!("?{}", ctx.query)
         };
 
-        let uri = format!("http://{backend}{out_path}{query}");
-
-        let mut builder = Request::builder()
-            .method(ctx.method.as_str())
-            .uri(&uri)
-            .version(hyper::Version::HTTP_11);
-
-        // 转发请求头：复制后按 proxy_set_header 覆盖
+        // 转发请求头：复制后按 proxy_set_header 覆盖（构建一次，重试时 clone）
         let mut headers = HeaderMap::new();
         for (k, v) in &ctx.req_headers {
             if is_hop_by_hop(k) {
@@ -122,35 +116,55 @@ impl ProxyEngine {
                 headers.insert(HOST, HeaderValue::try_from(h.as_str()).unwrap());
             }
         }
-        *builder.headers_mut().unwrap() = headers;
 
         // 请求体已由 server 层缓冲后传入（流式转发在路线图中）
         let body_bytes = raw_body.unwrap_or_default();
 
-        let req = builder
-            .body(Full::new(body_bytes))
-            .map_err(|e| e.to_string())?;
+        // nginx proxy_next_upstream 语义：连接级失败时换下一节点重试一次
+        // （典型场景：后端不支持 keep-alive，连接池命中已关闭的陈旧连接）
+        let mut backend = backend;
+        let mut resp = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                if let Some(up) = self.pool.get(&host_part) {
+                    let g = up.acquire(&ctx.remote_addr);
+                    backend = (*g).clone();
+                    guard_holder = Some(g);
+                }
+                eprintln!("[learnon] upstream {backend} 连接失败，重试下一节点");
+            }
+            let uri = format!("http://{backend}{out_path}{query}");
+            let mut req = Request::builder()
+                .method(ctx.method.as_str())
+                .uri(&uri)
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(body_bytes.clone()))
+                .map_err(|e| e.to_string())?;
+            *req.headers_mut() = headers.clone();
+            match tokio::time::timeout(read_timeout, self.client.request(req)).await {
+                Ok(Ok(r)) => {
+                    note(&guard_holder, true);
+                    resp = Some(r);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    note(&guard_holder, false);
+                    if attempt == 1 {
+                        return Err(format!(
+                            "代理请求失败 {backend}: {} | 根因: {}",
+                            e,
+                            error_root(&e)
+                        ));
+                    }
+                }
+                Err(_) => {
+                    note(&guard_holder, false);
+                    return Err(format!("proxy_read_timeout ({read_timeout:?}) 超时: {backend}"));
+                }
+            }
+        }
 
-        let resp = match tokio::time::timeout(read_timeout, self.client.request(req)).await {
-            Ok(Ok(r)) => {
-                note(true);
-                r
-            }
-            Ok(Err(e)) => {
-                note(false);
-                return Err(format!(
-                    "代理请求失败 {backend}: {} | 根因: {}",
-                    e,
-                    error_root(&e)
-                ));
-            }
-            Err(_) => {
-                note(false);
-                return Err(format!("proxy_read_timeout ({read_timeout:?}) 超时: {backend}"));
-            }
-        };
-
-        Ok(resp)
+        Ok(resp.unwrap())
     }
 }
 

@@ -67,6 +67,7 @@ pub async fn serve(
             Some(acceptor) => {
                 let acceptor = acceptor.clone();
                 tokio::task::spawn(async move {
+                    let _ = stream.set_nodelay(true); // 低延迟：禁用 Nagle
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
                             let io = TokioIo::new(tls_stream);
@@ -85,6 +86,7 @@ pub async fn serve(
                 });
             }
             None => {
+                let _ = stream.set_nodelay(true); // 低延迟：禁用 Nagle
                 let io = TokioIo::new(stream);
                 tokio::task::spawn(async move {
                     let service = service_fn(move |req| {
