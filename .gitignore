@@ -4,6 +4,7 @@
 
 # 本地生成的测试证书（用 lon-gencert 重新生成）
 /certs/
+/certs_scenario/
 
 # 运行日志
 /logs/
