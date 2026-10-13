@@ -126,15 +126,44 @@ async fn handle_request(
 ) -> Result<BoxResponse, std::convert::Infallible> {
     let started = std::time::Instant::now();
 
-    let method = req.method().to_string();
-    let uri = req.uri().to_string();
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or("").to_string();
-    let headers: Vec<(String, String)> = req
+    // ---- 安全校验（对齐 nginx：畸形请求直接拒绝）----
+    // 未知 HTTP 方法 → 501（nginx 对未实现方法返回 501 Not Implemented）
+    const KNOWN_METHODS: [&str; 8] = ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"];
+    if !KNOWN_METHODS.contains(&req.method().as_str()) {
+        return Ok(error_page(StatusCode::NOT_IMPLEMENTED));
+    }
+    // URL 过长 → 414
+    if req.uri().path().len() > 8192 {
+        return Ok(error_page(StatusCode::URI_TOO_LONG));
+    }
+    let hdr_list: Vec<(String, String)> = req
         .headers()
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+    // 重复 Content-Length → 400（防走私）
+    let cl_count = hdr_list.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).count();
+    // Content-Length 与 Transfer-Encoding 并存 → 400（防走私，nginx 行为）
+    let has_te = hdr_list.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    // 非法 Content-Length → 400
+    let bad_cl = hdr_list
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.trim().parse::<u64>().is_err())
+        .unwrap_or(false);
+    if cl_count > 1 || has_te || bad_cl {
+        return Ok(error_page(StatusCode::BAD_REQUEST));
+    }
+    // HTTP/1.1 缺 Host → 400
+    if req.version() == hyper::Version::HTTP_11 && !hdr_list.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        return Ok(error_page(StatusCode::BAD_REQUEST));
+    }
+
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let headers = hdr_list;
     let host = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
@@ -174,6 +203,11 @@ async fn handle_request(
         }
     }
 
+    // 路径穿越防护：RFC 3986 dot-segment 归一化，越出根即 400（nginx 对 /../ 越根返回 400）
+    let path = match normalize_path(&path) {
+        Some(p) => p,
+        None => return Ok(error_page(StatusCode::BAD_REQUEST)),
+    };
     let mut ctx = RequestCtx {
         method,
         path,
@@ -691,6 +725,33 @@ fn redirect_response(code: u16, target: &str) -> BoxResponse {
         .header("server", SERVER_HEADER)
         .body(full_body(format!("{} {}", code, target)))
         .unwrap()
+}
+
+/// RFC 3986 dot-segment 归一化：消除 `.` 与 `..` 段；`..` 越出根返回 None（调用方回 400）。
+fn normalize_path(path: &str) -> Option<String> {
+    if path.contains('\0') {
+        return None;
+    }
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if segs.pop().is_none() {
+                    return None; // 越出根
+                }
+            }
+            _ => segs.push(seg),
+        }
+    }
+    let mut out = String::with_capacity(path.len() + 1);
+    out.push('/');
+    out.push_str(&segs.join("/"));
+    // 保留尾部斜杠：目录语义（index/301 补斜杠）依赖它
+    if path.ends_with('/') && !out.ends_with('/') {
+        out.push('/');
+    }
+    Some(out)
 }
 
 /// nginx/OpenResty 风格默认错误页，底部署名 LearnON
