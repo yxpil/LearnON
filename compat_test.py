@@ -3,7 +3,7 @@
 import subprocess, sys, time, os
 import urllib.request, urllib.error
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))  # 仓库根：脚本与 conf/、target/ 同级
 BASE = "http://127.0.0.1:8090"
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

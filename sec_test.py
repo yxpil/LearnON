@@ -3,7 +3,7 @@
 import subprocess, sys, time, os, socket
 import urllib.request, urllib.error
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))  # 仓库根：脚本与 conf/、target/ 同级
 BASE = "http://127.0.0.1:8090"
 HOST, PORT = "127.0.0.1", 8090
 
@@ -22,8 +22,8 @@ def req(method, path, headers=None, data=None, timeout=10):
     except Exception as e:
         return 0, {}, str(e).encode()
 
-def raw(payload: bytes, timeout=5):
-    """发送原始字节，返回 (状态行, 全部响应头, body)。"""
+def raw_all(payload: bytes, timeout=5):
+    """发原始字节并把连接上回来的字节全收回来 —— 数"响应条数"是验走私的关键。"""
     s = socket.create_connection((HOST, PORT), timeout=timeout)
     try:
         s.sendall(payload)
@@ -38,6 +38,11 @@ def raw(payload: bytes, timeout=5):
             pass
     finally:
         s.close()
+    return buf
+
+def raw(payload: bytes, timeout=5):
+    """发送原始字节，返回 (状态行, 全部响应头, body)。"""
+    buf = raw_all(payload, timeout)
     if not buf:
         return b"", {}, b""
     head, _, body = buf.partition(b"\r\n\r\n")
@@ -97,10 +102,18 @@ def main():
         # 非法 CL → 400
         line, _, _ = raw(b"POST /exact HTTP/1.1\r\nHost: h\r\nContent-Length: abc\r\n\r\nhello")
         check("走私: 非法 Content-Length 拒绝", line.startswith(b"HTTP/1.1 400"), line[:40])
-        # CL + TE 双头 → 拒绝或按 CL（不允许歧义即可）
-        line, _, _ = raw(b"POST /exact HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
-        ok = line.startswith(b"HTTP/1.1 400") or line.startswith(b"HTTP/1.1 4")
-        check("走私: CL+TE 双头歧义拒绝", ok, line[:40])
+        # CL + TE 双头：nginx 直接 400；hyper 的解析器按 RFC 9112 的另一条许可走"TE 优先并抹掉 CL"，
+        # 到应用层已看不到 CL。因此这里验证真正要紧的性质：分帧唯一确定，
+        # chunked 终止符之后藏起来的字节不会被当成第二个请求执行（那才是走私的实际危害）
+        buf = raw_all(
+            b"POST /exact HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nXY",
+            timeout=2,
+        )
+        check(
+            "走私: CL+TE 分帧唯一且不执行藏起来的第二个请求",
+            buf.count(b"HTTP/1.1 ") == 1 and buf.startswith(b"HTTP/1.1 2"),
+            f"responses={buf.count(b'HTTP/1.1 ')} {buf[:40]!r}",
+        )
         # 缺 Host 的 HTTP/1.1 → 400
         line, _, _ = raw(b"GET /exact HTTP/1.1\r\n\r\n")
         check("走私: HTTP/1.1 缺 Host 拒绝", line.startswith(b"HTTP/1.1 400"), line[:40])

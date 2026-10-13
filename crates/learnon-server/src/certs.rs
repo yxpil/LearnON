@@ -46,7 +46,19 @@ pub struct SniResolver {
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?.to_ascii_lowercase();
+        self.choose(client_hello.server_name())
+    }
+}
+
+impl SniResolver {
+    /// SNI -> 证书。没有 SNI（HTTPS 直连 IP、或 TLS1.3 的 ECH/无扩展客户端）时，
+    /// 和 nginx 一样退回 default server 的证书，而不是掐断握手：
+    /// 证书选择失败只会让客户端看到一个没有状态码的握手错误，比 404 难查得多。
+    pub fn choose(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        let Some(name) = server_name else {
+            return Some(Arc::clone(&self.default));
+        };
+        let sni = name.to_ascii_lowercase();
         if let Some(k) = self.exact.get(&sni) {
             return Some(Arc::clone(k));
         }
@@ -184,6 +196,45 @@ mod tests {
         assert_eq!(resolver.wildcard.len(), 1);
         assert_eq!(resolver.wildcard[0].0, ".example.com");
         // 默认证书 = 第一个 spec
+        assert!(Arc::ptr_eq(
+            &resolver.choose(None).unwrap(),
+            &resolver.choose(Some("example.com")).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chooses_cert_by_sni_with_default_fallback() {
+        let dir = std::env::temp_dir().join(format!("learnon-certs-sni-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c1, k1) = write_pair(&dir, &["example.com"]);
+        let (c2, k2) = write_pair(&dir, &["*.spec.io"]);
+        let resolver = build_resolver(&[
+            CertSpec {
+                names: vec!["example.com".into()],
+                cert: c1,
+                key: k1,
+            },
+            CertSpec {
+                names: vec!["*.spec.io".into()],
+                cert: c2,
+                key: k2,
+            },
+        ])
+        .unwrap();
+        let default = resolver.choose(Some("example.com")).unwrap();
+        let wildcard_cert = resolver.choose(Some("a.spec.io")).unwrap();
+        // 通配命中子域，且不是默认证书
+        assert!(!Arc::ptr_eq(&default, &wildcard_cert));
+        assert!(Arc::ptr_eq(
+            &wildcard_cert,
+            &resolver.choose(Some("API.SPEC.IO")).unwrap()
+        ));
+        // 通配不覆盖主域本身：spec.io 回落默认
+        assert!(Arc::ptr_eq(&default, &resolver.choose(Some("spec.io")).unwrap()));
+        // 无 SNI / 未知 SNI 都用默认证书，而不是让握手失败
+        assert!(Arc::ptr_eq(&default, &resolver.choose(None).unwrap()));
+        assert!(Arc::ptr_eq(&default, &resolver.choose(Some("nope.net")).unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
