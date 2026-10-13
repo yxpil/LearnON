@@ -1,4 +1,4 @@
-//! 请求路由与配置模型：server 块 / location 匹配（nginx 语义）。
+//! 请求路由与配置模型：监听端点 / server 块 / location 匹配（nginx 语义）。
 //!
 //! location 匹配算法（与 nginx 一致）：
 //!   1. `= /exact` 精确匹配命中 → 直接使用
@@ -6,22 +6,29 @@
 //!   3. 否则按配置顺序找第一个命中的正则（`~` 或 `~*`）→ 使用
 //!   4. 都没有 → 用第 2 步的最长前缀
 //!
-//! server 匹配（Host）：精确名 > 通配符（*.example.com / example.*）> 默认第一个
+//! server 匹配：先按**实际监听地址**（ip:port）取该端点的 vhost 集合，
+//! 再按 Host 匹配：精确名 > 通配符（`*.example.com` / `example.*`）> `default_server` > 第一个。
 //!
-//! 支持 nginx 指令：listen、server_name（多值+通配符）、root、alias、index、
-//! autoindex、try_files、error_page、client_max_body_size、return、rewrite、
-//! add_header、proxy_pass、proxy_set_header、proxy_read_timeout、
-//! *_by_lua[_file]、*_by_rust、ssl_certificate[_key]。
+//! `listen` 支持的形态：
+//! ```text
+//! listen 8080;                       # 0.0.0.0:8080（与 nginx 一致）
+//! listen 127.0.0.1:8080;             # 指定地址
+//! listen [::]:8080;                  # IPv6
+//! listen 8443 ssl http2;             # TLS + ALPN h2
+//! listen 8443 ssl default_server;    # 该端点的默认 vhost
+//! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use learnon_config::{Config, Directive};
 
+use crate::certs::{CertSpec, TlsOptions, TlsVersion};
 use crate::engine::{HandlerSpec, Phase, ReturnAction, RewriteFlag, RewriteRule};
+use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
-use crate::upstream::UpstreamPool;
 use crate::AppError;
 
 // ---------- location 匹配 ----------
@@ -30,11 +37,11 @@ use crate::AppError;
 pub enum LocationKind {
     /// `location = /exact`
     Exact(String),
-    /// `location /prefix`（caret = `^~`：命中即赢过正则）
+    /// `location /prefix`（`^~`：命中即赢过正则）
     Prefix { path: String, caret: bool },
-    /// `location ~ regex`（区分大小写）
+    /// `location ~ regex`
     Regex(regex::Regex),
-    /// `location ~* regex`（不区分大小写）
+    /// `location ~* regex`
     RegexI(regex::Regex),
 }
 
@@ -46,16 +53,13 @@ impl LocationKind {
                 path: pattern.to_string(),
                 caret: true,
             },
-            Some("~") => LocationKind::Regex(regex::Regex::new(pattern).map_err(|e| {
-                AppError::Other(format!("location 正则错误 {pattern}: {e}"))
-            })?),
+            Some("~") => LocationKind::Regex(regex::Regex::new(pattern)
+                .map_err(|e| AppError::Other(format!("location 正则错误 {pattern}: {e}")))?),
             Some("~*") => LocationKind::RegexI(
                 regex::RegexBuilder::new(pattern)
                     .case_insensitive(true)
                     .build()
-                    .map_err(|e| {
-                        AppError::Other(format!("location 正则错误 {pattern}: {e}"))
-                    })?,
+                    .map_err(|e| AppError::Other(format!("location 正则错误 {pattern}: {e}")))?,
             ),
             None => LocationKind::Prefix {
                 path: pattern.to_string(),
@@ -63,7 +67,7 @@ impl LocationKind {
             },
             Some(other) => {
                 return Err(AppError::Other(format!(
-                    "暂不支持的 location 修饰符 '{other}'"
+                    "暂不支持的 location 修饰符 '{other}'（支持 = / ^~ / ~ / ~*）"
                 )))
             }
         })
@@ -88,92 +92,175 @@ impl LocationKind {
 #[derive(Debug, Clone)]
 pub struct Location {
     pub kind: LocationKind,
-    /// 原始 pattern（日志/调试/alias 前缀剥离）
+    /// 原始 pattern（日志/调试/alias 前缀剥离/proxy URI 替换）
     pub pattern: String,
-    /// rewrite 规则（按配置顺序）
     pub rewrites: Vec<RewriteRule>,
     pub ret: Option<ReturnAction>,
     pub proxy_pass: Option<String>,
     pub proxy_set_headers: Vec<(String, String)>,
     pub proxy_read_timeout: u64,
-    /// rust 原生阶段（rewrite/access/content_by_rust）
+    pub proxy_connect_timeout: u64,
+    pub proxy_send_timeout: u64,
+    /// `proxy_next_upstream off | error | timeout | http_500 | ...`（默认 error,timeout）
+    pub proxy_next_upstream: Vec<String>,
     pub rust_phases: Vec<(Phase, HandlerSpec)>,
-    /// lua 阶段（rewrite/access/content_by_lua[_file]）
     pub lua_phases: Vec<(Phase, String, LuaSource)>,
-    /// `root <dir>`：URI 完整路径追加到 root 后（nginx 语义）
     pub root: Option<PathBuf>,
-    /// `alias <dir>`：location 前缀之后的部分映射到 alias（nginx 语义）
     pub alias: Option<PathBuf>,
-    /// `index <file>...`；None 继承 server 级
     pub index: Option<Vec<String>>,
-    /// `try_files <file>... <fallback>`
     pub try_files: Option<Vec<String>>,
-    /// `autoindex on`
     pub autoindex: bool,
-    /// `error_page <code>... <uri>`
     pub error_pages: HashMap<u16, String>,
     pub add_headers: Vec<(String, String)>,
+    /// PREACCESS 阶段限流
+    pub limit_req: Vec<ReqRule>,
+    /// `internal;` 只允许内部重定向访问
+    pub internal: bool,
+    /// `client_max_body_size` 的 location 级覆盖
+    pub client_max_body_size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Server {
-    pub listen: u16,
-    /// 第一个 server_name（兼容字段）
+    /// `server_name` 的首个值，用于日志与告警
     pub server_name: String,
-    /// 全部 server_name（支持通配符）
     pub server_names: Vec<String>,
+    /// `listen ... default_server`：Host 匹配不上时的兜底 vhost
+    pub is_default_server: bool,
     pub locations: Vec<Location>,
     pub root: Option<PathBuf>,
     pub index: Vec<String>,
     pub autoindex: bool,
-    /// server 级 error_page（location 级优先）
     pub error_pages: HashMap<u16, String>,
-    /// `client_max_body_size <size>`；None = 不限制
     pub client_max_body_size: Option<u64>,
     pub add_headers: Vec<(String, String)>,
+    /// server 级 proxy_set_header，作为 location 的默认值
+    pub proxy_set_headers: Vec<(String, String)>,
+    /// server 级并发限制
+    pub limit_conn: Vec<ConnRule>,
+}
+
+/// 一个真实监听端点
+#[derive(Debug, Clone)]
+pub struct Listener {
+    pub addr: SocketAddr,
+    pub tls: Option<TlsOptions>,
+    /// `listen ... backlog=N`；None 用全局 accept_backlog
+    pub backlog: Option<u32>,
+    /// `listen [::]:80 ipv6only=off` 等；None = 默认（仅 IPv6）
+    pub ipv6only: Option<bool>,
+}
+
+/// 某监听地址上的一组虚拟主机；`servers[0]` 是默认 vhost
+#[derive(Debug)]
+pub struct AddrGroup {
+    pub servers: Vec<Arc<Server>>,
 }
 
 #[derive(Debug)]
 pub struct Router {
-    pub by_port: std::collections::HashMap<u16, Vec<Arc<Server>>>,
+    pub groups: HashMap<SocketAddr, AddrGroup>,
     pub listeners: Vec<Listener>,
+    pub warnings: Vec<String>,
 }
 
-/// 一个监听端口（可带 TLS 配置）
-#[derive(Debug, Clone)]
-pub struct Listener {
-    pub addr: std::net::SocketAddr,
-    /// `listen 8443 ssl` + ssl_certificate / ssl_certificate_key
-    pub tls: Option<TlsPaths>,
+/// 一个 server 块里除 listen 之外的所有配置模板
+struct ServerTemplate {
+    server_name: String,
+    server_names: Vec<String>,
+    locations: Vec<Location>,
+    root: Option<PathBuf>,
+    index: Vec<String>,
+    autoindex: bool,
+    error_pages: HashMap<u16, String>,
+    client_max_body_size: Option<u64>,
+    add_headers: Vec<(String, String)>,
+    proxy_set_headers: Vec<(String, String)>,
+    proxy_connect_timeout: u64,
+    proxy_read_timeout: u64,
+    proxy_send_timeout: u64,
+    limit_conn: Vec<ConnRule>,
+    ssl_cert: Option<PathBuf>,
+    ssl_key: Option<PathBuf>,
+    min_tls: TlsVersion,
+    http2: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct TlsPaths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
+#[derive(Debug, Clone, Default)]
+struct ListenFlags {
+    ssl: bool,
+    http2: bool,
+    default_server: bool,
+    backlog: Option<u32>,
+    ipv6only: Option<bool>,
 }
 
-/// 解析 nginx 大小后缀：1m / 10k / 纯字节数
-pub fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (num, mult) = if let Some(n) = s.strip_suffix(['m', 'M']) {
-        (n, 1024 * 1024u64)
-    } else if let Some(n) = s.strip_suffix(['k', 'K']) {
-        (n, 1024u64)
-    } else if let Some(n) = s.strip_suffix(['g', 'G']) {
-        (n, 1024 * 1024 * 1024u64)
-    } else {
-        (s, 1u64)
-    };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
+/// 解析 `listen` 的第一个参数为 SocketAddr
+pub fn parse_listen_addr(arg: &str) -> Option<SocketAddr> {
+    let a = arg.trim();
+    if a.is_empty() {
+        return None;
+    }
+    if let Ok(p) = a.parse::<u16>() {
+        return Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, p)));
+    }
+    if let Some(rest) = a.strip_prefix("*:") {
+        let p = rest.parse::<u16>().ok()?;
+        return Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, p)));
+    }
+    a.parse::<SocketAddr>().ok().or_else(|| {
+        // `1.2.3.4 8080` 之类的分隔写法不支持；给个明确错误提示
+        None
+    })
 }
 
-/// 解析 error_page 指令组：`error_page 404 403 /x.html;`（`=` 覆盖码形式暂按目标处理）
+fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppError> {
+    let arg = directive
+        .arg(0)
+        .ok_or_else(|| AppError::Other("listen 缺少地址/端口".into()))?;
+    let addr = parse_listen_addr(arg).ok_or_else(|| {
+        AppError::Other(format!(
+            "listen 参数无法解析: '{arg}'（支持 8080 / 127.0.0.1:8080 / [::]:8080 / *:8080）"
+        ))
+    })?;
+    let mut f = ListenFlags::default();
+    for a in directive.args.iter().skip(1) {
+        match a.as_str() {
+            "ssl" => f.ssl = true,
+            "http2" => f.http2 = true,
+            "default_server" => f.default_server = true,
+            other => {
+                if let Some(v) = other.strip_prefix("backlog=") {
+                    f.backlog = Some(v.parse().map_err(|_| {
+                        AppError::Other(format!("listen backlog 取值非法: {other}"))
+                    })?);
+                } else if let Some(v) = other.strip_prefix("ipv6only=") {
+                    f.ipv6only = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(AppError::Other(format!(
+                                "listen ipv6only 只接受 on/off，收到 '{v}'"
+                            )))
+                        }
+                    });
+                } else {
+                    // reuseport/proxy_protocol/setfib 等尚未实现，明确报错而不是静默忽略
+                    return Err(AppError::Other(format!(
+                        "listen 暂不支持参数 '{other}'（已支持 ssl / http2 / default_server / backlog=N / ipv6only=on|off）"
+                    )));
+                }
+            }
+        }
+    }
+    Ok((addr, f))
+}
+
+/// 解析 error_page 指令组：`error_page 404 403 /x.html;`
 fn parse_error_pages(d: &Directive) -> HashMap<u16, String> {
     let mut map = HashMap::new();
-    for ep in d.block.iter().filter(|x| x.name == "error_page") {
-        let args: Vec<&str> = ep.args.iter().map(|s| s.as_str()).collect();
-        // 最后一个以 '/' 开头的参数作为目标 URI
+    for ep in collect_error_pages(d) {
+        let args: Vec<&str> = ep.args.iter().map(String::as_str).collect();
         let Some(target) = args.iter().rev().find(|a| a.starts_with('/')) else {
             continue;
         };
@@ -186,32 +273,245 @@ fn parse_error_pages(d: &Directive) -> HashMap<u16, String> {
     map
 }
 
+/// error_page 可能出现在块里（server 块）也可能被 include 展开到别处，统一收集
+fn collect_error_pages(d: &Directive) -> Vec<&Directive> {
+    d.block.iter().filter(|x| x.name == "error_page").collect()
+}
+
+/// 解析 nginx 大小后缀：1m / 10k / 1g / 纯字节
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix(['k', 'K']) {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix(['m', 'M']) {
+        (n, 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix(['g', 'G']) {
+        (n, 1024 * 1024 * 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+fn parse_time_secs(v: &str, default: u64) -> u64 {
+    crate::settings::parse_duration(v)
+        .map(|d| d.as_secs())
+        .unwrap_or(default)
+}
+
 impl Router {
     pub fn build(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
-        let mut by_port = std::collections::HashMap::new();
-        let mut listeners = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        // addr -> servers
+        let mut groups: HashMap<SocketAddr, Vec<Arc<Server>>> = HashMap::new();
+        // addr -> 默认 vhost 下标标记
+        let mut defaults: HashMap<SocketAddr, usize> = HashMap::new();
+        // addr -> TLS 证书集合
+        let mut tls_specs: HashMap<SocketAddr, Vec<CertSpec>> = HashMap::new();
+        // addr -> (是否 ssl, 是否 http2, 最低 TLS 版本)
+        struct Endpoint {
+            ssl: bool,
+            http2: bool,
+            min_tls: TlsVersion,
+            backlog: Option<u32>,
+            ipv6only: Option<bool>,
+        }
+        let mut endpoints: HashMap<SocketAddr, Endpoint> = HashMap::new();
+        // 配置里 listen 首次出现的顺序（HashMap 遍历顺序不定，监听顺序必须可复现）
+        let mut order: Vec<SocketAddr> = Vec::new();
+        let mut plain_conflicts: Vec<SocketAddr> = Vec::new();
+
+        let limits_declared: Vec<String> = config
+            .root
+            .block
+            .iter()
+            .filter(|d| d.name == "limit_req_zone" || d.name == "limit_conn_zone")
+            .filter_map(|d| d.args.iter().find_map(|a| a.strip_prefix("zone="))
+                .map(|z| z.split(':').next().unwrap_or(z).to_string()))
+            .collect();
+
         for d in config.servers() {
-            // 一个 server 块可有多条 listen（如 8080 + 8443 ssl）
-            for (s, tls) in Self::build_server(d, base_dir)? {
-                let s = Arc::new(s);
-                if !by_port.contains_key(&s.listen) {
-                    listeners.push(Listener {
-                        addr: std::net::SocketAddr::from(([127, 0, 0, 1], s.listen)),
-                        tls,
-                    });
+            Self::warn_unknown(
+                d,
+                &["listen", "server_name", "root", "index", "autoindex", "try_files",
+                   "error_page", "client_max_body_size", "return", "rewrite", "add_header",
+                   "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
+                   "proxy_send_timeout", "proxy_next_upstream", "limit_conn", "http2",
+                   "ssl_certificate", "ssl_certificate_key", "ssl_min_version",
+                   "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
+                   "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
+                   "content_by_rust", "access_by_rust", "rewrite_by_rust"],
+                "server",
+                &mut warnings,
+            );
+
+            let tmpl = Self::build_template(d, base_dir, &limits_declared, &mut warnings)?;
+
+            let mut listens: Vec<(SocketAddr, ListenFlags)> = Vec::new();
+            for l in d.block.iter().filter(|x| x.name == "listen") {
+                listens.push(parse_listen(l)?);
+            }
+            if listens.is_empty() {
+                listens.push((
+                    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 8080)),
+                    ListenFlags::default(),
+                ));
+                warnings.push(format!(
+                    "server '{}'（第 {} 行）没有 listen 指令，默认监听 0.0.0.0:8080",
+                    tmpl.server_name, d.line
+                ));
+            }
+
+            for (addr, flags) in listens {
+                if !order.contains(&addr) {
+                    order.push(addr);
                 }
-                by_port.entry(s.listen).or_insert_with(Vec::new).push(s);
+                let ep = endpoints.entry(addr).or_insert(Endpoint {
+                    ssl: false,
+                    http2: false,
+                    min_tls: tmpl.min_tls,
+                    backlog: None,
+                    ipv6only: None,
+                });
+                if flags.backlog.is_some() {
+                    ep.backlog = flags.backlog;
+                }
+                if flags.ipv6only.is_some() {
+                    ep.ipv6only = flags.ipv6only;
+                }
+                if flags.ssl {
+                    if ep.ssl {
+                        // 同一地址已有 ssl server，确保证书齐全
+                    }
+                    ep.ssl = true;
+                    let cert = tmpl
+                        .ssl_cert
+                        .clone()
+                        .ok_or_else(|| AppError::Other(format!(
+                            "{addr} 声明了 listen ssl，但 server '{}' 缺少 ssl_certificate",
+                            tmpl.server_name
+                        )))?;
+                    let key = tmpl.ssl_key.clone().ok_or_else(|| AppError::Other(format!(
+                        "{addr} 声明了 listen ssl，但 server '{}' 缺少 ssl_certificate_key",
+                        tmpl.server_name
+                    )))?;
+                    tls_specs.entry(addr).or_default().push(CertSpec {
+                        names: tmpl.server_names.clone(),
+                        cert,
+                        key,
+                    });
+                } else if ep.ssl {
+                    // 该端点已被其他 server 要求 TLS：这个 vhost 复用同一监听 socket，
+                    // 只能走 HTTPS（与 nginx 行为一致：同一地址不能同时有明文与 TLS）
+                    plain_conflicts.push(addr);
+                }
+                ep.http2 |= flags.http2 || tmpl.http2;
+                if tmpl.min_tls == TlsVersion::Tls12 {
+                    ep.min_tls = TlsVersion::Tls12;
+                }
+
+                let server = Server {
+                    server_name: tmpl.server_name.clone(),
+                    server_names: tmpl.server_names.clone(),
+                    is_default_server: flags.default_server,
+                    locations: tmpl.locations.clone(),
+                    root: tmpl.root.clone(),
+                    index: tmpl.index.clone(),
+                    autoindex: tmpl.autoindex,
+                    error_pages: tmpl.error_pages.clone(),
+                    client_max_body_size: tmpl.client_max_body_size,
+                    add_headers: tmpl.add_headers.clone(),
+                    proxy_set_headers: tmpl.proxy_set_headers.clone(),
+                    limit_conn: tmpl.limit_conn.clone(),
+                };
+                let list = groups.entry(addr).or_default();
+                if flags.default_server {
+                    if defaults.contains_key(&addr) {
+                        return Err(AppError::Other(format!(
+                            "{addr} 上配置了多个 default_server，只能有一个"
+                        )));
+                    }
+                    defaults.insert(addr, list.len());
+                }
+                list.push(Arc::new(server));
             }
         }
-        Ok(Router { by_port, listeners })
+
+        // 按配置顺序组装监听端点
+        let mut listeners = Vec::new();
+        for addr in order {
+            let ep = endpoints.get(&addr);
+            let tls = ep.filter(|e| e.ssl).map(|e| TlsOptions {
+                specs: tls_specs.remove(&addr).unwrap_or_default(),
+                http2: e.http2,
+                min_version: e.min_tls,
+            });
+            if ep.map(|e| e.ssl).unwrap_or(false) && tls.as_ref().map(|t| t.specs.is_empty()).unwrap_or(true) {
+                return Err(AppError::Other(format!("{addr} 需要 TLS 但没有加载到证书")));
+            }
+            listeners.push(Listener {
+                addr,
+                tls,
+                backlog: ep.and_then(|e| e.backlog),
+                ipv6only: ep.and_then(|e| e.ipv6only),
+            });
+        }
+
+        // 默认 vhost 放到下标 0
+        for (addr, idx) in &defaults {
+            if let Some(list) = groups.get_mut(addr) {
+                if *idx < list.len() && *idx != 0 {
+                    list.swap(0, *idx);
+                }
+            }
+        }
+        // 没有显式 default_server 时，把"名字最少/第一个"的放前面（nginx：配置顺序第一个）
+        let out_groups: HashMap<SocketAddr, AddrGroup> = groups
+            .into_iter()
+            .map(|(a, servers)| (a, AddrGroup { servers }))
+            .collect();
+
+        if !plain_conflicts.is_empty() {
+            warnings.push(format!(
+                "端点 {plain_conflicts:?} 同时被声明为明文与 TLS 监听，统一按 HTTPS 提供服务"
+            ));
+        }
+
+        Ok(Router {
+            groups: out_groups,
+            listeners,
+            warnings,
+        })
     }
 
-    fn build_server(
+    /// 未知指令告警：拼错的指令静默失效是网关最难排查的一类故障
+    fn warn_unknown(
+        d: &Directive,
+        known: &[&str],
+        ctx: &str,
+        warnings: &mut Vec<String>,
+    ) {
+        for child in &d.block {
+            if child.name == "location" {
+                continue;
+            }
+            if !known.contains(&child.name.as_str()) {
+                warnings.push(format!(
+                    "{ctx} 块第 {} 行：未知指令 '{name}'（已忽略，请检查拼写或是否尚未支持）",
+                    child.line,
+                    name = child.name
+                ));
+            }
+        }
+    }
+
+    fn build_template(
         d: &Directive,
         base_dir: &PathBuf,
-    ) -> Result<Vec<(Server, Option<TlsPaths>)>, AppError> {
-        let mut server = Server {
-            listen: 8080,
+        limits: &[String],
+        warnings: &mut Vec<String>,
+    ) -> Result<ServerTemplate, AppError> {
+        let mut tmpl = ServerTemplate {
             server_name: "localhost".to_string(),
             server_names: vec!["localhost".to_string()],
             locations: Vec::new(),
@@ -221,89 +521,116 @@ impl Router {
             error_pages: HashMap::new(),
             client_max_body_size: None,
             add_headers: Vec::new(),
+            proxy_set_headers: Vec::new(),
+            proxy_connect_timeout: 3,
+            proxy_read_timeout: 60,
+            proxy_send_timeout: 60,
+            limit_conn: Vec::new(),
+            ssl_cert: None,
+            ssl_key: None,
+            min_tls: TlsVersion::Tls12,
+            http2: false,
         };
-        // TLS：收集全部 listen 指令；`listen <port> ssl` 需要 ssl_certificate / ssl_certificate_key
-        let mut listens: Vec<(u16, bool)> = Vec::new();
-        for l in d.block.iter().filter(|x| x.name == "listen") {
-            if let Some(port) = l
-                .arg(0)
-                .and_then(|s| s.split(':').next_back())
-                .and_then(|s| s.parse().ok())
-            {
-                let ssl = l.args.iter().skip(1).any(|a| a == "ssl");
-                listens.push((port, ssl));
-            }
-        }
-        if listens.is_empty() {
-            listens.push((8080, false));
-        }
-        let tls_of = |ssl: bool| -> Result<Option<TlsPaths>, AppError> {
-            if !ssl {
-                return Ok(None);
-            }
-            let cert = d
-                .find("ssl_certificate")
-                .and_then(|x| x.arg(0))
-                .ok_or_else(|| AppError::Other("listen ssl 缺少 ssl_certificate".into()))?;
-            let key = d
-                .find("ssl_certificate_key")
-                .and_then(|x| x.arg(0))
-                .ok_or_else(|| AppError::Other("listen ssl 缺少 ssl_certificate_key".into()))?;
-            Ok(Some(TlsPaths {
-                cert: crate::resolve_path(cert, base_dir),
-                key: crate::resolve_path(key, base_dir),
-            }))
-        };
-        // server_name：多值 + 通配符（*.example.com / example.*）
         if let Some(sn) = d.find("server_name") {
             let names: Vec<String> = sn
                 .args
                 .iter()
                 .filter(|n| !n.eq_ignore_ascii_case("default_server"))
-                .map(|n| n.to_string())
+                .cloned()
                 .collect();
             if !names.is_empty() {
-                server.server_names = names.clone();
-                server.server_name = names[0].clone();
+                tmpl.server_names = names.clone();
+                tmpl.server_name = names[0].clone();
             }
         }
         if let Some(root) = d.find("root").and_then(|x| x.arg(0)) {
-            server.root = Some(crate::resolve_path(root, base_dir));
+            tmpl.root = Some(crate::resolve_path(root, base_dir));
         }
         if let Some(ix) = d.find("index") {
-            let names: Vec<String> = ix.args.iter().map(|s| s.to_string()).collect();
+            let names: Vec<String> = ix.args.clone();
             if !names.is_empty() {
-                server.index = names;
+                tmpl.index = names;
             }
         }
         if let Some(ai) = d.find("autoindex") {
-            server.autoindex = ai.arg(0) == Some("on");
+            tmpl.autoindex = ai.arg(0) == Some("on");
         }
-        if let Some(cms) = d
+        if let Some(v) = d
             .find("client_max_body_size")
             .and_then(|x| x.arg(0))
             .and_then(parse_size)
         {
-            server.client_max_body_size = Some(cms);
+            tmpl.client_max_body_size = Some(v);
         }
-        server.error_pages = parse_error_pages(d);
-        server.add_headers = parse_add_headers(d);
+        if let Some(cert) = d.find("ssl_certificate").and_then(|x| x.arg(0)) {
+            tmpl.ssl_cert = Some(crate::resolve_path(cert, base_dir));
+        }
+        if let Some(key) = d.find("ssl_certificate_key").and_then(|x| x.arg(0)) {
+            tmpl.ssl_key = Some(crate::resolve_path(key, base_dir));
+        }
+        if let Some(v) = d.find("ssl_min_version").and_then(|x| x.arg(0)) {
+            tmpl.min_tls = match v.to_ascii_lowercase().as_str() {
+                "tlsv1.2" | "1.2" => TlsVersion::Tls12,
+                "tlsv1.3" | "1.3" => TlsVersion::Tls13,
+                other => {
+                    warnings.push(format!("ssl_min_version 不支持 '{other}'，按 TLS1.2"));
+                    TlsVersion::Tls12
+                }
+            };
+        }
+        if let Some(v) = d.find("http2").and_then(|x| x.arg(0)) {
+            tmpl.http2 = v == "on" || v == "1.3.0" || v == "true";
+        }
+        for h in d.block.iter().filter(|x| x.name == "proxy_set_header") {
+            if let (Some(k), Some(v)) = (h.arg(0), h.arg(1)) {
+                tmpl.proxy_set_headers.push((k.to_string(), v.to_string()));
+            }
+        }
+        for (name, slot) in [
+            ("proxy_connect_timeout", &mut tmpl.proxy_connect_timeout),
+            ("proxy_read_timeout", &mut tmpl.proxy_read_timeout),
+            ("proxy_send_timeout", &mut tmpl.proxy_send_timeout),
+        ] {
+            if let Some(v) = d.find(name).and_then(|x| x.arg(0)) {
+                *slot = parse_time_secs(v, *slot);
+            }
+        }
+        for c in d.block.iter().filter(|x| x.name == "limit_conn") {
+            match crate::limit::parse_conn_rule(c) {
+                Some(rule) => {
+                    if !limits.contains(&rule.zone) {
+                        return Err(AppError::Other(format!(
+                            "第 {} 行 limit_conn 引用了未声明的区域 '{}'",
+                            c.line, rule.zone
+                        )));
+                    }
+                    tmpl.limit_conn.push(rule);
+                }
+                None => {
+                    return Err(AppError::Other(format!(
+                        "第 {} 行 limit_conn 需要 `<zone> <number>`",
+                        c.line
+                    )))
+                }
+            }
+        }
+        tmpl.error_pages = parse_error_pages(d);
+        tmpl.add_headers = parse_add_headers(d);
 
         for loc in d.block.iter().filter(|x| x.name == "location") {
-            server.locations.push(Self::build_location(loc, base_dir)?);
+            tmpl.locations
+                .push(Self::build_location(loc, base_dir, &tmpl, limits, warnings)?);
         }
-        // 每个 listen 端口生成一个 Server 实例（TLS 只挂在 ssl 端口上）
-        let mut out = Vec::new();
-        for (port, ssl) in &listens {
-            let mut s = server.clone();
-            s.listen = *port;
-            out.push((s, tls_of(*ssl)?));
-        }
-        Ok(out)
+        Ok(tmpl)
     }
 
-    fn build_location(d: &Directive, base_dir: &PathBuf) -> Result<Location, AppError> {
-        // location [=|^~|~|~*] pattern
+    fn build_location(
+        d: &Directive,
+        base_dir: &PathBuf,
+        tmpl: &ServerTemplate,
+        limits: &[String],
+        warnings: &mut Vec<String>,
+    ) -> Result<Location, AppError> {
         let (modifier, pattern) = match (d.arg(0), d.arg(1)) {
             (Some(m), Some(p)) if ["=", "^~", "~", "~*"].contains(&m) => (Some(m), p),
             (Some(p), _) => (None, p),
@@ -316,7 +643,10 @@ impl Router {
             ret: None,
             proxy_pass: None,
             proxy_set_headers: Vec::new(),
-            proxy_read_timeout: 60,
+            proxy_read_timeout: tmpl.proxy_read_timeout,
+            proxy_connect_timeout: tmpl.proxy_connect_timeout,
+            proxy_send_timeout: tmpl.proxy_send_timeout,
+            proxy_next_upstream: vec!["error".to_string(), "timeout".to_string()],
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
             root: None,
@@ -326,27 +656,54 @@ impl Router {
             autoindex: false,
             error_pages: HashMap::new(),
             add_headers: parse_add_headers(d),
+            limit_req: Vec::new(),
+            internal: false,
+            client_max_body_size: None,
         };
-        if let Some(root) = d.find("root").and_then(|x| x.arg(0)) {
-            loc.root = Some(crate::resolve_path(root, base_dir));
+        Self::warn_unknown(
+            d,
+            &["rewrite", "return", "proxy_pass", "proxy_set_header", "proxy_read_timeout",
+               "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream", "root",
+               "alias", "index", "try_files", "autoindex", "error_page", "add_header",
+               "limit_req", "internal", "client_max_body_size", "content_by_lua",
+               "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
+               "rewrite_by_lua_file", "content_by_rust", "access_by_rust", "rewrite_by_rust"],
+            &format!("location '{}'", loc.pattern),
+            warnings,
+        );
+        if let Some(v) = d.find("root").and_then(|x| x.arg(0)) {
+            loc.root = Some(crate::resolve_path(v, base_dir));
         }
-        if let Some(alias) = d.find("alias").and_then(|x| x.arg(0)) {
-            loc.alias = Some(crate::resolve_path(alias, base_dir));
+        if let Some(v) = d.find("alias").and_then(|x| x.arg(0)) {
+            loc.alias = Some(crate::resolve_path(v, base_dir));
         }
         if let Some(ix) = d.find("index") {
-            let names: Vec<String> = ix.args.iter().map(|s| s.to_string()).collect();
-            if !names.is_empty() {
-                loc.index = Some(names);
+            if !ix.args.is_empty() {
+                loc.index = Some(ix.args.clone());
             }
         }
         if let Some(tf) = d.find("try_files") {
-            let v: Vec<String> = tf.args.iter().map(|s| s.to_string()).collect();
-            if v.len() >= 2 {
-                loc.try_files = Some(v);
+            if tf.args.len() >= 2 {
+                loc.try_files = Some(tf.args.clone());
+            } else {
+                return Err(AppError::Other(format!(
+                    "第 {} 行 try_files 至少需要一个文件和一个兜底项",
+                    tf.line
+                )));
             }
         }
         if let Some(ai) = d.find("autoindex") {
             loc.autoindex = ai.arg(0) == Some("on");
+        }
+        if d.find("internal").is_some() {
+            loc.internal = true;
+        }
+        if let Some(v) = d
+            .find("client_max_body_size")
+            .and_then(|x| x.arg(0))
+            .and_then(parse_size)
+        {
+            loc.client_max_body_size = Some(v);
         }
         loc.error_pages = parse_error_pages(d);
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
@@ -357,18 +714,57 @@ impl Router {
                 loc.proxy_set_headers.push((k.to_string(), v.to_string()));
             }
         }
-        if let Some(t) = d.find("proxy_read_timeout").and_then(|x| x.arg(0)) {
-            loc.proxy_read_timeout = t.parse().unwrap_or(60);
+        for (name, slot) in [
+            ("proxy_connect_timeout", &mut loc.proxy_connect_timeout),
+            ("proxy_read_timeout", &mut loc.proxy_read_timeout),
+            ("proxy_send_timeout", &mut loc.proxy_send_timeout),
+        ] {
+            if let Some(v) = d.find(name).and_then(|x| x.arg(0)) {
+                *slot = parse_time_secs(v, *slot);
+            }
+        }
+        if let Some(nu) = d.find("proxy_next_upstream") {
+            loc.proxy_next_upstream = nu.args.clone();
+        }
+        for r in d.block.iter().filter(|x| x.name == "limit_req") {
+            match crate::limit::parse_req_rule(r) {
+                Some(rule) => {
+                    if !limits.contains(&rule.zone) {
+                        return Err(AppError::Other(format!(
+                            "location '{}' 第 {} 行 limit_req 引用了未声明的区域 '{}'",
+                            loc.pattern, r.line, rule.zone
+                        )));
+                    }
+                    loc.limit_req.push(rule);
+                }
+                None => {
+                    return Err(AppError::Other(format!(
+                        "第 {} 行 limit_req 需要 `zone=<name> [burst=n]`",
+                        r.line
+                    )))
+                }
+            }
         }
         for r in d.block.iter().filter(|x| x.name == "rewrite") {
-            let pattern = r.arg(0).ok_or_else(|| AppError::Other("rewrite 缺少 pattern".into()))?;
-            let replacement = r.arg(1).ok_or_else(|| AppError::Other("rewrite 缺少 replacement".into()))?;
+            let pattern = r
+                .arg(0)
+                .ok_or_else(|| AppError::Other(format!("第 {} 行 rewrite 缺少 pattern", r.line)))?;
+            let replacement = r
+                .arg(1)
+                .ok_or_else(|| AppError::Other(format!("第 {} 行 rewrite 缺少 replacement", r.line)))?;
             let flag = match r.arg(2) {
                 Some("last") => RewriteFlag::Last,
                 Some("break") => RewriteFlag::Break,
                 Some("redirect") => RewriteFlag::Redirect,
                 Some("permanent") => RewriteFlag::Permanent,
-                None | Some(_) => RewriteFlag::Last,
+                None => RewriteFlag::Last,
+                Some(other) => {
+                    warnings.push(format!(
+                        "rewrite 标志 '{other}'（第 {} 行）不支持，按 last 处理",
+                        r.line
+                    ));
+                    RewriteFlag::Last
+                }
             };
             loc.rewrites.push(RewriteRule {
                 pattern: regex::Regex::new(pattern)
@@ -378,7 +774,6 @@ impl Router {
             });
         }
         if let Some(ret) = d.find("return") {
-            // nginx 语义：`return <code> [text|URL]`；`return <URL>` 等价 302 重定向
             match ret.arg(0).and_then(|s| s.parse::<u16>().ok()) {
                 Some(code) => {
                     loc.ret = Some(ReturnAction {
@@ -392,11 +787,12 @@ impl Router {
                             code: 302,
                             text: Some(url.to_string()),
                         });
+                    } else {
+                        return Err(AppError::Other(format!("第 {} 行 return 缺少参数", ret.line)));
                     }
                 }
             }
         }
-        // *_by_rust 处理器
         for name in Phase::directive_names() {
             if let Some(dir) = d.find(name) {
                 let phase = Phase::from_directive(name).unwrap();
@@ -405,8 +801,14 @@ impl Router {
                 }
             }
         }
-        // *_by_lua / *_by_lua_file 脚本
-        for name in ["rewrite_by_lua", "rewrite_by_lua_file", "access_by_lua", "access_by_lua_file", "content_by_lua", "content_by_lua_file"] {
+        for name in [
+            "rewrite_by_lua",
+            "rewrite_by_lua_file",
+            "access_by_lua",
+            "access_by_lua_file",
+            "content_by_lua",
+            "content_by_lua_file",
+        ] {
             if let Some(dir) = d.find(name) {
                 let phase = match name.split('_').next().unwrap() {
                     "rewrite" => Phase::Rewrite,
@@ -421,80 +823,160 @@ impl Router {
         Ok(loc)
     }
 
-    /// server_name 通配符匹配：`*.example.com` / `example.*`
-    fn wildcard_match(pattern: &str, host: &str) -> bool {
-        if let Some(suf) = pattern.strip_prefix("*.") {
-            host.to_ascii_lowercase().ends_with(&format!(".{}", suf.to_ascii_lowercase()))
-        } else if let Some(pre) = pattern.strip_suffix(".*") {
-            host.to_ascii_lowercase().starts_with(&format!("{}.", pre.to_ascii_lowercase()))
-        } else {
-            false
-        }
-    }
-
-    /// 选择 server（Host 匹配，nginx 优先级）：精确名 > 通配符 > 第一个
-    pub fn match_server(&self, port: u16, host: Option<&str>) -> Option<&Arc<Server>> {
-        let servers = self.by_port.get(&port)?;
-        let host = host.map(|h| h.split(':').next().unwrap_or(h)).unwrap_or("");
-        if !host.is_empty() {
+    /// 按真实监听地址 + Host 选 server（nginx ngx_http_find_virtual_server 的顺序）：
+    /// 精确名 > `*.example.com`（最长）> `example.*`（最长）> default_server > 配置顺序第一个
+    pub fn match_server(&self, local: SocketAddr, host: Option<&str>) -> Option<&Arc<Server>> {
+        let group = self
+            .groups
+            .get(&local)
+            // 兜底：同一端口其他地址绑定时共享 vhost 集合（例如 0.0.0.0 与 127.0.0.1 混配）
+            .or_else(|| {
+                self.groups
+                    .iter()
+                    .find(|(a, _)| a.port() == local.port())
+                    .map(|(_, g)| g)
+            })?;
+        let servers = &group.servers;
+        if let Some(h) = host.map(strip_port).filter(|h| !h.is_empty()) {
             if let Some(s) = servers
                 .iter()
-                .find(|s| s.server_names.iter().any(|n| n.eq_ignore_ascii_case(host)))
+                .find(|s| s.server_names.iter().any(|n| n.eq_ignore_ascii_case(h)))
             {
                 return Some(s);
             }
-            if let Some(s) = servers
-                .iter()
-                .find(|s| s.server_names.iter().any(|n| Self::wildcard_match(n, host)))
-            {
+            if let Some(s) = best_wildcard(servers, h, true) {
+                return Some(s);
+            }
+            if let Some(s) = best_wildcard(servers, h, false) {
                 return Some(s);
             }
         }
-        servers.first()
+        servers
+            .iter()
+            .find(|s| s.is_default_server)
+            .or(servers.first())
     }
 
-    /// 选择 location（nginx 算法）：
-    /// 精确 → 最长前缀（`^~` 则跳过正则）→ 配置顺序第一个正则 → 最长前缀
+    /// 启动/`-t` 用：每个监听端点上的 vhost 概况（运维只需看日志就知道 Host 会落到哪）
+    pub fn describe_listeners(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for l in &self.listeners {
+            let tls = match &l.tls {
+                Some(_) => " TLS",
+                None => "",
+            };
+            let names = self.groups.get(&l.addr).map_or(String::new(), |g| {
+                g.servers
+                    .iter()
+                    .map(|s| {
+                        if s.is_default_server {
+                            format!("{}(default)", s.server_name)
+                        } else {
+                            s.server_name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            out.push(format!("{}{tls} -> [{names}]", l.addr));
+        }
+        out
+    }
+
+    /// 选择 location（nginx 算法）
     pub fn match_location<'s>(server: &'s Server, path: &str) -> Option<&'s Location> {
-        // 1. 精确匹配
         if let Some(l) = server.locations.iter().find(|l| {
             matches!(&l.kind, LocationKind::Exact(p) if p == path)
         }) {
             return Some(l);
         }
-        // 2. 最长前缀
         let mut best_prefix: Option<(&Location, usize)> = None;
         for l in &server.locations {
             if let Some(p) = l.kind.prefix_path() {
-                if path.starts_with(p)
-                    && best_prefix.map_or(true, |(_, len)| p.len() > len)
-                {
+                if path.starts_with(p) && best_prefix.map_or(true, |(_, len)| p.len() > len) {
                     best_prefix = Some((l, p.len()));
                 }
             }
         }
         if let Some((l, _)) = best_prefix {
             if l.kind.is_caret() {
-                return Some(l); // ^~：赢过正则
+                return Some(l);
             }
         }
-        // 3. 按配置顺序找第一个命中的正则
         for l in &server.locations {
             if !l.kind.is_regex() {
                 continue;
             }
             let hit = match &l.kind {
-                LocationKind::Regex(re) => re.is_match(path),
-                LocationKind::RegexI(re) => re.is_match(path),
+                LocationKind::Regex(re) | LocationKind::RegexI(re) => re.is_match(path),
                 _ => false,
             };
             if hit {
                 return Some(l);
             }
         }
-        // 4. 最长前缀兜底
         best_prefix.map(|(l, _)| l)
     }
+}
+
+fn strip_port(host: &str) -> &str {
+    if let Some((h, _)) = host.rsplit_once(']') {
+        return h;
+    }
+    host.split(':').next().unwrap_or(host)
+}
+
+/// server_name 通配符：`*.example.com` / `example.*`
+fn wildcard_match(pattern: &str, host: &str) -> bool {
+    let (p, h) = (pattern.to_ascii_lowercase(), host.to_ascii_lowercase());
+    if let Some(suf) = p.strip_prefix("*.") {
+        h.ends_with(&format!(".{suf}"))
+    } else if let Some(pre) = p.strip_suffix(".*") {
+        h.starts_with(&format!("{pre}."))
+    } else {
+        false
+    }
+}
+
+/// 通配符 vhost 里取最长匹配者：`prefix_form=true` 看 `*.example.com`，false 看 `example.*`
+fn best_wildcard<'a>(
+    servers: &'a [Arc<Server>],
+    host: &str,
+    prefix_form: bool,
+) -> Option<&'a Arc<Server>> {
+    let mut best: Option<(usize, &'a Arc<Server>)> = None;
+    for s in servers {
+        for n in &s.server_names {
+            let form_ok = if prefix_form {
+                n.starts_with("*.")
+            } else {
+                n.ends_with(".*")
+            };
+            if !form_ok || !wildcard_match(n, host) {
+                continue;
+            }
+            if best.map_or(true, |(len, _)| n.len() > len) {
+                best = Some((n.len(), s));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// location 级 add_header 为空时回退到 server 级（nginx：location 一旦有 add_header 就完全覆盖 server 级）
+pub fn effective_add_headers<'a>(
+    loc: Option<&'a Location>,
+    server: &'a Server,
+) -> Vec<&'a (String, String)> {
+    let mut out: Vec<&(String, String)> = Vec::new();
+    if let Some(l) = loc {
+        if !l.add_headers.is_empty() {
+            out.extend(l.add_headers.iter());
+            return out;
+        }
+    }
+    out.extend(server.add_headers.iter());
+    out
 }
 
 fn parse_add_headers(d: &Directive) -> Vec<(String, String)> {
@@ -505,5 +987,284 @@ fn parse_add_headers(d: &Directive) -> Vec<(String, String)> {
         .collect()
 }
 
-// 保留 upstream 引用避免未使用告警（proxy 引擎持有 pool，Router 不直接用）
-pub type _PoolRef = UpstreamPool;
+/// `proxy_set_header` 合并：server 级为默认，location 级同名覆盖
+pub fn effective_proxy_headers<'a>(
+    loc: &'a Location,
+    server: &'a Server,
+) -> Vec<(&'a str, &'a str)> {
+    let mut out: Vec<(&str, &str)> = server
+        .proxy_set_headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    for (k, v) in &loc.proxy_set_headers {
+        if let Some(slot) = out.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            *slot = (k.as_str(), v.as_str());
+        } else {
+            out.push((k.as_str(), v.as_str()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(s: &str) -> Config {
+        Config::parse(s).unwrap()
+    }
+
+    fn build(s: &str) -> Router {
+        Router::build(&cfg(s), &PathBuf::from(".")).unwrap()
+    }
+
+    const TWO_HOSTS: &str = r#"
+        server {
+            listen 127.0.0.1:18080;
+            server_name a.example.com;
+            location = /x { return 200 "a"; }
+        }
+        server {
+            listen 127.0.0.1:18080;
+            server_name b.example.com;
+            location = /x { return 200 "b"; }
+        }
+        server {
+            listen 127.0.0.1:18081 default_server;
+            server_name c.example.com;
+            location = /x { return 200 "c"; }
+        }
+    "#;
+
+    #[test]
+    fn routes_by_actual_listen_address_not_just_port() {
+        let r = build(TWO_HOSTS);
+        let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:18081".parse().unwrap();
+        assert_eq!(
+            r.match_server(a, Some("b.example.com")).unwrap().server_name,
+            "b.example.com"
+        );
+        assert_eq!(
+            r.match_server(b, Some("b.example.com")).unwrap().server_name,
+            "c.example.com",
+            "另一个监听地址上的 vhost 不应串到这里"
+        );
+    }
+
+    #[test]
+    fn host_with_port_still_matches() {
+        let r = build(TWO_HOSTS);
+        let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        assert_eq!(
+            r.match_server(a, Some("a.example.com:18080")).unwrap().server_name,
+            "a.example.com"
+        );
+    }
+
+    #[test]
+    fn wildcard_vhost_prefers_exact_then_longest_wildcard_then_default() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18087; server_name www.*; location / { return 200 suffix; } }
+               server { listen 127.0.0.1:18087; server_name *.a.example.com; location / { return 200 short; } }
+               server { listen 127.0.0.1:18087; server_name hit.example.com; location / { return 200 exact; } }
+               server { listen 127.0.0.1:18087 default_server; server_name fallback; location / { return 200 default; } }"#,
+        );
+        let addr: SocketAddr = "127.0.0.1:18087".parse().unwrap();
+        let pick =
+            |h: &str| r.match_server(addr, Some(h)).unwrap().server_name.to_string();
+        // 1. 精确名赢过所有通配
+        assert_eq!(pick("hit.example.com"), "hit.example.com");
+        // 2. 前缀通配命中
+        assert_eq!(pick("q.a.example.com"), "*.a.example.com");
+        // 3. 后缀通配命中
+        assert_eq!(pick("www.long.io"), "www.*");
+        // 4. 通配只匹配子域：*.a.example.com 不命中 a.example.com
+        assert_eq!(pick("a.example.com"), "fallback");
+        // 5. 都不匹配时走 default_server（不是配置顺序第一个）
+        assert_eq!(pick("nothing.here"), "fallback");
+        // 6. 大小写无关；没有 Host 头也走 default_server
+        assert_eq!(pick("HIT.EXAMPLE.COM"), "hit.example.com");
+        assert_eq!(r.match_server(addr, None).unwrap().server_name, "fallback");
+    }
+
+    #[test]
+    fn unknown_directive_is_warned_not_silently_dropped() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18099; server_name w; prxoy_pass http://127.0.0.1:1; }"#,
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("prxoy_pass")),
+            "实际告警: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_listen_parameter() {
+        let err = Router::build(
+            &cfg("server { listen 127.0.0.1:18080 spdy; }"),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spdy"));
+    }
+
+    #[test]
+    fn listen_backlog_and_ipv6only_flags_reach_the_listener() {
+        let r = build("server { listen 18080 backlog=2048 ipv6only=off; }");
+        let l = &r.listeners[0];
+        assert_eq!(l.backlog, Some(2048));
+        assert_eq!(l.ipv6only, Some(false));
+        assert_eq!(l.addr, "0.0.0.0:18080".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn listeners_follow_config_order() {
+        let r = build(
+            "server { listen 18082; } server { listen 18081; } server { listen 18083; }",
+        );
+        let ports: Vec<u16> = r.listeners.iter().map(|l| l.addr.port()).collect();
+        assert_eq!(ports, vec![18082, 18081, 18083]);
+    }
+
+    #[test]
+    fn multiple_listen_lines_share_one_server_block() {
+        let r = build("server { listen 18084; listen 18085; server_name m; }");
+        let ports: Vec<u16> = r.listeners.iter().map(|l| l.addr.port()).collect();
+        assert!(ports.contains(&18084) && ports.contains(&18085));
+        // 同一个 server 块要出现在两个监听端点的 vhost 集合里
+        for port in [18084u16, 18085] {
+            let s = r
+                .match_server(format!("127.0.0.1:{port}").parse().unwrap(), Some("m"))
+                .unwrap_or_else(|| panic!("{port} 上没有 vhost"));
+            assert_eq!(s.server_name, "m");
+        }
+    }
+
+    #[test]
+    fn two_default_servers_on_one_endpoint_is_fatal() {
+        let err = Router::build(
+            &cfg(
+                "server { listen 127.0.0.1:18080 default_server; } server { listen 127.0.0.1:18080 default_server; }",
+            ),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("default_server"));
+    }
+
+    #[test]
+    fn listen_forms() {
+        assert_eq!(
+            parse_listen_addr("8080").unwrap(),
+            "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen_addr("127.0.0.1:8080").unwrap(),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen_addr("[::]:8080").unwrap(),
+            "[::]:8080".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(parse_listen_addr("nonsense"), None);
+    }
+
+    #[test]
+    fn location_priority_matches_nginx() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080;
+                 location / { return 200 root; }
+                 location = /a/b/c/d { return 200 exact; }
+                 location /a/ { return 200 prefix; }
+                 location ^~ /a/b/ { return 200 caret; }
+                 location ~ ^/a/b/c { return 200 regex1; }
+                 location ~ ^/a/o { return 200 regex2; }
+               }"#,
+        );
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        let pick = |p: &str| Router::match_location(&s, p).unwrap().pattern.clone();
+        // 精确匹配优先于一切（这里同时命中 ^~ 前缀与正则）
+        assert_eq!(pick("/a/b/c/d"), "/a/b/c/d");
+        // ^~ 前缀命中后不再检查正则（nginx：`^~` 只在"它是最长前缀"时抑制正则）
+        assert_eq!(pick("/a/b/c/x"), "/a/b/");
+        // 最长前缀不是 ^~ 时，按配置顺序取第一个命中的正则
+        assert_eq!(pick("/a/other"), "^/a/o");
+        assert_eq!(pick("/a/xyz"), "/a/");
+        assert_eq!(pick("/zzz"), "/");
+    }
+
+    #[test]
+    fn server_level_proxy_headers_merge_with_location() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; proxy_set_header X-A 1; proxy_set_header X-B 1;
+                 location /p/ { proxy_pass http://127.0.0.1:1; proxy_set_header X-B 2; } }"#,
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let loc = Router::match_location(&s, "/p/x").unwrap();
+        let merged = effective_proxy_headers(loc, &s);
+        assert!(merged.contains(&("X-A", "1")));
+        assert!(merged.contains(&("X-B", "2")));
+        assert!(!merged.contains(&("X-B", "1")));
+    }
+
+    #[test]
+    fn limit_req_must_reference_declared_zone() {
+        let err = Router::build(
+            &cfg("server { listen 127.0.0.1:18080; location / { limit_req zone=nope; } }"),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("未声明的区域"));
+    }
+
+    #[test]
+    fn add_header_location_overrides_server() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; add_header X-S 1;
+                 location /a { add_header X-L 1; }
+                 location /b { return 200 x; } }"#,
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let loc_a = Router::match_location(&s, "/a").unwrap();
+        assert_eq!(effective_add_headers(Some(loc_a), &s).len(), 1);
+        let loc_b = Router::match_location(&s, "/b").unwrap();
+        assert_eq!(effective_add_headers(Some(loc_b), &s).len(), 1);
+    }
+
+    #[test]
+    fn try_files_needs_fallback() {
+        let err = Router::build(
+            &cfg("server { listen 127.0.0.1:18080; location / { try_files $uri; } }"),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("try_files"));
+    }
+
+    #[test]
+    fn ssl_listen_without_cert_is_fatal() {
+        let err = Router::build(
+            &cfg("server { listen 127.0.0.1:18443 ssl; server_name x; }"),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ssl_certificate"));
+    }
+
+    #[test]
+    fn default_server_goes_first() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; server_name first; }
+               server { listen 127.0.0.1:18080 default_server; server_name chosen; }"#,
+        );
+        let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        assert_eq!(r.match_server(a, Some("unknown.com")).unwrap().server_name, "chosen");
+        assert_eq!(r.match_server(a, None).unwrap().server_name, "chosen");
+    }
+}

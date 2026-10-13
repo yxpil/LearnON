@@ -192,14 +192,6 @@ impl Parser {
         self.tokens.get(self.pos)
     }
 
-    fn next(&mut self) -> Option<(Token, usize)> {
-        let t = self.tokens.get(self.pos).cloned();
-        if t.is_some() {
-            self.pos += 1;
-        }
-        t
-    }
-
     fn parse_block(&mut self, term: Option<usize>) -> Result<Vec<Directive>, ConfigError> {
         let mut directives = Vec::new();
         loop {

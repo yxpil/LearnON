@@ -215,6 +215,11 @@ fn push_args_table(lua: &Lua, args: Vec<(String, LuaArgValue)>) -> LuaResult<Lua
 }
 
 impl LuaEngine {
+    /// VM 实例数（启动日志用）
+    pub fn vm_count(&self) -> usize {
+        self.vms.len()
+    }
+
     pub fn new(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
         let dicts = SharedDicts::parse_all(config);
 
@@ -582,7 +587,7 @@ impl LuaEngine {
         ngx.set("_get_status", status_get)?;
         ngx.set("_set_status", status_set)?;
         let mt = lua.create_table()?;
-        let idx = lua.create_function(move |lua, (t, key): (LuaTable, String)| {
+        let idx = lua.create_function(move |_lua, (t, key): (LuaTable, String)| {
             match key.as_str() {
                 "status" => {
                     let f: LuaFunction = t.raw_get("_get_status")?;
@@ -591,7 +596,7 @@ impl LuaEngine {
                 _ => Ok(LuaValue::Nil),
             }
         })?;
-        let newidx = lua.create_function(move |lua, (t, key, value): (LuaTable, String, LuaValue)| {
+        let newidx = lua.create_function(move |_lua, (t, key, value): (LuaTable, String, LuaValue)| {
             if key == "status" {
                 let code = value.as_integer().unwrap_or(200) as u16;
                 let f: LuaFunction = t.raw_get("_set_status")?;
@@ -668,7 +673,7 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         for m in ["set", "safe_set"] {
             methods.add_method(
                 m,
-                |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+                |_lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
                     let bytes = lua_value_to_bytes(&value)
                         .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
                     this.set(&key, bytes, ex);
@@ -679,7 +684,7 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         // d:add(key, value, ex?) -> bool（已存在则 false）
         methods.add_method(
             "add",
-            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+            |_lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
                 Ok(this.add(&key, bytes, ex))

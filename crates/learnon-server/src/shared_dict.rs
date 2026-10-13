@@ -45,7 +45,6 @@ impl Entry {
 
 #[derive(Debug, Clone)]
 pub struct SharedZone {
-    pub name: String,
     inner: Arc<ZoneInner>,
 }
 
@@ -72,9 +71,8 @@ impl ZoneInner {
 }
 
 impl SharedZone {
-    fn new(name: &str) -> Self {
+    fn new() -> Self {
         SharedZone {
-            name: name.to_string(),
             inner: Arc::new(ZoneInner::new()),
         }
     }
@@ -190,14 +188,10 @@ impl SharedDicts {
         for d in &config.root.block {
             if d.name == "lua_shared_dict" {
                 if let Some(name) = d.arg(0) {
-                    zones.insert(name.to_string(), SharedZone::new(name));
+                    zones.insert(name.to_string(), SharedZone::new());
                 }
             }
         }
         SharedDicts { zones }
-    }
-
-    pub fn get(&self, name: &str) -> Option<SharedZone> {
-        self.zones.get(name).cloned()
     }
 }
