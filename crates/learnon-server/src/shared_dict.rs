@@ -333,46 +333,62 @@ impl SharedZone {
     /// 原子自增整数值；项不存在时若给了 init 则初始化为 init
     pub fn incr(&self, key: &str, delta: i64, init: Option<i64>) -> Result<i64, String> {
         let now = now_epoch();
-        let mut map = self.inner.shard(key).lock().unwrap();
-        let entry = map.get_mut(key);
-        match entry {
-            Some(e) if e.alive(now) => {
-                let text = String::from_utf8_lossy(&e.value).trim().to_string();
-                let cur: i64 = text
-                    .parse()
-                    .map_err(|_| format!("incr: '{key}' 的值不是数字 ({text})"))?;
-                let new = cur + delta;
-                e.value = new.to_string().into_bytes();
-                e.last_used = self.inner.tick();
-                Ok(new)
-            }
-            _ => {
-                let Some(init) = init else {
-                    return Err(format!("incr: '{key}' 不存在且未提供 init"));
-                };
-                let new = init + delta;
-                let val = new.to_string().into_bytes();
-                let cost = key.len() + val.len() + NODE_OVERHEAD;
-                if self.inner.capacity > 0 && cost > self.inner.capacity {
-                    return Err("no memory".to_string());
+        let shard = self.inner.shard(key);
+        // 命中且存活：原地累加，全程只持当前分片锁，不触发淘汰
+        {
+            let mut map = shard.lock().unwrap();
+            if let Some(e) = map.get_mut(key) {
+                if e.alive(now) {
+                    let text = String::from_utf8_lossy(&e.value).trim().to_string();
+                    let cur: i64 = text
+                        .parse()
+                        .map_err(|_| format!("incr: '{key}' 的值不是数字 ({text})"))?;
+                    let new = cur + delta;
+                    e.value = new.to_string().into_bytes();
+                    e.last_used = self.inner.tick();
+                    return Ok(new);
                 }
-                if !self.inner.make_room(cost) {
-                    return Err("no memory".to_string());
-                }
-                let tick = self.inner.tick();
-                map.insert(
-                    key.to_string(),
-                    Entry {
-                        value: val,
-                        expires_at: None,
-                        last_used: tick,
-                        cost,
-                    },
-                );
-                self.inner.used.fetch_add(cost, Ordering::Relaxed);
-                Ok(new)
             }
         }
+        // 不存在/已过期：需要新建。make_room 会遍历锁全部分片，必须先释放当前分片锁再调用，
+        // 否则自死锁（与 set 的腾空间路径同理）
+        let Some(init) = init else {
+            return Err(format!("incr: '{key}' 不存在且未提供 init"));
+        };
+        let new = init + delta;
+        let val = new.to_string().into_bytes();
+        let cost = key.len() + val.len() + NODE_OVERHEAD;
+        if self.inner.capacity > 0 && cost > self.inner.capacity {
+            return Err("no memory".to_string());
+        }
+        if !self.inner.make_room(cost) {
+            return Err("no memory".to_string());
+        }
+        let tick = self.inner.tick();
+        let mut map = shard.lock().unwrap();
+        // 释放锁的窗口里同 key 可能已被其它请求写入且为数字：再走一次累加，避免覆盖
+        if let Some(e) = map.get_mut(key) {
+            if e.alive(now) {
+                let text = String::from_utf8_lossy(&e.value).trim().to_string();
+                if let Ok(cur) = text.parse::<i64>() {
+                    let new2 = cur + delta;
+                    e.value = new2.to_string().into_bytes();
+                    e.last_used = tick;
+                    return Ok(new2);
+                }
+            }
+        }
+        map.insert(
+            key.to_string(),
+            Entry {
+                value: val,
+                expires_at: None,
+                last_used: tick,
+                cost,
+            },
+        );
+        self.inner.used.fetch_add(cost, Ordering::Relaxed);
+        Ok(new)
     }
 
     /// 剩余存活时间：None=不存在，Some(-1.0)=永不过期，Some(x)=剩余秒数
@@ -528,20 +544,21 @@ mod tests {
 
     #[test]
     fn capacity_enforced_with_lru_eviction() {
-        // 容量 200B：每个条目约 64+key+len(value)，放 3 个短串就会超
-        let z = zone(200);
+        // 每条目 cost = NODE_OVERHEAD(64) + key.len + value.len。
+        // 容量 300B：3 个短串（70+70+68=208）都能放下，还没触发淘汰
+        let z = zone(300);
         z.set("a", b"hello".to_vec(), None).unwrap();
         z.set("b", b"world".to_vec(), None).unwrap();
         z.set("c", b"foo".to_vec(), None).unwrap();
-        // 三个都还在（刚好没超）
         assert!(z.get("a").is_some());
         assert!(z.get("b").is_some());
         assert!(z.get("c").is_some());
-        // 再塞一个大的，触发 LRU 淘汰最早插入的 a
+        // 再塞一个大条目（cost=64+1+40=105），208+105>300，触发一次近似 LRU 淘汰
         z.set("d", b"this_is_a_longer_value_to_force_eviction".to_vec(), None)
             .unwrap();
-        // a 可能被淘汰（取决于采样），但 d 一定在
+        // 近似 LRU 淘汰目标不确定，但新写入的 d 一定在，且总占用被压回容量以内
         assert!(z.get("d").is_some());
+        assert!(z.num() <= 3);
     }
 
     #[test]
@@ -552,12 +569,15 @@ mod tests {
 
     #[test]
     fn safe_set_no_eviction() {
-        let z = zone(100);
+        // 容量 200B：a(cost 69) + b(cost 125) = 194 装满但未超
+        let z = zone(200);
         z.set("a", b"fill".to_vec(), None).unwrap();
-        // 填满到接近上限
-        z.set("b", vec![0u8; 50], None).unwrap();
-        // safe_set 一个新的大值应该失败
+        z.set("b", vec![0u8; 60], None).unwrap();
+        // safe_set 一个新的大值（cost 145），194+145>200：safe_set 不淘汰，直接失败
         assert!(z.safe_set("c", vec![0u8; 80], None).is_err());
+        // 且原有条目没有被淘汰
+        assert!(z.get("a").is_some());
+        assert!(z.get("b").is_some());
     }
 
     #[test]
