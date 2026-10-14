@@ -168,6 +168,8 @@ pub struct Server {
 pub struct Listener {
     pub addr: SocketAddr,
     pub tls: Option<TlsOptions>,
+    /// 明文监听是否接受 h2c（prior-knowledge）；TLS 监听的 h2 由 tls.http2 决定
+    pub http2: bool,
     /// `listen ... backlog=N`；None 用全局 accept_backlog
     pub backlog: Option<u32>,
     /// `listen [::]:80 ipv6only=off` 等；None = 默认（仅 IPv6）
@@ -564,6 +566,7 @@ impl Router {
             listeners.push(Listener {
                 addr,
                 tls,
+                http2: ep.map(|e| e.http2).unwrap_or(false),
                 backlog: ep.and_then(|e| e.backlog),
                 ipv6only: ep.and_then(|e| e.ipv6only),
             });

@@ -74,6 +74,7 @@ all gateway logic is hand-written.
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
+| HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
 | `init_by_lua` | runs once at startup | `lua_engine.rs` |
 | `lua_shared_dict` / `ngx.shared.DICT` | cross-request shared dict: get/set/add/replace/delete/incr/ttl/flush_all | `shared_dict.rs` |
@@ -327,6 +328,17 @@ Already done (previously listed as gaps, now implemented):
   non-caching control location with no `X-Cache-Status`.) Not yet implemented: `proxy_cache_use_stale`,
   revalidation (`If-None-Match` to origin), `proxy_cache_purge`, on-disk `keys_zone`, and `Vary`-aware
   keying.
+- **HTTP/2 serving**: LearnON serves HTTP/2 over both transports. On TLS endpoints the `h2` protocol is
+  negotiated through ALPN (`listen … ssl http2`). On cleartext endpoints `http2 on;` turns on
+  prior-knowledge h2c: the connection layer peeks the first 24 bytes with `MSG_PEEK` (`TcpStream::peek`,
+  non-consuming) and, only if they match the client connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`),
+  hands the socket to hyper's `http2` server; otherwise the same listener serves HTTP/1.1 unchanged — so
+  h1 and h2c coexist on one port. Requests are handled by the same vhost/location pipeline as HTTP/1, and
+  a single h2 connection multiplexes concurrent streams.
+  (Verified by `tools/http2_e2e.py` via Node's core `http2` client — the local libcurl has no HTTP/2:
+  cleartext h2c and TLS-ALPN h2 both return the configured bodies, HTTP/1.1 still works on the same
+  cleartext port, and 3 concurrent streams on one h2 connection all reach `200`.)
+  HTTP/2 to *upstreams* (h2 `proxy_pass`) and `server_tokens`/hpack tuning remain open.
 
 Remaining tradeoffs / roadmap:
 

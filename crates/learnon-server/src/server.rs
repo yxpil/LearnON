@@ -201,6 +201,7 @@ pub async fn serve(
                     peer,
                     addr,
                     tls.clone(),
+                    listener.http2,
                     shutdown.clone(),
                 );
             }
@@ -248,6 +249,7 @@ fn spawn_connection(
     peer: SocketAddr,
     listener: SocketAddr,
     tls: Option<(TlsAcceptor, bool)>,
+    enable_h2c: bool,
     shutdown: watch::Receiver<bool>,
 ) {
     tasks.spawn(async move {
@@ -267,11 +269,14 @@ fn spawn_connection(
         let _ = stream.set_nodelay(state.settings.tcp_nodelay);
         match tls {
             None => {
+                // 明文且监听开了 http2：嗅探 HTTP/2 客户端连接前导（prior-knowledge h2c），
+                // 命中就按 h2c 服务，否则回落到 HTTP/1.1（peek 不消费字节，h1 仍能完整读请求行）
+                let h2c = if enable_h2c { sniff_h2c_preface(&stream).await } else { false };
                 let meta = Arc::new(ConnMeta {
                     listener,
                     peer: Some(peer),
                     scheme: "http",
-                    http1: true,
+                    http1: !h2c,
                     requests: Arc::new(AtomicU64::new(0)),
                 });
                 drive(state, TokioIo::new(stream), meta, shutdown).await;
@@ -307,6 +312,33 @@ fn spawn_connection(
             }
         }
     });
+}
+
+/// 嗅探明文连接是否以 HTTP/2 客户端连接前导（24 字节 magic）开头 → prior-knowledge h2c。
+/// 用 `peek`（MSG_PEEK，不消费字节）：h2c 命中后 hyper 仍会读到完整前导；未命中则原样交给 h1。
+/// 分多次 peek 累积（TCP 可能分包），拿到 24 字节或读不到新字节即止，全程带短超时防挂起。
+async fn sniff_h2c_preface(stream: &TcpStream) -> bool {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut buf = [0u8; 24];
+    let mut filled = 0usize;
+    for _ in 0..32 {
+        let res = tokio::time::timeout(
+            Duration::from_millis(100),
+            stream.peek(&mut buf[filled..]),
+        )
+        .await;
+        match res {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                filled += n;
+                if filled >= 24 {
+                    break;
+                }
+            }
+            _ => break, // 超时或出错：当作非 h2c，回落 h1（后续 h1 读会正常处理或超时）
+        }
+    }
+    filled >= 24 && &buf[..] == PREFACE
 }
 
 /// 过载快速拒绝：写一个 503 并关闭
