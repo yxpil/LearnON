@@ -324,6 +324,16 @@ impl HandlerRegistry {
             })
         });
 
+        // metrics：渲染 Prometheus 文本（对标 stub_status 的运行时指标）。数据源是进程级
+        // metrics 单例，连接层在 accept/请求/状态码处写入，此处只读。
+        reg.register("metrics", |ctx: &mut RequestCtx, _args: &[String]| {
+            Box::pin(async move {
+                ctx.set_resp_header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+                ctx.say(&crate::metrics::get().render());
+                Ok(())
+            })
+        });
+
         reg
     }
 

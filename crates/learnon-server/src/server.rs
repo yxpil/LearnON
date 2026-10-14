@@ -191,6 +191,7 @@ pub async fn serve(
         match accepted {
             Ok((stream, peer)) => {
                 backoff = Duration::from_millis(1);
+                crate::metrics::get().on_accept();
                 spawn_connection(
                     &mut tasks,
                     Arc::clone(&state),
@@ -260,6 +261,7 @@ fn spawn_connection(
             return;
         }
         let _permit = permit.expect("checked above");
+        let _active = crate::metrics::ActiveConnGuard::new(crate::metrics::get());
         let _ = stream.set_nodelay(state.settings.tcp_nodelay);
         match tls {
             None => {
@@ -430,6 +432,7 @@ impl Service<Request<Incoming>> for Gateway {
         // keep-alive 请求数上限（nginx keepalive_requests）：第 N 条之后主动关闭连接。
         // h2 不能用 Connection 头，交由 keep_alive_interval / 停机时的 GOAWAY 处理。
         let seq = meta.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::metrics::get().on_request();
         let must_close = meta.http1 && seq >= state.settings.keepalive_requests as u64;
 
         // gzip 判定要在 `req` 被 move 进 handle_request 之前取走请求头的 Accept-Encoding。
@@ -479,6 +482,7 @@ fn finalize(
     accept_encoding: &str,
 ) -> BoxResponse {
     rec.set_status(resp.status().as_u16());
+    crate::metrics::get().record_status(resp.status().as_u16());
     let (mut parts, body) = resp.into_parts();
     if state.settings.server_tokens {
         if !parts.headers.contains_key(SERVER) {

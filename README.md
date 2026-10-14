@@ -77,6 +77,7 @@ all gateway logic is hand-written.
 | `lua_shared_dict` / `ngx.shared.DICT` | cross-request shared dict: get/set/add/replace/delete/incr/ttl/flush_all | `shared_dict.rs` |
 | `access_log` combined format | local file + stdout | `access_log.rs` |
 | third-party C modules | `content_by_rust` / `access_by_rust` compile-time registered Rust handlers | `engine.rs` |
+| `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
 
 ## Directory layout
@@ -253,6 +254,17 @@ Already done (previously listed as gaps, now implemented):
   `ngx.socket.tcp` cosocket ops share the same yield-and-resume path, verified by `tools/cosocket_e2e.py`:
   32 concurrent connect/send/receive round-trips finish in ~1.3s wall, far below the ~9.6s a serialized
   model would take, while per-op timeout returns `(nil, "timeout")` and connect failure returns `(nil, err)`.)
+- **Runtime metrics endpoint**: a process-global `Metrics` singleton (std `OnceLock`) is fed by the
+  connection layer — accepted-count on each TCP accept, an active-connections gauge via an RAII guard
+  scoped to each connection task, requests-handled per HTTP request, and responses bucketed by status
+  class (2xx/3xx/4xx/5xx) in `finalize`. `content_by_rust metrics` reads the singleton and renders it
+  in the Prometheus text exposition format (`# HELP`/`# TYPE` + `learnon_uptime_seconds`,
+  `learnon_connections_{accepted,active,capacity}`, `learnon_http_requests_total`,
+  `learnon_http_responses_total{class="…"}`). It uses the singleton because the native handler signature
+  has no access to `AppState`. (`metrics.rs`, `server.rs`, `engine.rs`, verified by
+  `tools/metrics_e2e.py`: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx`
+  deltas track the real request counts, the active gauge stays ≥1 while a connection is in flight, and
+  `capacity` equals the `worker_connections` default.)
 
 Remaining tradeoffs / roadmap:
 

@@ -25,6 +25,7 @@ mod engine;
 mod limit;
 mod log;
 mod lua_engine;
+mod metrics;
 mod proxy;
 mod router;
 mod server;
@@ -337,6 +338,9 @@ async fn run(
         limits: Arc::clone(&limits),
         permits: server::permits_for(&settings),
     });
+
+    // 运行时指标单例：记录 worker_connections 容量与进程启动时刻，供 /metrics 渲染
+    crate::metrics::global(settings.worker_connections);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
     let mut bound = Vec::with_capacity(listener_specs.len());
