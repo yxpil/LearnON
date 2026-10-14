@@ -22,6 +22,7 @@ mod access_log;
 mod access;
 mod certs;
 mod compress;
+mod dns;
 mod engine;
 mod limit;
 mod log;
@@ -321,7 +322,13 @@ async fn run(
     let pool = Arc::new(pool);
     let handlers = Arc::new(HandlerRegistry::with_builtins());
     let lua = Arc::new(LuaEngine::new(&config, &base_dir)?);
-    let proxy = Arc::new(ProxyEngine::new(Arc::clone(&pool)));
+    let proxy = match dns::DnsResolver::from_config(&config) {
+        Some(r) => {
+            println!("[learnon] 异步 DNS 解析器就绪：nameserver {:?}", r.nameservers());
+            Arc::new(ProxyEngine::new(Arc::clone(&pool)).with_resolver(r))
+        }
+        None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
+    };
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();

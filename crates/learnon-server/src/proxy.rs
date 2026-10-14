@@ -81,6 +81,8 @@ pub struct ProxyOpts<'a> {
 pub struct ProxyEngine {
     pool: Arc<UpstreamPool>,
     clients: Mutex<HashMap<(u64, u64, u64), HyperClient>>,
+    /// 异步 DNS 解析器（配置了 `resolver` 时非空）；转发/Upgrade 前用它把域名换成 IP。
+    resolver: Option<Arc<crate::dns::DnsResolver>>,
 }
 
 impl ProxyEngine {
@@ -88,7 +90,35 @@ impl ProxyEngine {
         ProxyEngine {
             pool,
             clients: Mutex::new(HashMap::new()),
+            resolver: None,
         }
+    }
+
+    /// 挂上异步 DNS 解析器（配置了 `resolver` 指令时）；未挂则转发走默认 getaddrinfo。
+    pub fn with_resolver(mut self, resolver: Arc<crate::dns::DnsResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// 若挂了 resolver 且目标主机是域名（非 IP 字面量），把它解析成 "IP:port" 作为连接目标，
+    /// 从而让 hyper 跳过阻塞式 getaddrinfo；解析失败即返回错误（对齐 nginx：解析不出来 → 502）。
+    /// 未挂 resolver 时原样返回，保持既有行为。
+    async fn connect_target(&self, backend: &str) -> Result<String, String> {
+        let resolver = match &self.resolver {
+            Some(r) => r,
+            None => return Ok(backend.to_string()),
+        };
+        // 拆 host:port（IPv6 字面量带方括号）
+        let (host, port) = split_host_port(backend);
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(backend.to_string());
+        }
+        let addrs = resolver.resolve(host).await?;
+        let ip = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("DNS 无可用地址: {host}"))?;
+        Ok(crate::dns::authority_with_port(ip, port))
     }
 
     /// 同一 (connect 超时 + keepalive 配置) 复用同一个客户端（= 同一套连接池），
@@ -267,8 +297,9 @@ impl ProxyEngine {
                 }
                 log_warn!("upstream {host_part} 换节点重试: {backend}");
             }
+            let connect_host = self.connect_target(&backend).await?;
             let uri = format!(
-                "http://{backend}{}{query}",
+                "http://{connect_host}{}{query}",
                 encode_path(&out_path),
             );
             // 每次尝试重建请求体：缓冲体可回放（clone Bytes），流式体只能取用一次
@@ -332,6 +363,32 @@ fn is_idempotent(method: &str) -> bool {
         "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PROPFIND" | "COPY" | "MOVE" | "MKCOL" | "LOCK"
             | "UNLOCK" | "SEARCH"
     )
+}
+
+/// 把 "host:port" / "host" / "[::1]:port" / "::1" 拆成 (host, port)；缺省端口 80。
+fn split_host_port(s: &str) -> (&str, u16) {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(80);
+            return (ip, port);
+        }
+        return (s, 80);
+    }
+    // 恰有一个冒号才当端口；多个冒号说明是裸 IPv6 字面量（无端口）
+    match s.rsplit_once(':') {
+        Some((h, p)) => {
+            if h.contains(':') {
+                (s, 80)
+            } else {
+                (h, p.parse::<u16>().unwrap_or(80))
+            }
+        }
+        None => (s, 80),
+    }
 }
 
 pub fn is_hop_by_hop(name: &str) -> bool {
@@ -472,10 +529,25 @@ impl ProxyEngine {
             Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("非法端口: {p}"))?),
             None => (backend_addr.clone(), 80),
         };
+        // 有 resolver 且是域名时先异步解析成 IP 再连（HOST 头仍用原始名）
+        let connect_host = match &self.resolver {
+            Some(r) if host.parse::<std::net::IpAddr>().is_err() => {
+                let addrs = r.resolve(&host).await?;
+                let ip = addrs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("DNS 无可用地址: {host}"))?;
+                match ip {
+                    std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                    std::net::IpAddr::V4(v4) => v4.to_string(),
+                }
+            }
+            _ => host.clone(),
+        };
 
         let mut backend_stream = tokio::time::timeout(
             opts.timeouts.connect,
-            TcpStream::connect((host.as_str(), port)),
+            TcpStream::connect((connect_host.as_str(), port)),
         )
         .await
         .map_err(|_| format!("连接后端超时: {backend_addr}"))?

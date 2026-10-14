@@ -68,6 +68,7 @@ all gateway logic is hand-written.
 | `upstream` + load balancing | weighted round-robin / `least_conn` / `ip_hash` (with connection tracking) | `upstream.rs` |
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
+| `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
@@ -299,6 +300,18 @@ Already done (previously listed as gaps, now implemented):
   verified by `tools/subrequest_e2e.py`: Lua/return/query/404 captures, a two-level nested capture, a
   self-referential capture hitting the depth guard, and an external request to an `internal` location
   still returning 404.) `share_all_vars`/`ctx` option passing is not yet implemented.
+- **`resolver` + async DNS**: a pure-Rust, non-blocking UDP DNS stub resolver (`dns.rs`) — it builds
+  RFC1035 queries for A/AAAA, follows compression pointers in the answer, and caches results for the
+  `valid=` TTL (default 10s), with negative caching for NXDOMAIN. Without it, `proxy_pass` relies on
+  the OS `getaddrinfo` (which a busy worker would block on); with it, `proxy.rs` resolves the backend
+  hostname to an IP literal before connecting and rewrites the URI authority — hyper then skips
+  `getaddrinfo` entirely, and the original name is kept in the `Host` header. Applies to both the
+  forward path and the WebSocket/`upgrade` raw-socket path. `resolver <addr…> [valid=…] [timeout=…]
+  [ipv6=on|off];` (plus `resolver_timeout`). Resolution failure returns the nginx-mapped `502`.
+  (Verified by `tools/resolver_e2e.py`, which points `resolver` at a stub DNS server and proxies to
+  `test.invalid` — an RFC6761 reserved name the OS cannot resolve — proving the async path is taken,
+  then shows a repeated request does **not** re-query thanks to the TTL cache.) `ngx.socket.tcp`
+  `connect` still uses system resolution.
 
 Remaining tradeoffs / roadmap:
 
