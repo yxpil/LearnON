@@ -17,6 +17,8 @@ services:
       - ./certs:/app/certs:ro
       # Persist logs
       - learnon-logs:/app/logs
+      # Branding assets (logo)
+      - ./public:/app/public:ro
     environment:
       # Optional: Override config path
       - LEARNON_CONFIG=/app/conf/learnon.conf

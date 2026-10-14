@@ -22,6 +22,8 @@ FROM debian:bookworm-slim
 LABEL maintainer="yxpil"
 LABEL description="LearnON: High-performance gateway server like Nginx, 100% in Rust"
 LABEL version="0.2.0"
+LABEL org.opencontainers.image.source="https://github.com/yxpil/LearnON"
+LABEL org.opencontainers.image.description="LearnON Gateway Server"
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -35,8 +37,11 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/target/release/learnon /usr/local/bin/learnon
 
+# Copy branding assets
+COPY public/logo.png /app/assets/logo.png
+
 # Create necessary directories
-RUN mkdir -p /app/conf /app/logs /app/certs && \
+RUN mkdir -p /app/conf /app/logs /app/certs /app/assets && \
     chown -R learnon:learnon /app
 
 # Expose ports
