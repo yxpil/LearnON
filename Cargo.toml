@@ -20,6 +20,8 @@ bytes = "1"
 futures-util = "0.3"
 regex = "1"
 chrono = "0.4"
+# 响应 gzip 压缩（默认 rust/miniz_oxide 后端，纯 Rust，交叉编译友好，无 libz 依赖）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "send"] }
 thiserror = "2"
 # 有界日志通道（std 的 SyncSender 不是 Sync，无法放进全局单例）

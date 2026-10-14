@@ -20,6 +20,7 @@
 
 mod access_log;
 mod certs;
+mod compress;
 mod engine;
 mod limit;
 mod log;

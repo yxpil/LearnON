@@ -209,6 +209,12 @@ Already done (previously listed as gaps, now implemented):
   101 handshake with the backend, hands off to hyper's upgrade mechanism for a bidirectional pipe
   (`server.rs::handle_upgrade` + `ProxyEngine::upgrade`); WS-frame bytes that race ahead of the
   backend's 101 are not lost (prefix buffer). `wss` (https backends) is not yet supported.
+- **gzip response compression**: `gzip on;` + `gzip_min_length` / `gzip_comp_level` / `gzip_types`
+  stream-compress eligible 2xx responses (flate2, pure-Rust). Respects `Accept-Encoding` (including
+  `q=0` decline), skips HEAD and non-listed content types, enforces the length threshold via the
+  body's exact `size_hint`, sets `Content-Encoding: gzip` + `Vary: Accept-Encoding`, and drops
+  `Content-Length` so the access log's `bytes_sent` reflects the real compressed wire bytes.
+  (`compress.rs::GzipBody`, `server.rs::finalize`, verified by `tools/gzip_e2e.sh`.)
 
 Remaining tradeoffs / roadmap:
 
@@ -216,5 +222,4 @@ Remaining tradeoffs / roadmap:
   concurrency inside one VM (OpenResty-style) is not implemented — parallelism comes from the VM pool.
 - **Buffered request-body forwarding**: the reverse proxy reads the body into memory before forwarding
   (roadmap: streaming pipe).
-- **Not yet implemented**: gzip response compression, upstream keep-alive connection-pool tuning knobs
-  (per-upstream `keepalive N`).
+- **Not yet implemented**: upstream keep-alive connection-pool tuning knobs (per-upstream `keepalive N`).

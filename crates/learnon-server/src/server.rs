@@ -27,7 +27,9 @@ use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Body, Frame, Incoming};
-use hyper::header::{HeaderName, HeaderValue,SERVER};
+use hyper::header::{
+    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, SERVER, VARY,
+};
 use hyper::server::conn::{http1, http2};
 use hyper::service::Service;
 use hyper::{Method, Request, Response, StatusCode, Version};
@@ -38,6 +40,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::access_log::{AccessLog, LogRecord};
 use crate::certs;
+use crate::compress::{accepts_gzip, GzipBody};
 use crate::engine::{self, HandlerRegistry, Phase, RequestCtx};
 use crate::lua_engine::LuaEngine;
 use crate::proxy::{ProxyEngine, ProxyOpts, ProxyTimeouts};
@@ -429,6 +432,9 @@ impl Service<Request<Incoming>> for Gateway {
         let seq = meta.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let must_close = meta.http1 && seq >= state.settings.keepalive_requests as u64;
 
+        // gzip 判定要在 `req` 被 move 进 handle_request 之前取走请求头的 Accept-Encoding。
+        let accept_encoding = header_of(&req, "accept-encoding").unwrap_or_default();
+
         Box::pin(async move {
             let _guard = EmitGuard {
                 rec: Arc::clone(&rec),
@@ -449,7 +455,7 @@ impl Service<Request<Incoming>> for Gateway {
                     error_page(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             };
-            Ok(finalize(&state, &rec, resp, must_close))
+            Ok(finalize(&state, &rec, resp, must_close, &accept_encoding))
         })
     }
 }
@@ -464,8 +470,14 @@ fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// 统一收尾：状态码记账、Server 头策略、过载关闭、响应体字节计数 + 落日志
-fn finalize(state: &AppState, rec: &Arc<LogRecord>, resp: BoxResponse, must_close: bool) -> BoxResponse {
+/// 统一收尾：状态码记账、Server 头策略、过载关闭、gzip 压缩、响应体字节计数 + 落日志
+fn finalize(
+    state: &AppState,
+    rec: &Arc<LogRecord>,
+    resp: BoxResponse,
+    must_close: bool,
+    accept_encoding: &str,
+) -> BoxResponse {
     rec.set_status(resp.status().as_u16());
     let (mut parts, body) = resp.into_parts();
     if state.settings.server_tokens {
@@ -484,11 +496,52 @@ fn finalize(state: &AppState, rec: &Arc<LogRecord>, resp: BoxResponse, must_clos
         );
     }
     let head = rec.method == "HEAD";
+
+    // 已知线上字节长度：优先取显式 Content-Length，否则从 body 的 exact size_hint 推断。
+    // 静态文件走 Full 体，Content-Length 由 hyper 在实际编码时才补上，此时 headers 里还没有，
+    // 若不查 size_hint 就会把定长小文件误判成流式、绕过 gzip_min_length。
+    let wire_len = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .or_else(|| body.size_hint().exact().map(|n| n as usize));
+
+    // gzip 判定（对标 nginx：gzip on + 命中 gzip_types + 长度阈值 + 客户端接受）：
+    // 仅在开启、2xx 成功、非 HEAD、体本身未带 Content-Encoding、客户端 Accept-Encoding 接受 gzip、
+    // Content-Type 命中可压缩类型、且（已知长度时）不小于 gzip_min_length 时压缩。
+    // 流式/未知长度的响应尽力压缩（nginx 亦按缓冲后的实际长度衡量，这里宁多不少）。
+    let do_gzip = state.settings.gzip.enabled
+        && !head
+        && parts.status.is_success()
+        && !parts.headers.contains_key(CONTENT_ENCODING)
+        && accepts_gzip(accept_encoding)
+        && parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| state.settings.gzip.eligible_content_type(ct))
+        && match wire_len {
+            Some(n) => n >= state.settings.gzip.min_length,
+            None => true,
+        };
+
     let body = if rec.mark_wrapped() {
         body
     } else {
+        // GzipBody 必须包在 LoggedBody 之内，才能让访问日志的 bytes_sent 反映真实压缩后的线上字节。
+        let base: RespBody = if do_gzip {
+            // 压缩改变了字节数：移除 Content-Length（交由传输层分帧），标注 Content-Encoding: gzip，
+            // 并按 nginx 追加 Vary: Accept-Encoding。
+            parts.headers.remove(CONTENT_LENGTH);
+            parts.headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            append_vary(&mut parts.headers);
+            GzipBody::new(body, state.settings.gzip.comp_level).boxed()
+        } else {
+            body
+        };
         LoggedBody {
-            inner: body,
+            inner: base,
             rec: Arc::clone(rec),
             log: Arc::clone(&state.access_log),
             count: !head,
@@ -496,6 +549,34 @@ fn finalize(state: &AppState, rec: &Arc<LogRecord>, resp: BoxResponse, must_clos
         .boxed()
     };
     Response::from_parts(parts, body)
+}
+
+/// 追加 `Vary: Accept-Encoding`，保留既有的 Vary 值且不重复（nginx 压缩响应必带 Vary）。
+fn append_vary(headers: &mut hyper::HeaderMap) {
+    match headers.get_mut(VARY) {
+        Some(existing) => {
+            let already = existing
+                .to_str()
+                .map(|s| {
+                    s.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("accept-encoding"))
+                })
+                .unwrap_or(false);
+            if already {
+                return;
+            }
+            let merged = match existing.to_str() {
+                Ok(s) => format!("{}, Accept-Encoding", s),
+                Err(_) => "Accept-Encoding".to_string(),
+            };
+            if let Ok(nv) = HeaderValue::from_str(&merged) {
+                *existing = nv;
+            }
+        }
+        None => {
+            headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+    }
 }
 
 /// 包一层响应体：累计真实写出的字节数，并在响应体生命周期结束时落访问日志

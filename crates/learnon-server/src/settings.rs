@@ -12,6 +12,10 @@
 //! server_tokens on;
 //! tcp_nodelay on;
 //! accept_backlog 512;
+//! gzip on;
+//! gzip_min_length 20;
+//! gzip_comp_level 1;
+//! gzip_types text/css application/json;
 //! ```
 
 use std::time::Duration;
@@ -38,6 +42,69 @@ pub struct Settings {
     pub server_tokens: bool,
     pub tcp_nodelay: bool,
     pub accept_backlog: u32,
+    /// 响应 gzip 压缩参数
+    pub gzip: GzipSettings,
+}
+
+/// 响应体 gzip 压缩配置（对标 nginx ngx_http_gzip_module）
+#[derive(Debug, Clone)]
+pub struct GzipSettings {
+    /// gzip on/off（nginx 默认 off）
+    pub enabled: bool,
+    /// 小于此字节数的响应不压缩（nginx gzip_min_length，默认 20）
+    pub min_length: usize,
+    /// 压缩级别 1-9（nginx gzip_comp_level，默认 1）
+    pub comp_level: u32,
+    /// 可压缩的 MIME 类型（小写；text/html 始终包含，与 nginx 一致）
+    pub types: Vec<String>,
+}
+
+/// nginx 内置始终压缩的类型，无法通过 gzip_types 移除
+pub const GZIP_ALWAYS: &str = "text/html";
+
+/// LearnON 开箱即用的默认压缩类型集合（nginx 默认只有 text/html，这里给一份实用超集）
+fn default_gzip_types() -> Vec<String> {
+    [
+        GZIP_ALWAYS,
+        "text/css",
+        "text/plain",
+        "text/xml",
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "text/javascript",
+        "image/svg+xml",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+impl Default for GzipSettings {
+    fn default() -> Self {
+        GzipSettings {
+            enabled: false,
+            min_length: 20,
+            comp_level: 1,
+            types: default_gzip_types(),
+        }
+    }
+}
+
+impl GzipSettings {
+    /// 响应 Content-Type 是否属于可压缩类型（忽略 `; charset=` 等参数，大小写不敏感）
+    pub fn eligible_content_type(&self, content_type: &str) -> bool {
+        let main = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if main.is_empty() {
+            return false;
+        }
+        self.types.iter().any(|t| t == &main)
+    }
 }
 
 impl Default for Settings {
@@ -53,6 +120,7 @@ impl Default for Settings {
             server_tokens: true,
             tcp_nodelay: true,
             accept_backlog: 512,
+            gzip: GzipSettings::default(),
         }
     }
 }
@@ -133,6 +201,38 @@ impl Settings {
         if let Some(v) = config.find("accept_backlog").and_then(|d| d.arg(0)) {
             s.accept_backlog = v.parse::<u32>().unwrap_or(512).clamp(16, 65535);
         }
+        if let Some(d) = config.find("gzip") {
+            match on_off(d.arg(0)) {
+                Some(v) => s.gzip.enabled = v,
+                None => warnings.push("gzip 只接受 on/off，已忽略".to_string()),
+            }
+        }
+        if let Some(v) = config.find("gzip_min_length").and_then(|d| d.arg(0)) {
+            match v.parse::<usize>() {
+                Ok(n) => s.gzip.min_length = n,
+                Err(_) => warnings.push(format!("gzip_min_length 取值非法: {v}")),
+            }
+        }
+        if let Some(v) = config.find("gzip_comp_level").and_then(|d| d.arg(0)) {
+            match v.parse::<u32>() {
+                Ok(n @ 1..=9) => s.gzip.comp_level = n,
+                _ => warnings.push(format!("gzip_comp_level 应在 1-9 之间，已忽略: {v}")),
+            }
+        }
+        // gzip_types 是多值指令：`gzip_types a b c;`。text/html 始终压缩，故强制保留。
+        if let Some(d) = config.find("gzip_types") {
+            let mut types = vec![GZIP_ALWAYS.to_string()];
+            for a in &d.args {
+                let t = a.trim().to_ascii_lowercase();
+                if t.is_empty() || t == GZIP_ALWAYS {
+                    continue;
+                }
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+            }
+            s.gzip.types = types;
+        }
 
         // hyper 的 http1 只有一个读头超时，它同时覆盖"慢速发头"与"keep-alive 空闲"，
         // 因此取两者较大值：否则 keep-alive 空闲会被 header 超时提前掐断导致频繁重连。
@@ -161,5 +261,53 @@ mod tests {
         let (s, _) = Settings::from_config(&cfg);
         assert_eq!(s.client_header_timeout, Duration::from_secs(60));
         assert_eq!(s.keepalive_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn gzip_defaults_off() {
+        let cfg = Config::parse("").unwrap();
+        let (s, warnings) = Settings::from_config(&cfg);
+        assert!(!s.gzip.enabled);
+        assert!(warnings.is_empty());
+        assert!(s.gzip.types.contains(&"text/html".to_string()));
+    }
+
+    #[test]
+    fn parses_gzip_directives() {
+        let cfg = Config::parse(
+            "gzip on; gzip_min_length 100; gzip_comp_level 6; gzip_types application/json text/css;",
+        )
+        .unwrap();
+        let (s, warnings) = Settings::from_config(&cfg);
+        assert!(s.gzip.enabled);
+        assert_eq!(s.gzip.min_length, 100);
+        assert_eq!(s.gzip.comp_level, 6);
+        // text/html 强制保留，即使没在 gzip_types 里列出
+        assert!(s.gzip.types.contains(&"text/html".to_string()));
+        assert!(s.gzip.types.contains(&"application/json".to_string()));
+        assert!(s.gzip.types.contains(&"text/css".to_string()));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn gzip_rejects_bad_values_with_warning() {
+        let cfg = Config::parse("gzip maybe; gzip_comp_level 99;").unwrap();
+        let (s, warnings) = Settings::from_config(&cfg);
+        assert!(!s.gzip.enabled); // 非法 on/off → 保持默认 off
+        assert_eq!(s.gzip.comp_level, 1); // 越界级别被忽略
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn eligible_content_type_ignores_charset() {
+        let g = GzipSettings {
+            enabled: true,
+            types: vec!["text/html".into(), "application/json".into()],
+            ..Default::default()
+        };
+        assert!(g.eligible_content_type("application/json; charset=utf-8"));
+        assert!(g.eligible_content_type("TEXT/HTML"));
+        assert!(!g.eligible_content_type("image/png"));
+        assert!(!g.eligible_content_type(""));
     }
 }
