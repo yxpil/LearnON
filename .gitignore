@@ -24,3 +24,9 @@ vendor/
 
 # realworld 测试生成的临时大文件
 public_realworld/big.bin
+
+# debug/test strays (never commit built binaries outside target/)
+natb.exe
+/.dbg-*/
+/.probe/
+/.tmp-legacy/

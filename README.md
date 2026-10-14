@@ -74,6 +74,7 @@ all gateway logic is hand-written.
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
+| `ssl_protocols TLSv1..TLSv1.3` | explicit enabled-version set (rustls serves the 1.2/1.3 subset by default); `--features native-tls` routes a legacy-needing listener to the OS stack (Windows Schannel) to truly negotiate TLS 1.0/1.1 | `certs.rs`, `tls.rs`, `router.rs` |
 | HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
 | `SIGHUP` graceful config reload | in-process hot swap of the routing table behind `RwLock<Arc<Router>>`; listeners never rebound (no accept gap), per-request snapshot, invalid config keeps old; portable `reload <interval>;` mtime poll | `server.rs`, `main.rs` |
 | HTTP/3 serving (`listen … quic`) | quinn QUIC endpoint (UDP) + h3 over it, TLS1.3/ALPN `h3` reusing the SNI cert store; same body-agnostic request core as h1/h2 (vhost/location/rewrite/access/proxy/lua); TCP-TLS on the same port serves h1/h2 and advertises `Alt-Svc: h3=":port"` | `server.rs`, `certs.rs`, `router.rs` |
@@ -373,6 +374,26 @@ Already done (previously listed as gaps, now implemented):
   body; a ~15 KB response arrives complete across h3 `DATA` frames; 5 concurrent streams on one QUIC
   connection all reach `200`; and HTTP/1.1 over TLS still works on the same port with an `alt-svc: h3=`
   header present.)
+- **TLS protocol selection (`ssl_protocols`)**: `ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;` sets an
+  explicit *enabled version set*, nginx-style, and `ssl_min_version` is accepted as an alias for the
+  "everything from this floor up" form. Several servers sharing one `listen` address merge their sets by
+  **union**. The built-in **rustls** backend can only ever negotiate **TLS 1.2/1.3** (rustls 0.23 has no
+  1.0/1.1), so within that world `ssl_protocols` precisely trims which of 1.2/1.3 are offered and a client
+  pinned to an excluded version fails the handshake. A config that requests **TLS 1.0/1.1** therefore
+  needs a second, opt-in backend: build with `cargo build --release --features native-tls` and any listener
+  whose set includes a legacy version is routed to the **platform-native stack** (Windows → Schannel, via
+  the `native-tls` crate), which negotiates the whole `min..max` range including 1.0/1.1; every other
+  listener still uses rustls. Both backends feed the **same** hyper h1/h2 request loop through one
+  `ServerStream` enum, so nothing downstream differs.
+  Two honest caveats: the native path is legacy/HTTP-1.1-only (no ALPN `h2`, and Schannel's
+  `Identity::from_pkcs8` accepts **RSA** keys only — an ECDSA cert like `certs_scenario/` is rejected, so
+  supply an RSA keypair for legacy listeners), and a feature-off build simply logs that `native-tls` is not
+  enabled and serves 1.2/1.3 instead.
+  (Verified by `tools/tls_protocols_e2e.py` — rustls trims exactly: `only-1.2` answers a 1.2 client and
+  rejects a 1.3-only client, `only-1.3` the mirror, the default serves both; and `tools/tls_legacy_e2e.py`
+  — a throwaway runtime-generated RSA cert (never committed) proves the `--features native-tls` binary
+  handshakes **TLS 1.0 and 1.1** and returns the configured body, while the same conf on the **default**
+  rustls binary refuses 1.0/1.1 and still serves 1.2/1.3.)
 
 Remaining tradeoffs / roadmap:
 
