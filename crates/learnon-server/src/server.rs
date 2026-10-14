@@ -36,7 +36,6 @@ use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit};
-use tokio_rustls::TlsAcceptor;
 
 use crate::access_log::{AccessLog, LogRecord};
 use crate::certs;
@@ -47,6 +46,7 @@ use crate::proxy::{ProxyBody, ProxyEngine, ProxyOpts, ProxyTimeouts};
 use crate::proxy_cache::CacheHit;
 use crate::router::{self, Location, Router, Server};
 use crate::settings::Settings;
+use crate::tls::{self, TlsAcceptor};
 use crate::{log_debug, log_error, log_info, log_warn, AppError};
 
 pub type RespBody = BoxBody<Bytes, hyper::Error>;
@@ -182,17 +182,20 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let addr = listener.addr;
-    let tls: Option<(TlsAcceptor, bool)> = match &listener.tls {
-        Some(opts) => match certs::build_server_config(opts) {
-            Ok(cfg) => {
-                let http2 = opts.http2;
+    let tls: Option<TlsAcceptor> = match &listener.tls {
+        Some(opts) => match tls::make_acceptor(opts) {
+            Ok(acc) => {
                 let names: Vec<String> = opts
                     .specs
                     .iter()
                     .flat_map(|s| s.names.clone())
                     .collect();
-                log_info!("{addr} TLS 就绪（ALPN {:?}，证书名 {names:?}）", if http2 { "h2,http/1.1" } else { "http/1.1" });
-                Some((TlsAcceptor::from(Arc::new(cfg)), http2))
+                let protos = format!("{:?}", opts.protocols.normalized().enabled);
+                log_info!(
+                    "{addr} TLS 就绪（协议 {protos}，ALPN {:?}，证书名 {names:?}）",
+                    if opts.http2 { "h2,http/1.1" } else { "http/1.1" }
+                );
+                Some(acc)
             }
             Err(e) => {
                 // 证书有问题就不能"降级成明文"继续服务——那会让 https 的调用方拿到意外结果
@@ -280,7 +283,7 @@ fn spawn_connection(
     stream: TcpStream,
     peer: SocketAddr,
     listener: SocketAddr,
-    tls: Option<(TlsAcceptor, bool)>,
+    tls: Option<TlsAcceptor>,
     enable_h2c: bool,
     alt_svc: Option<String>,
     shutdown: watch::Receiver<bool>,
@@ -315,10 +318,11 @@ fn spawn_connection(
                 });
                 drive(state, TokioIo::new(stream), meta, shutdown).await;
             }
-            Some((acceptor, _http2)) => {
-                let handshake = tokio::time::timeout(state.settings.tls_handshake_timeout, acceptor.accept(stream));
-                let tls_stream = match handshake.await {
-                    Ok(Ok(s)) => s,
+            Some(acceptor) => {
+                let handshake =
+                    tokio::time::timeout(state.settings.tls_handshake_timeout, acceptor.accept(stream));
+                let (tls_stream, h2) = match handshake.await {
+                    Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
                         log_debug!("TLS 握手失败 {peer}: {e}");
                         return;
@@ -328,13 +332,7 @@ fn spawn_connection(
                         return;
                     }
                 };
-                // ALPN 决定这条连接走 h2 还是 h1
-                let h2 = tls_stream
-                    .get_ref()
-                    .1
-                    .alpn_protocol()
-                    .map(|p| p == b"h2")
-                    .unwrap_or(false);
+                // ALPN（或后端类型）决定这条连接走 h2 还是 h1：rustls 看 ALPN，原生 legacy 恒为 h1
                 let meta = Arc::new(ConnMeta {
                     listener,
                     peer: Some(peer),

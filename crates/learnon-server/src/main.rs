@@ -34,6 +34,7 @@ mod router;
 mod server;
 mod settings;
 mod shared_dict;
+mod tls;
 mod upstream;
 
 use std::path::PathBuf;

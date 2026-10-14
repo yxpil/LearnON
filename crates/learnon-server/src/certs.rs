@@ -22,10 +22,98 @@ pub struct CertSpec {
     pub key: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 单个 TLS 协议版本。`Ord` 按新旧升序，用于 `from_min`（最低版本 → 该版本及以上全部启用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TlsVersion {
+    Tls10,
+    Tls11,
     Tls12,
     Tls13,
+}
+
+impl TlsVersion {
+    const ALL: [TlsVersion; 4] = [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13];
+
+    /// nginx `ssl_protocols` 里的写法（小写 token）。
+    pub fn from_nginx_token(tok: &str) -> Option<TlsVersion> {
+        match tok.to_ascii_lowercase().as_str() {
+            "tlsv1.0" | "tlsv1" | "1.0" => Some(TlsVersion::Tls10),
+            "tlsv1.1" | "1.1" => Some(TlsVersion::Tls11),
+            "tlsv1.2" | "1.2" => Some(TlsVersion::Tls12),
+            "tlsv1.3" | "1.3" => Some(TlsVersion::Tls13),
+            _ => None,
+        }
+    }
+}
+
+/// 显式启用的协议集合（对标 nginx `ssl_protocols`，可任意裁剪，不是"最低版本"下限）。
+/// `enabled` 升序去重；空集合按默认（TLS1.2 + TLS1.3）处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsProtocols {
+    pub enabled: Vec<TlsVersion>,
+}
+
+impl Default for TlsProtocols {
+    fn default() -> Self {
+        Self::from_min(TlsVersion::Tls12)
+    }
+}
+
+impl TlsProtocols {
+    /// 从最低版本向上启用（`ssl_min_version` 的等价展开）。
+    pub fn from_min(min: TlsVersion) -> Self {
+        Self {
+            enabled: TlsVersion::ALL.into_iter().filter(|v| *v >= min).collect(),
+        }
+    }
+
+    pub fn set(&mut self, v: TlsVersion) {
+        if !self.enabled.contains(&v) {
+            self.enabled.push(v);
+            self.enabled.sort_unstable();
+        }
+    }
+
+    /// 同一监听端口上多个 server 的协议集取并集（socket 对外提供任一格要求的版本）。
+    pub fn union_with(&mut self, other: &TlsProtocols) {
+        for v in &other.enabled {
+            self.set(*v);
+        }
+    }
+
+    pub fn contains(&self, v: TlsVersion) -> bool {
+        self.enabled.contains(&v)
+    }
+
+    /// 是否请求了 rustls 无法协商的旧版本（TLS 1.0/1.1）——需要 native-tls 后端才能落地。
+    pub fn wants_legacy(&self) -> bool {
+        self.enabled.iter().any(|v| *v <= TlsVersion::Tls11)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_empty()
+    }
+
+    /// rustls 能提供的版本子集（1.0/1.1 被过滤掉，由 native 后端负责）。
+    pub fn rustls_versions(&self) -> Vec<&'static SupportedProtocolVersion> {
+        let mut out = Vec::new();
+        if self.contains(TlsVersion::Tls13) {
+            out.push(&rustls::version::TLS13);
+        }
+        if self.contains(TlsVersion::Tls12) {
+            out.push(&rustls::version::TLS12);
+        }
+        out
+    }
+
+    /// 归一化：空集合回落默认（1.2+1.3），供构建前使用。
+    pub fn normalized(&self) -> TlsProtocols {
+        if self.is_empty() {
+            TlsProtocols::default()
+        } else {
+            self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +121,8 @@ pub struct TlsOptions {
     pub specs: Vec<CertSpec>,
     /// ALPN 是否协商 h2
     pub http2: bool,
-    pub min_version: TlsVersion,
+    /// 显式启用的 TLS 协议集合（`ssl_protocols`）
+    pub protocols: TlsProtocols,
 }
 
 #[derive(Debug)]
@@ -132,10 +221,15 @@ pub fn build_resolver(specs: &[CertSpec]) -> Result<SniResolver, String> {
 
 pub fn build_server_config(opts: &TlsOptions) -> Result<ServerConfig, String> {
     let resolver = Arc::new(build_resolver(&opts.specs)?);
-    let versions: Vec<&'static SupportedProtocolVersion> = match opts.min_version {
-        TlsVersion::Tls13 => vec![&rustls::version::TLS13],
-        TlsVersion::Tls12 => vec![&rustls::version::TLS13, &rustls::version::TLS12],
-    };
+    let protocols = opts.protocols.normalized();
+    // rustls 只能协商 TLS1.2/1.3；1.0/1.1 由 feature-gated native 后端负责（见 build_native_acceptor）。
+    let versions = protocols.rustls_versions();
+    if versions.is_empty() {
+        return Err(
+            "ssl_protocols 只包含 TLSv1/TLSv1.1：内置 rustls 后端无法协商，请用 `--features native-tls` 重新构建"
+                .to_string(),
+        );
+    }
     let mut config = ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_cert_resolver(resolver);
@@ -274,7 +368,7 @@ mod tests {
         let h2 = build_server_config(&TlsOptions {
             specs: vec![spec.clone()],
             http2: true,
-            min_version: TlsVersion::Tls12,
+            protocols: TlsProtocols::default(),
         })
         .unwrap();
         assert_eq!(h2.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
@@ -282,10 +376,69 @@ mod tests {
         let h1 = build_server_config(&TlsOptions {
             specs: vec![spec],
             http2: false,
-            min_version: TlsVersion::Tls13,
+            protocols: TlsProtocols::from_min(TlsVersion::Tls13),
         })
         .unwrap();
         assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssl_protocols_set_controls_enabled_versions() {
+        // 显式集合：只开 TLS1.2 时 rustls 版本集就只有 TLS12（可裁剪掉 1.3）
+        let only12 = TlsProtocols {
+            enabled: vec![TlsVersion::Tls12],
+        };
+        assert_eq!(only12.rustls_versions().len(), 1);
+        assert!(only12.rustls_versions().contains(&&rustls::version::TLS12));
+        assert!(!only12.wants_legacy());
+
+        // 只开 TLS1.3
+        let only13 = TlsProtocols {
+            enabled: vec![TlsVersion::Tls13],
+        };
+        assert_eq!(only13.rustls_versions(), vec![&rustls::version::TLS13]);
+
+        // from_min(1.2) = {1.2,1.3}
+        assert_eq!(
+            TlsProtocols::from_min(TlsVersion::Tls12).enabled,
+            vec![TlsVersion::Tls12, TlsVersion::Tls13]
+        );
+
+        // 旧版本标记 wants_legacy，且被 rustls_versions 过滤掉
+        let legacy = TlsProtocols {
+            enabled: vec![TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12],
+        };
+        assert!(legacy.wants_legacy());
+        assert_eq!(legacy.rustls_versions(), vec![&rustls::version::TLS12]);
+
+        // 并集去重升序
+        let mut merged = TlsProtocols {
+            enabled: vec![TlsVersion::Tls13],
+        };
+        merged.union_with(&TlsProtocols {
+            enabled: vec![TlsVersion::Tls12, TlsVersion::Tls13],
+        });
+        assert_eq!(merged.enabled, vec![TlsVersion::Tls12, TlsVersion::Tls13]);
+    }
+
+    #[test]
+    fn legacy_only_protocols_rejected_by_rustls_backend() {
+        let dir = std::env::temp_dir().join(format!("learnon-certs-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, k) = write_pair(&dir, &["localhost"]);
+        let err = build_server_config(&TlsOptions {
+            specs: vec![CertSpec {
+                names: vec!["localhost".into()],
+                cert: c,
+                key: k,
+            }],
+            http2: false,
+            protocols: TlsProtocols {
+                enabled: vec![TlsVersion::Tls10, TlsVersion::Tls11],
+            },
+        });
+        assert!(err.is_err(), "仅 TLS1.0/1.1 时 rustls 后端应明确拒绝而非静默降级");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

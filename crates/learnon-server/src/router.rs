@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use learnon_config::{Config, Directive};
 
-use crate::certs::{CertSpec, TlsOptions, TlsVersion};
+use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
 use crate::engine::{HandlerSpec, Phase, ReturnAction, RewriteFlag, RewriteRule};
 use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
@@ -219,7 +219,7 @@ struct ServerTemplate {
     auth_basic_user_file: Option<PathBuf>,
     ssl_cert: Option<PathBuf>,
     ssl_key: Option<PathBuf>,
-    min_tls: TlsVersion,
+    protocols: TlsProtocols,
     http2: bool,
 }
 
@@ -447,7 +447,7 @@ impl Router {
             ssl: bool,
             http2: bool,
             quic: bool,
-            min_tls: TlsVersion,
+            protocols: TlsProtocols,
             backlog: Option<u32>,
             ipv6only: Option<bool>,
         }
@@ -473,7 +473,7 @@ impl Router {
                    "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
                    "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
                    "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
-                   "ssl_certificate", "ssl_certificate_key", "ssl_min_version",
+                   "ssl_certificate", "ssl_certificate_key", "ssl_min_version", "ssl_protocols",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
                    "header_filter_by_lua", "header_filter_by_lua_file",
@@ -510,7 +510,7 @@ impl Router {
                     ssl: false,
                     http2: false,
                     quic: false,
-                    min_tls: tmpl.min_tls,
+                    protocols: tmpl.protocols.clone(),
                     backlog: None,
                     ipv6only: None,
                 });
@@ -548,9 +548,8 @@ impl Router {
                 }
                 ep.http2 |= flags.http2 || tmpl.http2;
                 ep.quic |= flags.quic;
-                if tmpl.min_tls == TlsVersion::Tls12 {
-                    ep.min_tls = TlsVersion::Tls12;
-                }
+                // 同一 socket 上多个 server 的 ssl_protocols 取并集
+                ep.protocols.union_with(&tmpl.protocols);
 
                 let server = Server {
                     server_name: tmpl.server_name.clone(),
@@ -589,7 +588,7 @@ impl Router {
             let tls = ep.filter(|e| e.ssl).map(|e| TlsOptions {
                 specs: tls_specs.remove(&addr).unwrap_or_default(),
                 http2: e.http2,
-                min_version: e.min_tls,
+                protocols: e.protocols.clone(),
             });
             if ep.map(|e| e.ssl).unwrap_or(false) && tls.as_ref().map(|t| t.specs.is_empty()).unwrap_or(true) {
                 return Err(AppError::Other(format!("{addr} 需要 TLS 但没有加载到证书")));
@@ -684,7 +683,7 @@ impl Router {
             auth_basic_user_file: None,
             ssl_cert: None,
             ssl_key: None,
-            min_tls: TlsVersion::Tls12,
+            protocols: TlsProtocols::default(),
             http2: false,
         };
         if let Some(sn) = d.find("server_name") {
@@ -724,15 +723,38 @@ impl Router {
         if let Some(key) = d.find("ssl_certificate_key").and_then(|x| x.arg(0)) {
             tmpl.ssl_key = Some(crate::resolve_path(key, base_dir));
         }
+        // ssl_min_version：等价于"该版本及以上全部启用"（向后兼容别名）。
         if let Some(v) = d.find("ssl_min_version").and_then(|x| x.arg(0)) {
-            tmpl.min_tls = match v.to_ascii_lowercase().as_str() {
-                "tlsv1.2" | "1.2" => TlsVersion::Tls12,
-                "tlsv1.3" | "1.3" => TlsVersion::Tls13,
-                other => {
-                    warnings.push(format!("ssl_min_version 不支持 '{other}'，按 TLS1.2"));
-                    TlsVersion::Tls12
+            match TlsVersion::from_nginx_token(v) {
+                Some(ver) => tmpl.protocols = TlsProtocols::from_min(ver),
+                None => warnings.push(format!(
+                    "ssl_min_version 不支持 '{v}'（可用 TLSv1/TLSv1.1/TLSv1.2/TLSv1.3），按 TLS1.2"
+                )),
+            }
+        }
+        // ssl_protocols：显式启用集合（nginx 语义），出现即以它为准，覆盖 ssl_min_version。
+        if let Some(p) = d.find("ssl_protocols") {
+            let mut set = TlsProtocols { enabled: Vec::new() };
+            for tok in &p.args {
+                match TlsVersion::from_nginx_token(tok) {
+                    Some(ver) => set.set(ver),
+                    None => {
+                        let lk = tok.to_ascii_lowercase();
+                        if lk == "sslv3" || lk == "ssl" {
+                            warnings.push(format!(
+                                "ssl_protocols 忽略 '{tok}'：SSLv3 已废弃且无任何后端支持"
+                            ));
+                        } else {
+                            warnings.push(format!("ssl_protocols 无法识别的协议 '{tok}'"));
+                        }
+                    }
                 }
-            };
+            }
+            if set.enabled.is_empty() {
+                warnings.push("ssl_protocols 未列出任何可用协议，回落默认 TLSv1.2 TLSv1.3".to_string());
+            } else {
+                tmpl.protocols = set;
+            }
         }
         if let Some(v) = d.find("http2").and_then(|x| x.arg(0)) {
             tmpl.http2 = v == "on" || v == "1.3.0" || v == "true";
@@ -1592,6 +1614,63 @@ mod tests {
         assert!(l.tls.is_some(), "quic 隐含 ssl：必须带 TLS 配置");
         // quic 但不带 http2（h2 走 TCP，h3 走 QUIC）
         assert!(!l.http2);
+    }
+
+    #[test]
+    fn ssl_protocols_parses_explicit_set() {
+        let tls_of = |conf: &str| {
+            let r = build(conf);
+            r.listeners[0].tls.as_ref().unwrap().protocols.clone()
+        };
+
+        // 显式单版本集合：可裁剪掉另一版本
+        assert_eq!(
+            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_protocols TLSv1.2; }"#)
+                .enabled,
+            vec![TlsVersion::Tls12]
+        );
+        assert_eq!(
+            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }"#)
+                .enabled,
+            vec![TlsVersion::Tls13]
+        );
+        // 四个都写：升序去重，含旧版本
+        let all = tls_of(
+            r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem; ssl_certificate_key k.pem;
+                 ssl_protocols TLSv1.3 TLSv1 TLSv1.1 TLSv1.2 TLSv1.3; }"#,
+        );
+        assert_eq!(
+            all.enabled,
+            vec![TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13]
+        );
+        assert!(all.wants_legacy());
+
+        // 默认（不写任何 TLS 协议指令）= TLS1.2 + TLS1.3
+        assert_eq!(
+            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; }"#)
+                .enabled,
+            vec![TlsVersion::Tls12, TlsVersion::Tls13]
+        );
+
+        // ssl_min_version 别名仍生效：min=TLSv1.3 → 只剩 1.3
+        assert_eq!(
+            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_min_version TLSv1.3; }"#)
+                .enabled,
+            vec![TlsVersion::Tls13]
+        );
+
+        // 同一 socket 上两个 server 的 ssl_protocols 取并集
+        let merged = tls_of(
+            r#"server { listen 127.0.0.1:18443 ssl; server_name a; ssl_certificate c.pem;
+                     ssl_certificate_key k.pem; ssl_protocols TLSv1.2; }
+               server { listen 127.0.0.1:18443 ssl; server_name b; ssl_certificate c.pem;
+                     ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }"#,
+        );
+        assert_eq!(merged.enabled, vec![TlsVersion::Tls12, TlsVersion::Tls13]);
     }
 
     #[test]

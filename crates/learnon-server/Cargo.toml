@@ -20,6 +20,13 @@ path = "src/gencert.rs"
 name = "lon-h3check"
 path = "src/h3check.rs"
 
+[features]
+default = []
+# 平台原生 TLS 后端（Windows=Schannel，Linux/macOS=系统栈），用于协商内置
+# rustls 无法提供的旧协议 TLSv1/TLSv1.1。默认关闭以保持纯 Rust；开启后按需
+# 依赖 native-tls/tokio-native-tls，legacy 监听自动改走原生握手（HTTP/1.1）。
+native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+
 [dependencies]
 learnon-config = { path = "../learnon-config" }
 tokio.workspace = true
@@ -44,3 +51,5 @@ socket2.workspace = true
 quinn = "0.11"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
