@@ -1,0 +1,4 @@
+# 这个 .txt 文件不该被 `*.conf` 通配命中；若被误包含，/decoy 会存在（E2E 断言其 404）。
+location /decoy {
+    return 200 "should-not-exist";
+}

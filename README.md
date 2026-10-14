@@ -64,7 +64,7 @@ all gateway logic is hand-written.
 | Nginx / OpenResty | LearnON (Rust) | Location |
 |---|---|---|
 | master/worker event loop | tokio async runtime + hyper HTTP/1 | `server.rs` |
-| nginx.conf syntax | custom lexer + recursive-descent parser (with unit tests) | `crates/learnon-config` |
+| nginx.conf syntax | custom lexer + recursive-descent parser, incl. `include <file \| glob>` (with unit tests) | `crates/learnon-config` |
 | `upstream` + load balancing | weighted round-robin / `least_conn` / `ip_hash` (with connection tracking) | `upstream.rs` |
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
