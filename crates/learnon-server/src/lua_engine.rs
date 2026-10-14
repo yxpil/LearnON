@@ -1,20 +1,25 @@
 //! Lua 引擎：OpenResty 的 LuaJIT + ngx.* 在 Rust 侧的对应物。
 //!
-//! - VM：mlua (Lua 5.4)，进程级共享，请求阶段串行执行（与 OpenResty 的
-//!   "每 worker 一个 VM" 思路一致，简化为每进程一个）
+//! - VM：mlua (Lua 5.4)，按 CPU 核心组建 VM 池（每核心一个，对标 OpenResty 每 worker 一个 VM）。
+//!   每个 VM 由一个专属调度器任务持有锁，以「同步 resume 一段、段间释放锁」的协程方式并发
+//!   多条在途请求（对标 OpenResty 单 worker 内的 C10K）：请求脚本只在 ngx.sleep 处
+//!   coroutine.yield 让出，让出期间同 VM 的其它请求继续推进，锁在步与步之间释放以便
+//!   ngx.timer 回调与 tokio 睡眠定时器取得进展。
 //! - API：ngx.say/print/status/exit/header/req.*/ctx/sleep/time/log/
 //!   shared.DICT/redirect/exec/re.*/encode_base64/decode_base64/
 //!   escape_uri/unescape_uri/decode_args/encode_args/config —— 语义对齐 ngx_lua
-//! - 请求状态放在 `Arc<Mutex<RequestCtx>>`，脚本通过 userdata 句柄读写，
-//!   阶段结束后由 Rust 侧继续接管同一个 ctx
+//! - 请求状态放在 `Arc<Mutex<RequestCtx>>`，脚本通过 userdata 句柄读写；每次同步 resume
+//!   前按协程挂回各自的 __ctx / ngx.ctx（每请求一张表，跨让出保持），阶段结束后由 Rust 侧
+//!   继续接管同一个 ctx
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use mlua::prelude::*;
-use mlua::{AnyUserData, Variadic};
+use mlua::{AnyUserData, RegistryKey, Thread, ThreadStatus, Variadic};
+use tokio::sync::{mpsc, oneshot};
 
 use learnon_config::Config;
 
@@ -124,9 +129,37 @@ type VM = tokio::sync::Mutex<Lua>;
 const MAX_PENDING_TIMERS: isize = 1024;
 const MAX_RUNNING_TIMERS: isize = 4096;
 
+/// 一次请求阶段作业：由 run_phase 提交给所属 VM 的调度器协程执行。
+/// 调度器把 code 编译进一个新 Lua 协程（thread），与其它在途请求在同一 VM 上
+/// 交错 resume；协程 Finished 时通过 reply 回传结果（保持 run_phase 原契约）。
+struct Job {
+    co_id: u64,
+    phase_name: String,
+    code: Arc<str>,
+    ctx: Arc<Mutex<RequestCtx>>,
+    reply: oneshot::Sender<Result<(), AppError>>,
+}
+
+/// VM 槽位：提交作业的发端（run_phase 用）+ 每 VM 的协程 id 计数。
+/// VM 本体由调度器任务持有强引用（引擎存活期间调度器不退出），Weak<VM> 供 ngx.timer 回调加锁。
+struct VmSlot {
+    job_tx: mpsc::UnboundedSender<Job>,
+    next_co: AtomicU64,
+}
+
+/// 调度器内部：一个在途协程的 Rust 侧状态。
+/// thread_key / ctx_table_key 指向 registry 里持有的 mlua 句柄（Send 安全，跨 await 存活）。
+struct CoState {
+    thread_key: RegistryKey,
+    ctx_table_key: RegistryKey,
+    ctx: Arc<Mutex<RequestCtx>>,
+    reply: oneshot::Sender<Result<(), AppError>>,
+}
+
 pub struct LuaEngine {
-    /// Lua VM 池：每 CPU 核心一个独立 VM，多请求并行执行（对标 OpenResty 每 worker 一个 VM）
-    vms: Vec<Arc<VM>>,
+    /// Lua VM 池：每 CPU 核心一个独立 VM，VM 之间完全并行；
+    /// 每个 VM 内部由调度器以协程方式并发多条在途请求（对标 OpenResty 单 worker 内的 C10K）。
+    vms: Vec<Arc<VmSlot>>,
     /// 轮询游标（无锁）
     counter: AtomicUsize,
 }
@@ -299,24 +332,44 @@ impl LuaEngine {
         // 进程级定时器计数（对标 lua_max_pending/running_timers 的每 worker 计数）
         let timer_pending = Arc::new(AtomicIsize::new(0));
         let timer_running = Arc::new(AtomicIsize::new(0));
-        let mut vms = Vec::with_capacity(n);
+        let mut vms: Vec<Arc<VmSlot>> = Vec::with_capacity(n);
         for _ in 0..n {
             let vm = Arc::new(VM::new(Lua::new()));
             let vm_ref = Arc::downgrade(&vm);
+            // 每 VM 一套作业/事件通道：调度器任务独占 VM 锁，run_phase 通过 job_tx 提交
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<u64>();
+            let sleep_counter = Arc::new(AtomicU64::new(1));
             {
                 let mut guard = vm.try_lock()
                     .map_err(|_| AppError::Other("Lua VM 启动时被占用".to_string()))?;
-                Self::install_api(&mut guard, &dicts, &vm_ref, &timer_pending, &timer_running)?;
+                Self::install_api(
+                    &mut guard,
+                    &dicts,
+                    &vm_ref,
+                    &timer_pending,
+                    &timer_running,
+                    &ev_tx,
+                    &sleep_counter,
+                )?;
                 for (name, code) in &inits {
                     guard.load(code).set_name(name).exec()?;
                 }
             }
-            vms.push(vm);
+            // ev_tx 的存活副本此刻已冻结进 ngx.sleep 的 Rust 闭包里；调度器只持有 ev_rx
+            // 调度器任务持有 VM 的强引用：引擎存活期间 job_tx 不 drop，调度器不退出，VM 随之存活
+            tokio::spawn(Self::run_scheduler(vm.clone(), job_rx, ev_rx));
+            vms.push(Arc::new(VmSlot {
+                job_tx,
+                next_co: AtomicU64::new(1),
+            }));
         }
         for (name, _) in &inits {
             println!("[learnon] 已执行 {name}（x{n} VM）");
         }
-        println!("[learnon] Lua VM 池就绪：{n} 个实例（每核心一个，多请求并行执行）");
+        println!(
+            "[learnon] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）"
+        );
         Ok(LuaEngine {
             vms,
             counter: AtomicUsize::new(0),
@@ -329,6 +382,8 @@ impl LuaEngine {
         vm_ref: &Weak<VM>,
         timer_pending: &Arc<AtomicIsize>,
         timer_running: &Arc<AtomicIsize>,
+        ev_tx: &mpsc::UnboundedSender<u64>,
+        sleep_counter: &Arc<AtomicU64>,
     ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
@@ -450,12 +505,38 @@ impl LuaEngine {
         })?;
         ngx.set("exec", exec)?;
 
-        // ngx.sleep(ms) —— 异步睡眠（协程让出，不阻塞 worker）
-        let sleep = lua.create_async_function(|_, ms: u64| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            Ok(())
-        })?;
-        ngx.set("sleep", sleep)?;
+        // ngx.sleep(ms) —— 让出当前请求协程，不阻塞 VM：
+        // _learnon_sleep_start 用 tokio 定时器计时，把完成事件投回所属 VM 调度器并返回 sleep id；
+        // Lua 侧随即 coroutine.yield(id) 挂起，调度器收到该 id 的事件后再 resume 本协程。
+        {
+            let ev_tx = ev_tx.clone();
+            let counter = Arc::clone(sleep_counter);
+            let sleep_start = lua.create_function(move |_lua, ms: f64| {
+                let id = counter.fetch_add(1, Ordering::Relaxed);
+                let ev_tx = ev_tx.clone();
+                let dur = std::time::Duration::from_millis(ms.max(0.0) as u64);
+                tokio::spawn(async move {
+                    tokio::time::sleep(dur).await;
+                    let _ = ev_tx.send(id);
+                });
+                Ok(id)
+            })?;
+            lua.globals().set("_learnon_sleep_start", sleep_start)?;
+        }
+        let sleep_wrapper: LuaFunction = lua
+            .load(
+                r#"
+                return function(ms)
+                    if not (coroutine.isyieldable and coroutine.isyieldable()) then
+                        error("ngx.sleep must run inside a coroutine (not usable in this context)", 0)
+                    end
+                    local id = _learnon_sleep_start(ms)
+                    return coroutine.yield(id)
+                end
+                "#,
+            )
+            .eval()?;
+        ngx.set("sleep", sleep_wrapper)?;
 
         // ngx.timer —— 官方表 API：at / every / running_count / pending_count
         // 回调派发器：把 premature 作为首参、原样转发用户变参（对标 OpenResty 调用约定）
@@ -974,36 +1055,220 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// 执行一个请求阶段脚本（串行化；ctx 由 Rust 侧传入、改完带回去）
+    /// 执行一个请求阶段脚本：轮询选一个 VM，把脚本作为协程作业提交给该 VM 的调度器，
+    /// 等待该协程跑到 Finished（期间与同 VM 的其它在途请求交错执行）。ctx 改完带回去。
     pub async fn run_phase(
         &self,
         phase_name: &str,
         src: &LuaSource,
         ctx: Arc<Mutex<RequestCtx>>,
     ) -> Result<(), AppError> {
-        // 无锁轮询取一个 VM；同一 VM 内串行、VM 之间完全并行
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.vms.len();
-        let vm = Arc::clone(&self.vms[idx]);
-        let vm = vm.lock().await;
-        let lua = &*vm;
         let code = src.load()?;
+        // 无锁轮询选 VM：VM 之间完全并行，VM 之内由调度器以协程方式并发
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.vms.len();
+        let slot = Arc::clone(&self.vms[idx]);
+        let co_id = slot.next_co.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let job = Job {
+            co_id,
+            phase_name: phase_name.to_string(),
+            code,
+            ctx,
+            reply: tx,
+        };
+        slot.job_tx
+            .send(job)
+            .map_err(|_| AppError::Other("Lua 调度器已停止".into()))?;
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(AppError::Other("Lua 调度器在请求完成前退出".into())),
+        }
+    }
 
-        lua.set_named_registry_value("__ctx", CtxHandle(ctx))?;
-        // ngx.ctx：每请求一张真实表（对标 OpenResty 的 ngx.ctx）
-        let ngx: LuaTable = lua.globals().get("ngx")?;
-        let ctx_table: LuaTable = lua.create_table()?;
-        ngx.raw_set("ctx", ctx_table)?;
-        let result = lua
-            .load(code.as_ref())
-            .set_name(phase_name)
-            .exec_async()
-            .await;
-        let _ = lua.unset_named_registry_value("__ctx");
+    /// 把请求脚本编译进一个新协程（thread），并把协程句柄与「本请求专属」的 ngx.ctx 表
+    /// 各自存入 registry（返回可跨 await 存活的 RegistryKey）。
+    fn co_spawn(lua: &Lua, phase_name: &str, code: &str) -> LuaResult<(RegistryKey, RegistryKey)> {
+        let f = lua.load(code).set_name(phase_name).into_function()?;
+        let co = lua.create_thread(f)?;
+        let thread_key = lua.create_registry_value(co)?;
+        let ctx_table = lua.create_table()?;
+        let ctx_table_key = lua.create_registry_value(ctx_table)?;
+        Ok((thread_key, ctx_table_key))
+    }
 
-        result.map_err(|e| {
-            eprintln!("[learnon] {phase_name} 脚本错误: {e}");
-            AppError::Lua(e)
-        })
+    /// VM 调度器：单任务独占该 VM 的锁，以「持锁同步 resume 一段、段间释放锁」的方式并发多条协程。
+    /// 释放锁的窗口内，直接 vm.lock() 的 ngx.timer 与 tokio 睡眠定时器得以推进；协程只在 ngx.sleep
+    /// 处 coroutine.yield 让出（yielded 值即睡眠 id）。
+    async fn run_scheduler(
+        vm: Arc<VM>,
+        mut job_rx: mpsc::UnboundedReceiver<Job>,
+        mut ev_rx: mpsc::UnboundedReceiver<u64>,
+    ) {
+        let mut states: HashMap<u64, CoState> = HashMap::new();
+        let mut ready: VecDeque<u64> = VecDeque::new();
+        let mut waiting: HashMap<u64, u64> = HashMap::new(); // 睡眠 id -> 协程 id
+        // 挂起等待时被 select 取走的作业/事件先暂存，下一步统一步骤内处理（避免丢事件）
+        let mut inbox: VecDeque<Job> = VecDeque::new();
+        let mut wake_evs: VecDeque<u64> = VecDeque::new();
+
+        loop {
+            // ==================== 持锁一步 ====================
+            {
+                let guard = vm.lock().await;
+                let lua = &*guard;
+                let ngx: LuaTable = match lua.globals().get("ngx") {
+                    Ok(t) => t,
+                    Err(_) => break, // VM 状态异常，退出
+                };
+
+                // 1) 收下新作业：编译进协程并入队 ready
+                let mut jobs: Vec<Job> = Vec::new();
+                jobs.extend(inbox.drain(..));
+                while let Ok(j) = job_rx.try_recv() {
+                    jobs.push(j);
+                }
+                for job in jobs {
+                    let Job { co_id, phase_name, code, ctx, reply } = job;
+                    match Self::co_spawn(lua, &phase_name, &code) {
+                        Ok((thread_key, ctx_table_key)) => {
+                            states.insert(co_id, CoState { thread_key, ctx_table_key, ctx, reply });
+                            ready.push_back(co_id);
+                        }
+                        Err(e) => {
+                            eprintln!("[learnon] {phase_name} 脚本编译失败: {e}");
+                            let _ = reply.send(Err(AppError::Lua(e)));
+                        }
+                    }
+                }
+
+                // 2) 收下睡眠完成事件：把对应协程从 waiting 移回 ready
+                let mut evs: Vec<u64> = Vec::new();
+                evs.extend(wake_evs.drain(..));
+                while let Ok(sid) = ev_rx.try_recv() {
+                    evs.push(sid);
+                }
+                for sid in evs {
+                    if let Some(co_id) = waiting.remove(&sid) {
+                        ready.push_back(co_id);
+                    }
+                }
+
+                // 3) 本轮就绪协程各同步 resume 一次（公平轮转）
+                let mut pending = std::mem::take(&mut ready);
+                while let Some(co_id) = pending.pop_front() {
+                    // 借用 st 仅用于挂上下文 + 取句柄；取回 thread 后立即结束借用
+                    let thread = match states.get(&co_id) {
+                        None => continue,
+                        Some(st) => {
+                            let _ = lua
+                                .set_named_registry_value("__ctx", CtxHandle(Arc::clone(&st.ctx)));
+                            if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
+                                let _ = ngx.raw_set("ctx", ct);
+                            }
+                            lua.registry_value::<Thread>(&st.thread_key)
+                        }
+                    }; // states 借用到此结束
+                    let thread = match thread {
+                        Ok(t) => t,
+                        Err(e) => {
+                            finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                            continue;
+                        }
+                    };
+
+                    match thread.resume::<LuaValue>(()) {
+                        Err(e) => {
+                            eprintln!("[learnon] 脚本错误: {e}");
+                            finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                        }
+                        Ok(yielded) => match thread.status() {
+                            ThreadStatus::Finished => {
+                                finish(lua, &mut states, &mut waiting, co_id, Ok(()))
+                            }
+                            ThreadStatus::Resumable => match sleep_id_of(&yielded) {
+                                Some(sid) => {
+                                    waiting.insert(sid, co_id);
+                                }
+                                None => {
+                                    // 非睡眠的野 yield：无法被唤醒，按错误回传避免悬挂
+                                    eprintln!("[learnon] 协程在ngx.sleep之外yield，无法恢复");
+                                    finish(
+                                        lua,
+                                        &mut states,
+                                        &mut waiting,
+                                        co_id,
+                                        Err(AppError::Other("attempt to yield from outside a supported operation".into())),
+                                    );
+                                }
+                            },
+                            ThreadStatus::Error => finish(
+                                lua,
+                                &mut states,
+                                &mut waiting,
+                                co_id,
+                                Err(AppError::Other("coroutine error".into())),
+                            ),
+                            // 不应出现（同步 resume 不会停在 Running）；保守放回本轮继续
+                            ThreadStatus::Running => pending.push_back(co_id),
+                        },
+                    }
+                }
+                ready.append(&mut pending);
+            } // ==================== 释放锁 ====================
+
+            // 有就绪工作：让出执行权给 runtime（timer/睡眠事件），随即再跑一步
+            // 无就绪工作：挂起等作业或睡眠事件
+            if ready.is_empty() {
+                tokio::select! {
+                    j = job_rx.recv() => match j {
+                        Some(job) => inbox.push_back(job),
+                        None => break, // 所有 job_tx 已 drop（引擎关闭）
+                    },
+                    e = ev_rx.recv() => {
+                        if let Some(sid) = e { wake_evs.push_back(sid); }
+                    },
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // 退出：把仍在途的协程全部回传错误，避免 run_phase 永久等待
+        let lua_guard = vm.lock().await;
+        for (_, st) in std::mem::take(&mut states) {
+            let _ = lua_guard.remove_registry_value(st.thread_key);
+            let _ = lua_guard.remove_registry_value(st.ctx_table_key);
+            drop(st.ctx);
+            let _ = st.reply.send(Err(AppError::Other("Lua 调度器已停止".into())));
+        }
+        drop(lua_guard);
+    }
+}
+
+/// 结束一个协程：出栈 states、释放其 registry 句柄、尽早 drop 请求 ctx 引用，再回传结果。
+fn finish(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    waiting: &mut HashMap<u64, u64>,
+    co_id: u64,
+    result: Result<(), AppError>,
+) {
+    if let Some(st) = states.remove(&co_id) {
+        // 清理可能残留的 waiting 映射（此协程已结束）
+        waiting.retain(|_, v| *v != co_id);
+        let _ = lua.remove_registry_value(st.thread_key);
+        let _ = lua.remove_registry_value(st.ctx_table_key);
+        drop(st.ctx);
+        let _ = st.reply.send(result);
+    }
+}
+
+/// 从协程 yield 出的值里取睡眠 id（由 _learnon_sleep_start 以整型返回）。
+fn sleep_id_of(v: &LuaValue) -> Option<u64> {
+    match v {
+        LuaValue::Integer(i) => u64::try_from(*i).ok(),
+        LuaValue::Number(n) => u64::try_from(*n as i64).ok(),
+        _ => None,
     }
 }
 

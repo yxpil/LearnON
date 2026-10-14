@@ -46,6 +46,10 @@ all gateway logic is hand-written.
 - **Lua VM pool**: one independent Lua VM per CPU core (mirroring OpenResty's one VM per worker).
   Multiple requests execute scripts fully in parallel with no global single-point lock;
   `init_by_lua` runs once per VM (matching nginx's once-per-worker initialization semantics).
+- **Within-VM coroutine scheduler**: each VM is driven by a dedicated scheduler task that interleaves
+  many in-flight requests as Lua coroutines — a request yields only at `ngx.sleep` and the VM lock is
+  released between synchronous resume segments, so `ngx.timer` callbacks and sleep timers progress
+  while other requests on the same VM run (OpenResty's single-worker C10K, not one-request-per-VM).
 - **16-shard ngx.shared.DICT**: sharded by key hash, each shard with its own lock, so multi-core
   concurrent reads/writes never block each other.
 - **Lock-free hot paths**: round-robin cursor / node health state / VM selection are all atomic.
@@ -229,8 +233,19 @@ Already done (previously listed as gaps, now implemented):
   switching. (`proxy.rs::ProxyBody`, `server.rs::handle_request`, verified by
   `tools/streaming_body_e2e.py`: a body dribbled to the backend over ~1.2s shows a ~1.1s read span
   through `off` but a single burst read through `on`, with matching sha256 both ways.)
+- **Within-VM Lua coroutine concurrency**: each VM is run by a scheduler task that holds the `Lua`
+  lock only for a synchronous resume segment and releases it between segments, so many requests share
+  one VM and interleave at `ngx.sleep` (a Lua wrapper around a `tokio::time::sleep` that yields the
+  sleep id; the scheduler re-readies the coroutine when the timer fires). `ngx.ctx` is a per-request
+  table re-attached before each resume, so it survives a yield and stays isolated from other coroutines
+  on the same VM. (`lua_engine.rs::run_scheduler`/`co_spawn`, verified by `tools/lua_concurrency_e2e.py`:
+  48 concurrent 500ms `ngx.sleep` requests finish in ~0.5s wall — not ~1.5s as the old one-request-per-VM
+  serialization would give — and 32 concurrent `ngx.ctx` requests each keep their own counter across the yield.)
 
 Remaining tradeoffs / roadmap:
 
-- **Within-VM Lua serialization**: a single VM runs one request at a time; per-request coroutine
-  concurrency inside one VM (OpenResty-style) is not implemented — parallelism comes from the VM pool.
+- **Yield points are limited to `ngx.sleep`**: the scheduler interleaves requests only at `ngx.sleep`.
+  The TCP cosocket (`ngx.socket.tcp`) is still a skeleton, so Lua that does its own socket I/O or
+  blocking work does not yield back to the scheduler yet — full cosocket (connect/send/receive as
+  yield points) is the next step toward parity. `ngx.sleep` is also not usable inside `ngx.timer`
+  callbacks (they run synchronously under the VM lock, outside a scheduler coroutine).
