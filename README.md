@@ -161,6 +161,9 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Response: `ngx.say / print / status (read-write) / exit / header.set / any response header before send_headers`
 - Request: `ngx.req.get_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / get_body_data`
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep (async coroutine)`
+- Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / settimeout / close /
+  setkeepalive / getstats` — non-blocking TCP, yields to the VM scheduler so concurrent requests
+  interleave on one VM (mirrors ngx_lua's cosocket yield-and-resume model)
 - Regex: `ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)` (flags support `i`)
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
@@ -169,8 +172,9 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   failures return `(nil, err)`, `return false` stops the interval (semantics aligned with official t/106/152/107)
 - Response filters: `header_filter_by_lua*` (mutate response headers / clear Content-Length before
   sending), `body_filter_by_lua*` (rewrite the response body via `ngx.arg[1]` chunk, `ngx.arg[2]` eof)
-- cosocket: `ngx.socket.tcp()` object is in place (API skeleton; full connect/send/receive pending
-  coroutine scheduling in v0.4)
+- cosocket: `ngx.socket.tcp()` with `connect/send/receive(*l|*a|n)/settimeout/close` — ops run in
+  tokio tasks (no VM lock held) and yield to the scheduler, so many socket-bound requests share one
+  VM concurrently; partial-data + timeout semantics mirror ngx_lua (`nil, err, partial`)
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 
 ## E2E tests (aligned with the OpenResty official suite)
@@ -240,12 +244,16 @@ Already done (previously listed as gaps, now implemented):
   table re-attached before each resume, so it survives a yield and stays isolated from other coroutines
   on the same VM. (`lua_engine.rs::run_scheduler`/`co_spawn`, verified by `tools/lua_concurrency_e2e.py`:
   48 concurrent 500ms `ngx.sleep` requests finish in ~0.5s wall — not ~1.5s as the old one-request-per-VM
-  serialization would give — and 32 concurrent `ngx.ctx` requests each keep their own counter across the yield.)
+  serialization would give — and 32 concurrent `ngx.ctx` requests each keep their own counter across the yield.
+  `ngx.socket.tcp` cosocket ops share the same yield-and-resume path, verified by `tools/cosocket_e2e.py`:
+  32 concurrent connect/send/receive round-trips finish in ~1.3s wall, far below the ~9.6s a serialized
+  model would take, while per-op timeout returns `(nil, "timeout")` and connect failure returns `(nil, err)`.)
 
 Remaining tradeoffs / roadmap:
 
-- **Yield points are limited to `ngx.sleep`**: the scheduler interleaves requests only at `ngx.sleep`.
-  The TCP cosocket (`ngx.socket.tcp`) is still a skeleton, so Lua that does its own socket I/O or
-  blocking work does not yield back to the scheduler yet — full cosocket (connect/send/receive as
-  yield points) is the next step toward parity. `ngx.sleep` is also not usable inside `ngx.timer`
-  callbacks (they run synchronously under the VM lock, outside a scheduler coroutine).
+- **Cosocket coverage**: `ngx.socket.tcp` runs `connect/send/receive(*l|*a|n)/settimeout/close` as
+  scheduler yield points (see the API section above), but not yet `receiveany`, the timed `*l` third
+  return variant, `connect` over SSL (`ssl:connect`), or `ngx.socket.udp`. Subrequests
+  (`ngx.location.capture`) and `balancer_by_lua` remain open.
+- **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
+  outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).

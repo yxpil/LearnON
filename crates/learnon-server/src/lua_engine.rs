@@ -5,7 +5,10 @@
 //!   多条在途请求（对标 OpenResty 单 worker 内的 C10K）：请求脚本只在 ngx.sleep 处
 //!   coroutine.yield 让出，让出期间同 VM 的其它请求继续推进，锁在步与步之间释放以便
 //!   ngx.timer 回调与 tokio 睡眠定时器取得进展。
-//! - API：ngx.say/print/status/exit/header/req.*/ctx/sleep/time/log/
+//! - 非阻塞 I/O：ngx.sleep 与 ngx.socket.tcp() cosocket（connect/send/receive）都走同一套
+//!   「协程让出 + 调度器带结果 resume」机制——op 在 tokio 任务里跑，不持 VM 锁，完成后把
+//!   唤醒值 (op_id, [结果…]) 投回调度器，coroutine.yield 因此拿到返回值，实现单 VM 上的真并发。
+//! - API：ngx.say/print/status/exit/header/req.*/ctx/sleep/socket.tcp/time/log/
 //!   shared.DICT/redirect/exec/re.*/encode_base64/decode_base64/
 //!   escape_uri/unescape_uri/decode_args/encode_args/config —— 语义对齐 ngx_lua
 //! - 请求状态放在 `Arc<Mutex<RequestCtx>>`，脚本通过 userdata 句柄读写；每次同步 resume
@@ -19,6 +22,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use mlua::prelude::*;
 use mlua::{AnyUserData, RegistryKey, Thread, ThreadStatus, Variadic};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 use learnon_config::Config;
@@ -106,22 +111,250 @@ impl LuaSource {
     }
 }
 
-/// TCP cosocket 对象（对标 ngx.socket.tcp）- v0.3 简化版：API 骨架，为 v0.4 完整实现预留接口
-pub struct TcpSocket {
-    _marker: (), // 占位符，v0.4 将实现实际 socket 逻辑
+/// TCP cosocket 句柄（对标 ngx.socket.tcp 的底层对象）。
+///
+/// I/O 在 tokio 任务里执行，**不持 Lua VM 锁**：`_start_*` 立即 spawn 一个 op 任务并返回 op id，
+/// Lua 侧 `coroutine.yield(op_id)` 让出；op 完成后把结果作为唤醒值投回调度器，调度器再带结果
+/// resume 本协程（即 `coroutine.yield` 的返回值）。同一 socket 上的 op 由调用协程串行发起，
+/// `stream` 的 tokio 互斥锁只是与调度器/其它 VM 任务隔离的防护。
+pub struct Cosocket {
+    stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    buf: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    op_counter: Arc<AtomicU64>,
+    ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
 }
 
-impl TcpSocket {
-    fn new() -> Self {
-        TcpSocket {
-            _marker: (),
+/// receive 模式（在同步阶段从 LuaValue 解析，交给 async 任务拥有）。
+enum RecvPat {
+    Line,
+    All,
+    Exact(usize),
+}
+
+impl Cosocket {
+    fn new(ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>, op_counter: Arc<AtomicU64>) -> Self {
+        Cosocket {
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(5000)),
+            op_counter,
+            ev_tx,
         }
     }
 }
 
-// v0.3: 基础 cosocket API 骨架（完整实现需 v0.4 的 mlua 协程支持）
-// 当前提供占位方法，实际网络操作建议使用 Rust 原生模块或外部代理
-impl LuaUserData for TcpSocket {}
+/// 睡眠/op 的超时时长；0 表示不超时（给一个足够大的上限）。
+fn op_timeout(dur_ms: u64) -> std::time::Duration {
+    if dur_ms == 0 {
+        std::time::Duration::from_secs(3600)
+    } else {
+        std::time::Duration::from_millis(dur_ms)
+    }
+}
+
+/// 从已缓冲字节 + 流的增量读中取出一个 receive 请求的数据；内部按 (Line/All/Exact) 处理，
+/// 读满/EOF/出错即返回。持有 buf 的 tokio 锁跨 await（Send 安全）。
+async fn recv_into(
+    s: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    pat: &RecvPat,
+) -> Vec<ResumeVal> {
+    use ResumeVal::*;
+    let nil_closed = |left: Vec<u8>| vec![Nil, Str("closed".into()), Bytes(left)];
+    match pat {
+        RecvPat::Line => loop {
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = buf.drain(..=pos).collect();
+                line.pop(); // 去掉 '\n'
+                if line.last() == Some(&b'\r') {
+                    line.pop(); // 去掉 CRLF 的 '\r'
+                }
+                return vec![Bytes(line)];
+            }
+            let mut tmp = [0u8; 4096];
+            match s.read(&mut tmp).await {
+                Ok(0) => return nil_closed(buf.clone()),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
+            }
+        },
+        RecvPat::Exact(n) => {
+            if *n == 0 {
+                return vec![Bytes(Vec::new())];
+            }
+            loop {
+                if buf.len() >= *n {
+                    let data: Vec<u8> = buf.drain(..*n).collect();
+                    return vec![Bytes(data)];
+                }
+                let mut tmp = [0u8; 4096];
+                match s.read(&mut tmp).await {
+                    Ok(0) => return nil_closed(buf.clone()),
+                    Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
+                }
+            }
+        }
+        RecvPat::All => loop {
+            let mut tmp = [0u8; 4096];
+            match s.read(&mut tmp).await {
+                Ok(0) => return vec![Bytes(std::mem::take(buf))],
+                Ok(k) => tmp[..k].iter().for_each(|&b| buf.push(b)),
+                Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
+            }
+        },
+    }
+}
+
+impl LuaUserData for Cosocket {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        // _start_connect(host, port) -> op id；成功唤醒值 [1]，失败 [nil, err]
+        methods.add_method("_start_connect", |lua, this, (host, port): (String, LuaValue)| {
+            let port = to_u16(lua, &port)?;
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let stream = Arc::clone(&this.stream);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let payload = match tokio::time::timeout(dur, TcpStream::connect((host.as_str(), port))).await {
+                    Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                    Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("connect failed: {e}"))],
+                    Ok(Ok(s)) => {
+                        *stream.lock().await = Some(s);
+                        vec![ResumeVal::Int(1)]
+                    }
+                };
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _start_send(data) -> op id；成功 [bytes]，失败 [nil, err]
+        methods.add_method("_start_send", |lua, this, data: LuaString| {
+            let _ = lua;
+            let bytes = data.as_bytes().to_vec();
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let stream = Arc::clone(&this.stream);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let mut g = stream.lock().await;
+                let payload = match g.as_mut() {
+                    None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
+                    Some(s) => match tokio::time::timeout(dur, s.write_all(&bytes)).await {
+                        Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))],
+                        Ok(Ok(())) => vec![ResumeVal::Int(bytes.len() as i64)],
+                    },
+                };
+                drop(g);
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _start_receive(pattern) -> op id；pattern: "*l"|nil / "*a" / 整数 n
+        methods.add_method("_start_receive", |lua, this, pattern: LuaValue| {
+            let pat = parse_recv_pat(lua, &pattern)?;
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let stream = Arc::clone(&this.stream);
+            let buf = Arc::clone(&this.buf);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let mut sg = stream.lock().await;
+                let s = match sg.as_mut() {
+                    None => {
+                        let _ = ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
+                        return;
+                    }
+                    Some(s) => s,
+                };
+                let mut bg = buf.lock().await;
+                let payload = match tokio::time::timeout(dur, recv_into(s, &mut bg, &pat)).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // 超时：把已缓冲部分作为 partial 回传
+                        let partial = bg.clone();
+                        vec![
+                            ResumeVal::Nil,
+                            ResumeVal::Str("timeout".into()),
+                            ResumeVal::Bytes(partial),
+                        ]
+                    }
+                };
+                drop(bg);
+                drop(sg);
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _close() -> 1（同步：此刻无在途 op，tokio try_lock 可成功）
+        methods.add_method("_close", |_lua, this, ()| {
+            if let Ok(mut g) = this.stream.try_lock() {
+                *g = None;
+            } else {
+                let stream = Arc::clone(&this.stream);
+                tokio::spawn(async move {
+                    *stream.lock().await = None;
+                });
+            }
+            if let Ok(mut b) = this.buf.try_lock() {
+                b.clear();
+            }
+            Ok(1u64)
+        });
+
+        // _settimeout(ms) -> 1
+        methods.add_method("_settimeout", |_lua, this, ms: u64| {
+            this.timeout_ms.store(ms, Ordering::Relaxed);
+            Ok(1u64)
+        });
+    }
+}
+
+/// 把 Lua 侧的端口值（整数/数字/字符串）转成 u16。
+fn to_u16(_lua: &Lua, v: &LuaValue) -> LuaResult<u16> {
+    let n = match v {
+        LuaValue::Integer(i) => *i,
+        LuaValue::Number(f) => *f as i64,
+        LuaValue::String(s) => s
+            .to_string_lossy()
+            .parse::<i64>()
+            .map_err(|_| LuaError::runtime("invalid port"))?,
+        _ => return Err(LuaError::runtime("invalid port type")),
+    };
+    if !(1..=65535).contains(&n) {
+        return Err(LuaError::runtime("port out of range"));
+    }
+    Ok(n as u16)
+}
+
+/// 解析 receive pattern。
+fn parse_recv_pat(_lua: &Lua, v: &LuaValue) -> LuaResult<RecvPat> {
+    Ok(match v {
+        LuaValue::Nil => RecvPat::Line,
+        LuaValue::Integer(n) if *n > 0 => RecvPat::Exact(*n as usize),
+        LuaValue::Number(f) if *f >= 1.0 => RecvPat::Exact(*f as usize),
+        LuaValue::String(s) => {
+            let t = s.to_string_lossy().to_lowercase();
+            match t.as_str() {
+                "*a" | "*all" | "all" => RecvPat::All,
+                "*l" | "l" | "line" => RecvPat::Line,
+                other => {
+                    // 也接受纯数字字符串
+                    match other.parse::<usize>() {
+                        Ok(n) if n > 0 => RecvPat::Exact(n),
+                        _ => RecvPat::Line,
+                    }
+                }
+            }
+        }
+        _ => RecvPat::Line,
+    })
+}
 
 type VM = tokio::sync::Mutex<Lua>;
 
@@ -147,6 +380,18 @@ struct VmSlot {
     next_co: AtomicU64,
 }
 
+/// 调度器在协程让出后、重新 resume 时回传给协程的值（纯 Rust，跨 await 安全）。
+/// 由完成事件的发端（睡眠 / cosocket op 任务）填充，scheduler 在 resume 前转成 LuaValue。
+#[derive(Clone)]
+enum ResumeVal {
+    Nil,
+    #[allow(dead_code)] // 预留给未来返回布尔的 op（如 setkeepalive）
+    Bool(bool),
+    Int(i64),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
 /// 调度器内部：一个在途协程的 Rust 侧状态。
 /// thread_key / ctx_table_key 指向 registry 里持有的 mlua 句柄（Send 安全，跨 await 存活）。
 struct CoState {
@@ -154,6 +399,8 @@ struct CoState {
     ctx_table_key: RegistryKey,
     ctx: Arc<Mutex<RequestCtx>>,
     reply: oneshot::Sender<Result<(), AppError>>,
+    /// 本次让出对应的唤醒参数（睡眠为空；cosocket op 携带结果）。resume 前消费并清空。
+    wake_args: Vec<ResumeVal>,
 }
 
 pub struct LuaEngine {
@@ -337,9 +584,10 @@ impl LuaEngine {
             let vm = Arc::new(VM::new(Lua::new()));
             let vm_ref = Arc::downgrade(&vm);
             // 每 VM 一套作业/事件通道：调度器任务独占 VM 锁，run_phase 通过 job_tx 提交
+            // 事件 = (op id, 回传给协程的唤醒值)：睡眠投空 vec，cosocket op 投结果
             let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<u64>();
-            let sleep_counter = Arc::new(AtomicU64::new(1));
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<(u64, Vec<ResumeVal>)>();
+            let op_counter = Arc::new(AtomicU64::new(1));
             {
                 let mut guard = vm.try_lock()
                     .map_err(|_| AppError::Other("Lua VM 启动时被占用".to_string()))?;
@@ -350,7 +598,7 @@ impl LuaEngine {
                     &timer_pending,
                     &timer_running,
                     &ev_tx,
-                    &sleep_counter,
+                    &op_counter,
                 )?;
                 for (name, code) in &inits {
                     guard.load(code).set_name(name).exec()?;
@@ -382,8 +630,8 @@ impl LuaEngine {
         vm_ref: &Weak<VM>,
         timer_pending: &Arc<AtomicIsize>,
         timer_running: &Arc<AtomicIsize>,
-        ev_tx: &mpsc::UnboundedSender<u64>,
-        sleep_counter: &Arc<AtomicU64>,
+        ev_tx: &mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
+        op_counter: &Arc<AtomicU64>,
     ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
@@ -510,14 +758,14 @@ impl LuaEngine {
         // Lua 侧随即 coroutine.yield(id) 挂起，调度器收到该 id 的事件后再 resume 本协程。
         {
             let ev_tx = ev_tx.clone();
-            let counter = Arc::clone(sleep_counter);
+            let counter = Arc::clone(op_counter);
             let sleep_start = lua.create_function(move |_lua, ms: f64| {
                 let id = counter.fetch_add(1, Ordering::Relaxed);
                 let ev_tx = ev_tx.clone();
                 let dur = std::time::Duration::from_millis(ms.max(0.0) as u64);
                 tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
-                    let _ = ev_tx.send(id);
+                    let _ = ev_tx.send((id, Vec::new()));
                 });
                 Ok(id)
             })?;
@@ -791,16 +1039,51 @@ impl LuaEngine {
         arg.set_metatable(Some(mt));
         ngx.set("arg", arg)?;
 
-        // ngx.socket.* —— TCP cosocket 基础 API（v0.3 简化版：spawn_blocking + std::net）
+        // ngx.socket.tcp() —— 真·非阻塞 cosocket：底层 op 在 tokio 任务里跑，Lua 方法通过
+        // coroutine.yield(op_id) 让出（不持 VM 锁），op 完成后调度器带结果 resume 协程。
+        // Rust 侧只提供「不 yield 的启动原语」（Cosocket 的 _start_* / _close / _settimeout 方法），
+        // 公开的 connect/send/receive 语义（含让出）用一小段 Lua 包在 metatable 上。
         let socket = lua.create_table()?;
-
-        // ngx.socket.tcp() —— 创建 TCP socket userdata
-        let tcp_create = lua.create_function(|lua, ()| {
-            let sock = TcpSocket::new();
-            let ud = lua.create_userdata(sock)?;
-            Ok(ud)
-        })?;
-        socket.set("tcp", tcp_create)?;
+        {
+            let ev_tx = ev_tx.clone();
+            let op_counter = Arc::clone(op_counter);
+            let sock_new = lua.create_function(move |lua, ()| {
+                let cs = Cosocket::new(ev_tx.clone(), Arc::clone(&op_counter));
+                Ok(lua.create_userdata(cs)?)
+            })?;
+            lua.globals().set("_learnon_sock_new", sock_new)?;
+        }
+        let cosocket_mod: LuaFunction = lua
+            .load(
+                r#"
+                return function(socket_tbl)
+                    local mt = { __index = {} }
+                    local M = mt.__index
+                    function M:connect(host, port)
+                        local id = self._h:_start_connect(host, port)
+                        return coroutine.yield(id)
+                    end
+                    function M:send(data)
+                        local id = self._h:_start_send(data)
+                        return coroutine.yield(id)
+                    end
+                    function M:receive(pattern)
+                        local id = self._h:_start_receive(pattern)
+                        return coroutine.yield(id)
+                    end
+                    function M:close() return self._h:_close() end
+                    function M:settimeout(ms) return self._h:_settimeout(ms) end
+                    function M:setkeepalive(...) return 1 end
+                    function M:getstats() return { bytes_received = 0, bytes_sent = 0 } end
+                    socket_tbl.tcp = function()
+                        return setmetatable({ _h = _learnon_sock_new() }, mt)
+                    end
+                    return true
+                end
+                "#,
+            )
+            .eval()?;
+        cosocket_mod.call::<()>(socket.clone())?;
         ngx.set("socket", socket)?;
 
         // ngx.req.* —— 请求信息
@@ -1102,14 +1385,14 @@ impl LuaEngine {
     async fn run_scheduler(
         vm: Arc<VM>,
         mut job_rx: mpsc::UnboundedReceiver<Job>,
-        mut ev_rx: mpsc::UnboundedReceiver<u64>,
+        mut ev_rx: mpsc::UnboundedReceiver<(u64, Vec<ResumeVal>)>,
     ) {
         let mut states: HashMap<u64, CoState> = HashMap::new();
         let mut ready: VecDeque<u64> = VecDeque::new();
-        let mut waiting: HashMap<u64, u64> = HashMap::new(); // 睡眠 id -> 协程 id
+        let mut waiting: HashMap<u64, u64> = HashMap::new(); // op id -> 协程 id
         // 挂起等待时被 select 取走的作业/事件先暂存，下一步统一步骤内处理（避免丢事件）
         let mut inbox: VecDeque<Job> = VecDeque::new();
-        let mut wake_evs: VecDeque<u64> = VecDeque::new();
+        let mut wake_evs: VecDeque<(u64, Vec<ResumeVal>)> = VecDeque::new();
 
         loop {
             // ==================== 持锁一步 ====================
@@ -1131,7 +1414,10 @@ impl LuaEngine {
                     let Job { co_id, phase_name, code, ctx, reply } = job;
                     match Self::co_spawn(lua, &phase_name, &code) {
                         Ok((thread_key, ctx_table_key)) => {
-                            states.insert(co_id, CoState { thread_key, ctx_table_key, ctx, reply });
+                            states.insert(
+                                co_id,
+                                CoState { thread_key, ctx_table_key, ctx, reply, wake_args: Vec::new() },
+                            );
                             ready.push_back(co_id);
                         }
                         Err(e) => {
@@ -1141,14 +1427,18 @@ impl LuaEngine {
                     }
                 }
 
-                // 2) 收下睡眠完成事件：把对应协程从 waiting 移回 ready
-                let mut evs: Vec<u64> = Vec::new();
+                // 2) 收下完成事件（睡眠或 cosocket op）：把对应协程从 waiting 移回 ready，
+                //    并携带该 op 的唤醒值（睡眠为空 vec，cosocket 为结果），供 resume 回传。
+                let mut evs: Vec<(u64, Vec<ResumeVal>)> = Vec::new();
                 evs.extend(wake_evs.drain(..));
-                while let Ok(sid) = ev_rx.try_recv() {
-                    evs.push(sid);
+                while let Ok(e) = ev_rx.try_recv() {
+                    evs.push(e);
                 }
-                for sid in evs {
+                for (sid, payload) in evs {
                     if let Some(co_id) = waiting.remove(&sid) {
+                        if let Some(st) = states.get_mut(&co_id) {
+                            st.wake_args = payload;
+                        }
                         ready.push_back(co_id);
                     }
                 }
@@ -1156,8 +1446,8 @@ impl LuaEngine {
                 // 3) 本轮就绪协程各同步 resume 一次（公平轮转）
                 let mut pending = std::mem::take(&mut ready);
                 while let Some(co_id) = pending.pop_front() {
-                    // 借用 st 仅用于挂上下文 + 取句柄；取回 thread 后立即结束借用
-                    let thread = match states.get(&co_id) {
+                    // 借用 st 仅用于挂上下文 + 取句柄 + 取出唤醒参数；随后立即结束借用
+                    let (thread, wake_args) = match states.get_mut(&co_id) {
                         None => continue,
                         Some(st) => {
                             let _ = lua
@@ -1165,7 +1455,8 @@ impl LuaEngine {
                             if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
                                 let _ = ngx.raw_set("ctx", ct);
                             }
-                            lua.registry_value::<Thread>(&st.thread_key)
+                            let wa = std::mem::take(&mut st.wake_args);
+                            (lua.registry_value::<Thread>(&st.thread_key), wa)
                         }
                     }; // states 借用到此结束
                     let thread = match thread {
@@ -1176,7 +1467,20 @@ impl LuaEngine {
                         }
                     };
 
-                    match thread.resume::<LuaValue>(()) {
+                    // 把唤醒参数转成 LuaValue，作为 coroutine.yield 的返回值喂回协程
+                    let resume_result = (|| -> LuaResult<LuaValue> {
+                        if wake_args.is_empty() {
+                            thread.resume::<LuaValue>(())
+                        } else {
+                            let mut vals: Vec<LuaValue> = Vec::with_capacity(wake_args.len());
+                            for rv in wake_args {
+                                vals.push(resume_val_to_lua(lua, rv)?);
+                            }
+                            thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals))
+                        }
+                    })();
+
+                    match resume_result {
                         Err(e) => {
                             eprintln!("[learnon] 脚本错误: {e}");
                             finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
@@ -1185,13 +1489,13 @@ impl LuaEngine {
                             ThreadStatus::Finished => {
                                 finish(lua, &mut states, &mut waiting, co_id, Ok(()))
                             }
-                            ThreadStatus::Resumable => match sleep_id_of(&yielded) {
+                            ThreadStatus::Resumable => match op_id_of(&yielded) {
                                 Some(sid) => {
                                     waiting.insert(sid, co_id);
                                 }
                                 None => {
-                                    // 非睡眠的野 yield：无法被唤醒，按错误回传避免悬挂
-                                    eprintln!("[learnon] 协程在ngx.sleep之外yield，无法恢复");
+                                    // 非受支持让出（yield 出的不是 op id）：无法唤醒，按错误回传避免悬挂
+                                    eprintln!("[learnon] 协程 yield 了非 op id 值，无法恢复");
                                     finish(
                                         lua,
                                         &mut states,
@@ -1216,8 +1520,8 @@ impl LuaEngine {
                 ready.append(&mut pending);
             } // ==================== 释放锁 ====================
 
-            // 有就绪工作：让出执行权给 runtime（timer/睡眠事件），随即再跑一步
-            // 无就绪工作：挂起等作业或睡眠事件
+            // 有就绪工作：让出执行权给 runtime（timer/事件），随即再跑一步
+            // 无就绪工作：挂起等作业或完成事件
             if ready.is_empty() {
                 tokio::select! {
                     j = job_rx.recv() => match j {
@@ -1225,7 +1529,7 @@ impl LuaEngine {
                         None => break, // 所有 job_tx 已 drop（引擎关闭）
                     },
                     e = ev_rx.recv() => {
-                        if let Some(sid) = e { wake_evs.push_back(sid); }
+                        if let Some(ev) = e { wake_evs.push_back(ev); }
                     },
                 }
             } else {
@@ -1263,13 +1567,24 @@ fn finish(
     }
 }
 
-/// 从协程 yield 出的值里取睡眠 id（由 _learnon_sleep_start 以整型返回）。
-fn sleep_id_of(v: &LuaValue) -> Option<u64> {
+/// 从协程 yield 出的值里取 op id（睡眠 / cosocket 让出时均以整型 op id yield）。
+fn op_id_of(v: &LuaValue) -> Option<u64> {
     match v {
         LuaValue::Integer(i) => u64::try_from(*i).ok(),
         LuaValue::Number(n) => u64::try_from(*n as i64).ok(),
         _ => None,
     }
+}
+
+/// 把 Rust 侧的唤醒值转成 LuaValue（在 VM 锁内、resume 之前调用）。
+fn resume_val_to_lua(lua: &Lua, v: ResumeVal) -> LuaResult<LuaValue> {
+    Ok(match v {
+        ResumeVal::Nil => LuaValue::Nil,
+        ResumeVal::Bool(b) => LuaValue::Boolean(b),
+        ResumeVal::Int(i) => LuaValue::Integer(i),
+        ResumeVal::Str(s) => LuaValue::String(lua.create_string(s)?),
+        ResumeVal::Bytes(b) => LuaValue::String(lua.create_string(&b)?),
+    })
 }
 
 // ---------- SharedZone 的 Lua 绑定（ngx.shared.<name>） ----------
