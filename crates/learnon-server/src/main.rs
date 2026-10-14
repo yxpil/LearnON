@@ -436,7 +436,7 @@ fn spawn_signal_handlers(tx: watch::Sender<bool>) -> Option<tokio::task::JoinHan
         Some(tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM 注册失败");
-            let mut interrupt = signal(SignalKind::int()).expect("SIGINT 注册失败");
+            let mut interrupt = signal(SignalKind::interrupt()).expect("SIGINT 注册失败");
             let mut hangup = signal(SignalKind::hangup()).expect("SIGHUP 注册失败");
             let mut user1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 注册失败");
             loop {
