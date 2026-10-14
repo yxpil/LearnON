@@ -157,6 +157,9 @@ OpenResty 官方把 E2E 测试发布在 `openresty/lua-nginx-module` 的 `t/` �
 
 - `timer_e2e_test.py`：11/11 通过，移植自 `t/106-timer.t`、`t/152-timer-every.t`、`t/107-timer-errors.t`
   （premature 首参、变参转发、every 的 `return false` 停止、四类错误串、无日志串扰）
+- `realworld_e2e_test.py`：26/26 通过，真实工作场景全量模拟（静态缓存协商/断点续传、API 反代、鉴权、
+  登录限流 429、WebSocket 101 隧道往返、后台定时器心跳、5MB 上传 sha256 一致、413、故障转移、超时、
+  死后端 502、并发突发 30、畸形请求 400 且网关存活）
 - 官方套件已 vendored 到 `vendor/lua-nginx-module/t/`（gitignored）作为语义参考；Test::Nginx 直接跑完整 `.t` 需要真实
   OpenResty 二进制作 `TEST_NGINX_BINARY` + `*_by_lua_block` 语法 + Unix 信号，Windows 本机无法运行，故走移植断言路线。
 - 兼容性回归：`compat_test.py` 17/17、安全 `sec_test.py` 30 项、静态/场景/上游各套件见目录。
@@ -166,4 +169,7 @@ OpenResty 官方把 E2E 测试发布在 `openresty/lua-nginx-module` 的 `t/` �
 - **Lua 串行执行**：进程级单 VM + 互斥锁（对应 OpenResty 每 worker 一个 VM 的简化）。
 - **请求体缓冲转发**：反代先把请求体读入内存再转发（路线图：流式管道）。
 - **`lua_shared_dict` 容量为声明式**：不做内存上限强制（OpenResty 会在写满时淘汰/报错）。
-- 未实现：WebSocket 升级转发、gzip、Lua 协程多请求并发、主动健康检查、keep-alive 上游连接池调优。
+- **WebSocket/Upgrade 隧道**：`proxy_pass` 自动识别 Upgrade 请求，与后端完成 101 握手后交给
+  hyper 升级机制做双向管道（`server.rs::handle_upgrade` + `ProxyEngine::upgrade`）；后端 101 抢跑的
+  WS 帧字节不丢（前缀缓冲）。暂不支持 wss（https 后端）。
+- 未实现：gzip、Lua 协程多请求并发、主动健康检查、keep-alive 上游连接池调优。

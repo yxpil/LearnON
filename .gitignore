@@ -19,3 +19,6 @@ _*.txt
 Thumbs.db
 .DS_Store
 vendor/
+
+# realworld 测试生成的临时大文件
+public_realworld/big.bin

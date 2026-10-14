@@ -552,8 +552,12 @@ async fn handle_request(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
     rec: Arc<LogRecord>,
-    req: Request<Incoming>
+    mut req: Request<Incoming>
 ) -> BoxResponse {
+    // ---- Upgrade 请求要在 Request 还完整时接管（hyper 的升级交接挂钩在请求扩展里）----
+    if crate::proxy::is_upgrade_request(req.headers()) {
+        return handle_upgrade(state, meta, rec, &mut req).await;
+    }
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let version = parts.version;
@@ -659,48 +663,6 @@ async fn handle_request(
                 return close_now(status_page(state.limits.conn_status));
             }
         }
-    }
-
-    // ---- WebSocket/Upgrade 检测：在读取请求体之前判断（升级请求不带 body）----
-    let is_upgrade = crate::proxy::is_upgrade_request(headers);
-    
-    if is_upgrade {
-        // 升级请求不读 body，直接找 location 并尝试代理
-        let loc = Router::match_location(&server, ctx.effective_path());
-        if let Some(location) = loc {
-            if let Some(ref proxy_pass) = location.proxy_pass {
-                let timeouts = ProxyTimeouts {
-                    connect: Duration::from_secs(location.proxy_connect_timeout),
-                    read: Duration::from_secs(location.proxy_read_timeout),
-                };
-                // 转换 Vec<(String, String)> -> Vec<(&str, &str)>
-                let set_headers_ref: Vec<(&str, &str)> = location.proxy_set_headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-                let opts = ProxyOpts {
-                    set_headers: &set_headers_ref,
-                    timeouts,
-                    next_upstream: &location.proxy_next_upstream,
-                };
-                
-                match crate::proxy::proxy_upgrade(&ctx, proxy_pass, &opts).await {
-                    Ok(_backend_stream) => {
-                        // TODO: 这里需要把 backend_stream 和客户端流进行双向 tunnel
-                        // 由于 hyper Service 架构限制，暂时返回占位响应
-                        // 完整的 TCP tunnel 需要在更底层实现（accept 层）
-                        log_info!("WebSocket 升级请求已转发到后端 (TODO: tunnel 未完全实现)");
-                        return error_page(StatusCode::NOT_IMPLEMENTED);
-                    }
-                    Err(e) => {
-                        log_warn!("WebSocket 升级失败: {}", e);
-                        return error_page(StatusCode::BAD_GATEWAY);
-                    }
-                }
-            }
-        }
-        // 没有配置 proxy_pass，返回 400
-        return error_page(StatusCode::BAD_REQUEST);
     }
 
     // ---- 请求体：边读边限长（单靠 Content-Length 挡不住分块上传与谎报长度的客户端）----
@@ -1705,6 +1667,172 @@ fn apply_add_headers(resp: &mut BoxResponse, loc: &Location, server: &Server) {
 }
 
 /// nginx/OpenResty 风格默认错误页
+/// Upgrade 请求的完整处理：路由 → 与后端完成 101 握手 → 返回 101 响应 →
+/// 把客户端连接交给 hyper 的升级机制，spawn 一条双向 TCP 管道。
+async fn handle_upgrade(
+    state: Arc<AppState>,
+    meta: Arc<ConnMeta>,
+    _rec: Arc<LogRecord>,
+    req: &mut Request<Incoming>,
+) -> BoxResponse {
+    let host = req
+        .headers()
+        .get(HOST_NAME)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let server = match state.router.match_server(meta.listener, host.as_deref()) {
+        Some(s) => Arc::clone(s),
+        None => return error_page(StatusCode::NOT_FOUND),
+    };
+    let path = match decode_and_normalize(req.uri().path()) {
+        Some(p) => p,
+        None => return error_page(StatusCode::BAD_REQUEST),
+    };
+    let location = match Router::match_location(&server, &path) {
+        Some(l) if l.proxy_pass.is_some() => l,
+        _ => return error_page(StatusCode::BAD_REQUEST),
+    };
+    let proxy_pass = location.proxy_pass.clone().unwrap();
+
+    let mut ctx = RequestCtx {
+        method: req.method().as_str().to_string(),
+        path,
+        query: req.uri().query().unwrap_or("").to_string(),
+        uri: req.uri().to_string(),
+        host,
+        remote_addr: _rec.remote.clone(),
+        remote_port: meta.peer.map(|p| p.port()).unwrap_or(0),
+        server_port: meta.listener.port(),
+        req_headers: header_pairs(req.headers()),
+        resp_headers: Vec::new(),
+        rewritten_path: None,
+        status: 101,
+        body: None,
+        done: false,
+        internal_redirect: false,
+        req_body: Vec::new(),
+        exec_depth: 0,
+        redirect: None,
+        scheme: meta.scheme.to_string(),
+        internal_request: false,
+        filter_chunk: None,
+        filter_eof: false,
+    };
+
+    let timeouts = ProxyTimeouts {
+        connect: Duration::from_secs(location.proxy_connect_timeout),
+        read: Duration::from_secs(location.proxy_read_timeout),
+    };
+    let set_headers_ref: Vec<(&str, &str)> = location
+        .proxy_set_headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let opts = ProxyOpts {
+        set_headers: &set_headers_ref,
+        timeouts,
+        next_upstream: &location.proxy_next_upstream,
+    };
+
+    let tunnel = match state.proxy.upgrade(&mut ctx, &proxy_pass, &opts).await {
+        Ok(t) => t,
+        Err(e) => {
+            log_warn!("WebSocket 升级失败: {}", e);
+            return error_page(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    // 后端 101 头原样转发（Sec-WebSocket-Accept 由后端计算，不能自造）
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (k, v) in &tunnel.headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let resp = match builder.body(full_body(Vec::<u8>::new())) {
+        Ok(r) => r,
+        Err(e) => {
+            log_warn!("101 响应构造失败: {}", e);
+            return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // 在 Request 上登记升级交接；响应写出后 hyper 把客户端裸流交给我们
+    let on = hyper::upgrade::on(&mut *req);
+    let backend = PrefixedTcp::new(tunnel.prefix, tunnel.stream);
+    tokio::spawn(async move {
+        match on.await {
+            Ok(upgraded) => {
+                // Upgraded 实现 hyper 自带 IO trait，用 TokioIo 桥到 tokio traits
+                let mut client = hyper_util::rt::TokioIo::new(upgraded);
+                let mut backend = backend;
+                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut backend).await {
+                    log_debug!("upgrade 隧道结束: {}", e);
+                }
+            }
+            Err(e) => log_warn!("upgrade 交接失败: {}", e),
+        }
+    });
+    resp
+}
+
+/// 先吐出一段缓存字节、再透传底层 TCP 流的读包装：
+/// 后端可能在 101 头之后立刻抢跑发了 WS 帧，这些前导字节不能丢。
+struct PrefixedTcp {
+    prefix: std::io::Cursor<Vec<u8>>,
+    inner: tokio::net::TcpStream,
+}
+
+impl PrefixedTcp {
+    fn new(prefix: Vec<u8>, inner: tokio::net::TcpStream) -> Self {
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for PrefixedTcp {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let data = this.prefix.get_ref();
+        let pos = this.prefix.position() as usize;
+        if pos < data.len() && buf.remaining() > 0 {
+            let n = buf.remaining().min(data.len() - pos);
+            let dst = buf.initialize_unfilled_to(n);
+            dst.copy_from_slice(&data[pos..pos + n]);
+            buf.advance(n);
+            this.prefix.set_position((pos + n) as u64);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PrefixedTcp {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 fn error_page(status: StatusCode) -> BoxResponse {
     let code = status.as_u16();
     let reason = status.canonical_reason().unwrap_or("Error");
