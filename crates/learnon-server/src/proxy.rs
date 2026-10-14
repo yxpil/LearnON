@@ -46,18 +46,15 @@ fn full_boxed(b: Bytes) -> ProxyReqBody {
         .boxed()
 }
 
-fn incoming_boxed(inc: Incoming) -> ProxyReqBody {
-    inc.map_err(|e| Box::new(e) as BoxError).boxed()
-}
-
 /// 转发给后端的请求体来源。
 /// - `Buffered`：整体已在内存里，可按 Content-Length 精确重发，因此允许换节点重试
-/// - `Streaming`：直接把客户端的 `Incoming` 管道给后端，边收边发、内存 O(1)；
-///   字节一旦被后端消费就无法回放，故流式路径不参与换节点重试（对齐 nginx
-///   `proxy_request_buffering off`）
+/// - `Streaming`：把客户端的请求体（已从具体传输层擦除成 `ProxyReqBody`）管道给后端，
+///   边收边发、内存 O(1)；字节一旦被后端消费就无法回放，故流式路径不参与换节点重试
+///   （对齐 nginx `proxy_request_buffering off`）。
+///   擦除后同一套代理逻辑既能吃 hyper 的 `Incoming`（HTTP/1.1、h2），也能吃 h3 的请求体流。
 pub enum ProxyBody {
     Buffered(Option<Bytes>),
-    Streaming(Option<Incoming>),
+    Streaming(Option<ProxyReqBody>),
 }
 
 
@@ -306,7 +303,7 @@ impl ProxyEngine {
             let req_body: ProxyReqBody = match &mut body {
                 ProxyBody::Buffered(b) => full_boxed(b.as_ref().cloned().unwrap_or_default()),
                 ProxyBody::Streaming(inc) => {
-                    incoming_boxed(inc.take().expect("streaming body 仅用于单次尝试"))
+                    inc.take().expect("streaming body 仅用于单次尝试")
                 }
             };
             let mut req = Request::builder()

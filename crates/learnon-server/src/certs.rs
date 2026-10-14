@@ -147,6 +147,19 @@ pub fn build_server_config(opts: &TlsOptions) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
+/// QUIC/HTTP/3 用的 rustls 配置：RFC 9001 只允许 TLS1.3，ALPN 固定 `h3`，
+/// 证书走与 TCP 监听相同的 SNI 解析器（复用 build_resolver 的多证书/通配/默认逻辑）。
+/// max_early_data_size=u32::MAX 是 quinn 转换 QuicServerConfig 的要求（否则拒绝 0-RTT 且校验失败）。
+pub fn build_quic_server_config(specs: &[CertSpec]) -> Result<ServerConfig, String> {
+    let resolver = Arc::new(build_resolver(specs)?);
+    let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config.max_early_data_size = u32::MAX;
+    Ok(config)
+}
+
 /// 供 `-t` 配置校验使用：只解析证书与私钥，不装 acceptor
 pub fn validate(specs: &[CertSpec]) -> Result<Vec<String>, String> {
     let r = build_resolver(specs)?;
@@ -273,6 +286,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quic_config_pins_tls13_and_alpn_h3() {
+        let dir = std::env::temp_dir().join(format!("learnon-certs-quic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, k) = write_pair(&dir, &["localhost"]);
+        let cfg = build_quic_server_config(&[CertSpec {
+            names: vec!["localhost".into()],
+            cert: c,
+            key: k,
+        }])
+        .unwrap();
+        // QUIC/RFC 9001：只允许 TLS1.3，ALPN 固定 h3
+        // （rustls 的 versions 字段私有，TLS1.3-only 由 builder_with_protocol_versions 保证）
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

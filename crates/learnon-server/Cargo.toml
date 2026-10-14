@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "lon-gencert"
 path = "src/gencert.rs"
 
+# HTTP/3 客户端探针（自研，因本机 curl/node 无 h3）：
+#   cargo run --bin lon-h3check -- <ip:port> <sni> <path> <mode=single|streams> [n]
+[[bin]]
+name = "lon-h3check"
+path = "src/h3check.rs"
+
 [dependencies]
 learnon-config = { path = "../learnon-config" }
 tokio.workspace = true
@@ -21,6 +27,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 http-body.workspace = true
+http = "1"
 bytes.workspace = true
 futures-util.workspace = true
 regex.workspace = true

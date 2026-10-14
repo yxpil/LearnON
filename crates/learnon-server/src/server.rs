@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures_util::{FutureExt, StreamExt};
 use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Body, Frame, Incoming};
@@ -113,6 +113,9 @@ pub struct ConnMeta {
     pub scheme: &'static str,
     /// 是否 HTTP/1.x（keep-alive 上限用 `Connection: close` 实现；h2 用 GOAWAY）
     pub http1: bool,
+    /// 本端点若同时开了 QUIC，则给出要广播的 `Alt-Svc` 头值（如 `h3=":18443"; ma=3600`），
+    /// 让真实浏览器/客户端在拿到 h1/h2 响应后发现可用的 HTTP/3。无 QUIC 时为 None。
+    pub alt_svc: Option<String>,
     /// 本连接已处理的请求数（每个连接独享一份计数）
     pub requests: Arc<AtomicU64>,
 }
@@ -200,6 +203,12 @@ pub async fn serve(
         None => None,
     };
     let scheme = if tls.is_some() { "https" } else { "http" };
+    // QUIC 端点在 TCP 响应上广播 Alt-Svc，让客户端发现同端口的 HTTP/3（h3 只在 https 上合法）
+    let alt_svc: Option<String> = if listener.quic && tls.is_some() {
+        Some(format!("h3=\":{}\"; ma=3600", addr.port()))
+    } else {
+        None
+    };
     log_info!("监听 {scheme}://{addr}（backlog={})", listener.backlog.unwrap_or(state.settings.accept_backlog));
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -224,6 +233,7 @@ pub async fn serve(
                     addr,
                     tls.clone(),
                     listener.http2,
+                    alt_svc.clone(),
                     shutdown.clone(),
                 );
             }
@@ -272,6 +282,7 @@ fn spawn_connection(
     listener: SocketAddr,
     tls: Option<(TlsAcceptor, bool)>,
     enable_h2c: bool,
+    alt_svc: Option<String>,
     shutdown: watch::Receiver<bool>,
 ) {
     tasks.spawn(async move {
@@ -299,6 +310,7 @@ fn spawn_connection(
                     peer: Some(peer),
                     scheme: "http",
                     http1: !h2c,
+                    alt_svc,
                     requests: Arc::new(AtomicU64::new(0)),
                 });
                 drive(state, TokioIo::new(stream), meta, shutdown).await;
@@ -328,6 +340,7 @@ fn spawn_connection(
                     peer: Some(peer),
                     scheme: "https",
                     http1: !h2,
+                    alt_svc,
                     requests: Arc::new(AtomicU64::new(0)),
                 });
                 drive(state, TokioIo::new(tls_stream), meta, shutdown).await;
@@ -469,7 +482,7 @@ impl Service<Request<Incoming>> for Gateway {
     type Future =
         Pin<Box<dyn Future<Output = Result<BoxResponse, Infallible>> + Send + 'static>>;
 
-    fn call(&self, req: Request<Incoming>) -> Self::Future {
+    fn call(&self, mut req: Request<Incoming>) -> Self::Future {
         let state = Arc::clone(&self.state);
         let meta = Arc::clone(&self.meta);
         let remote = meta
@@ -499,22 +512,43 @@ impl Service<Request<Incoming>> for Gateway {
                 rec: Arc::clone(&rec),
                 log: Arc::clone(&state.access_log),
             };
-            let resp = match std::panic::AssertUnwindSafe(handle_request(
-                Arc::clone(&state),
-                Arc::clone(&meta),
-                Arc::clone(&rec),
-                req,
-            ))
-            .catch_unwind()
-            .await
-            {
+            // HTTP/1.1 的 Upgrade（WebSocket）只能在 hyper 连接上接管原始 socket；其余请求
+            // （含 HTTP/2）以及 HTTP/3 都走同一个传输无关核心 handle_request，请求体先擦成 BoxBody。
+            let handled = if crate::proxy::is_upgrade_request(req.headers()) {
+                std::panic::AssertUnwindSafe(handle_upgrade(
+                    Arc::clone(&state),
+                    Arc::clone(&meta),
+                    Arc::clone(&rec),
+                    &mut req,
+                ))
+                .catch_unwind()
+                .await
+            } else {
+                let breq = req.map(|b| b.map_err(|e| Box::new(e) as crate::proxy::BoxError).boxed());
+                std::panic::AssertUnwindSafe(handle_request(
+                    Arc::clone(&state),
+                    Arc::clone(&meta),
+                    Arc::clone(&rec),
+                    breq,
+                ))
+                .catch_unwind()
+                .await
+            };
+            let resp = match handled {
                 Ok(r) => r,
                 Err(p) => {
                     log_error!("请求处理 panic（已隔离，返回 500）: {}", panic_text(&p));
                     error_page(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             };
-            Ok(finalize(&state, &rec, resp, must_close, &accept_encoding))
+            let mut resp = finalize(&state, &rec, resp, must_close, &accept_encoding);
+            // Alt-Svc 广播 HTTP/3 可用性（仅 h1/h2 over TLS；h3 上再广播 h3 无意义）
+            if let Some(av) = &meta.alt_svc {
+                if let Ok(v) = HeaderValue::from_str(av) {
+                    resp.headers_mut().insert("alt-svc", v);
+                }
+            }
+            Ok(resp)
         })
     }
 }
@@ -689,16 +723,16 @@ impl Drop for LoggedBody {
 
 // ==================== 请求处理 ====================
 
+/// 传输无关的请求核心：入参请求体已被擦除成 `ProxyReqBody`（BoxBody<Bytes, BoxError>），
+/// 因此 HTTP/1.1、HTTP/2（hyper `Incoming`）与 HTTP/3（h3 请求流）都能喂进同一套阶段管线
+/// （vhost/location/rewrite/access/try_files/content/proxy/lua）。返回的 `BoxResponse` 由各自
+/// 传输层负责把 `RespBody` 落成线上字节。
 async fn handle_request(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
     rec: Arc<LogRecord>,
-    mut req: Request<Incoming>
+    req: Request<crate::proxy::ProxyReqBody>
 ) -> BoxResponse {
-    // ---- Upgrade 请求要在 Request 还完整时接管（hyper 的升级交接挂钩在请求扩展里）----
-    if crate::proxy::is_upgrade_request(req.headers()) {
-        return handle_upgrade(state, meta, rec, &mut req).await;
-    }
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let version = parts.version;
@@ -896,7 +930,11 @@ enum BodyFail {
     Io,
 }
 
-async fn read_body(body: Incoming, limit: Option<u64>, timeout: Duration) -> Result<Bytes, BodyFail> {
+async fn read_body(
+    body: crate::proxy::ProxyReqBody,
+    limit: Option<u64>,
+    timeout: Duration,
+) -> Result<Bytes, BodyFail> {
     let mut stream = BodyStream::new(body);
     let mut out: Vec<u8> = Vec::new();
     while let Some(frame) = tokio::time::timeout(timeout, stream.next()).await
@@ -2524,6 +2562,248 @@ fn decode_and_normalize(raw: &str) -> Option<String> {
 /// 供 main 使用的连接额度表
 pub fn permits_for(settings: &Settings) -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(settings.worker_connections.max(1)))
+}
+
+// ==================== HTTP/3（QUIC/UDP）服务 ====================
+
+/// 为一个 `listen ... quic` 端点绑定 QUIC/UDP 并按 HTTP/3 接受连接。
+///
+/// 复用与 TCP 监听完全相同的请求核心（`handle_request`）：h3 请求体先擦成 `ProxyReqBody`，
+/// 响应体仍是传输无关的 `RespBody`，因此 vhost/location/rewrite/access/proxy/lua 全部阶段
+/// 在 HTTP/1.1、HTTP/2、HTTP/3 上行为一致。证书走 `certs::build_quic_server_config`
+/// （锁 TLS1.3、ALPN=h3、多证书 SNI）。
+///
+/// 已知边界：WebSocket/Upgrade 隧道只在 hyper（HTTP/1.1 over TCP）上接管原始 socket，
+/// HTTP/3 不支持 Upgrade；热重载沿用共享的 `RwLock<Arc<Router>>`，无需重新绑定 UDP。
+pub async fn serve_quic(
+    state: Arc<AppState>,
+    listener: crate::router::Listener,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let addr = listener.addr;
+    let specs = match &listener.tls {
+        Some(opts) => opts.specs.clone(),
+        None => {
+            log_error!("{addr} quic 监听缺少 TLS 证书（quic 隐含 ssl），该监听退出");
+            return;
+        }
+    };
+    let rustls_cfg = match certs::build_quic_server_config(&specs) {
+        Ok(c) => c,
+        Err(e) => {
+            log_error!("{addr} QUIC TLS 配置无效: {e}，该监听退出");
+            return;
+        }
+    };
+    let quic_crypto = match quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg) {
+        Ok(q) => q,
+        Err(e) => {
+            log_error!("{addr} QUIC 无法装载 TLS 配置: {e:?}，该监听退出");
+            return;
+        }
+    };
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_STREAMS));
+    server_cfg.transport_config(Arc::new(transport));
+    let endpoint = match quinn::Endpoint::server(server_cfg, addr) {
+        Ok(e) => e,
+        Err(e) => {
+            log_error!("{addr} 绑定 QUIC/UDP 失败: {e}，该监听退出");
+            return;
+        }
+    };
+    log_info!("监听 https://{addr}（QUIC/HTTP/3，ALPN h3）");
+
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let incoming = tokio::select! {
+            _ = shutdown.changed() => break,
+            inc = endpoint.accept() => inc,
+        };
+        let Some(incoming) = incoming else {
+            break; // endpoint 已关闭
+        };
+        let peer = incoming.remote_address();
+        match incoming.accept() {
+            Ok(connecting) => {
+                let state = Arc::clone(&state);
+                tasks.spawn(async move {
+                    let conn = match connecting.await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log_debug!("QUIC 握手失败 {peer}: {e}");
+                            return;
+                        }
+                    };
+                    serve_h3_connection(state, conn, addr).await;
+                });
+            }
+            Err(e) => log_debug!("QUIC incoming 接受失败 {peer}: {e}"),
+        }
+    }
+    endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+    drain_connections(&mut tasks, state.settings.shutdown_grace, addr).await;
+    endpoint.wait_idle().await;
+}
+
+/// 单条 QUIC 连接：建立 h3 server 连接，循环 accept 请求流并各自成任务，
+/// 使慢请求不会阻塞后续请求（与 h2 的多路复用语义一致）。
+async fn serve_h3_connection(state: Arc<AppState>, conn: quinn::Connection, listener: SocketAddr) {
+    let peer = conn.remote_address();
+    let _permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            conn.close(quinn::VarInt::from_u32(0), b"overloaded");
+            log_debug!("连接数已达 worker_connections，拒绝 QUIC {peer}");
+            return;
+        }
+    };
+    let _active = crate::metrics::ActiveConnGuard::new(crate::metrics::get());
+
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
+        match h3::server::builder().build(h3_conn).await {
+            Ok(c) => c,
+            Err(e) => {
+                log_debug!("HTTP/3 连接建立失败 {peer}: {e:?}");
+                return;
+            }
+        };
+
+    let requests = Arc::new(AtomicU64::new(0));
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                crate::metrics::get().on_request();
+                let meta = Arc::new(ConnMeta {
+                    listener,
+                    peer: Some(peer),
+                    scheme: "https",
+                    http1: false,
+                    alt_svc: None,
+                    requests: Arc::clone(&requests),
+                });
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_h3_request(state, meta, resolver).await {
+                        log_debug!("HTTP/3 请求结束: {e:?}");
+                    }
+                });
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log_debug!("HTTP/3 accept 出错 {peer}: {e:?}");
+                break;
+            }
+        }
+    }
+    // 连接收尾：优雅发 GOAWAY，等在途请求自然结束（客户端已断开则忽略错误）
+    let _ = h3_conn.shutdown(0).await;
+}
+
+/// 单个 h3 请求：解析请求头/体 → 走传输无关核心 → 逐帧写回响应。
+async fn handle_h3_request(
+    state: Arc<AppState>,
+    meta: Arc<ConnMeta>,
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (req, stream) = resolver.resolve_request().await?;
+    let (parts, ()) = req.into_parts();
+    let (mut send, recv) = stream.split();
+
+    // 请求体：recv_data 逐帧适配成 ProxyReqBody，交给核心里的 read_body 做限长/超时
+    let body_stream = futures_util::stream::unfold(recv, |mut rs| async move {
+        match rs.recv_data().await {
+            Ok(Some(mut buf)) => {
+                let data = buf.copy_to_bytes(buf.remaining());
+                Some((Ok::<_, crate::proxy::BoxError>(Frame::data(data)), rs))
+            }
+            Ok(None) => None,
+            Err(e) => Some((
+                Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "h3 recv error: {e:?}"
+                ))),
+                rs,
+            )),
+        }
+    });
+    let body: crate::proxy::ProxyReqBody =
+        BoxBody::new(http_body_util::StreamBody::new(body_stream));
+
+    let remote = meta.peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "-".into());
+    let header_str = |name: &str| -> String {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
+    let accept_encoding = parts
+        .headers
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let rec = state.access_log.record(
+        remote,
+        parts.method.as_str().to_string(),
+        parts.uri.to_string(),
+        proto_name(parts.version).to_string(),
+        header_str("referer"),
+        header_str("user-agent"),
+    );
+
+    let breq = Request::from_parts(parts, body);
+    let handled = std::panic::AssertUnwindSafe(handle_request(
+        Arc::clone(&state),
+        Arc::clone(&meta),
+        Arc::clone(&rec),
+        breq,
+    ))
+    .catch_unwind()
+    .await;
+    let resp = match handled {
+        Ok(r) => r,
+        Err(p) => {
+            log_error!("HTTP/3 请求处理 panic（已隔离，返回 500）: {}", panic_text(&p));
+            error_page(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    };
+    // finalize 记账状态码 / Server 头 / gzip / 访问日志字节计数；must_close=false（h3 无 Connection:close）
+    let resp = finalize(&state, &rec, resp, false, &accept_encoding);
+
+    let (mut resp_parts, mut resp_body) = resp.into_parts();
+    // HTTP/3 禁止逐跳头（RFC 9114 §4.2）：这些是 TCP 层的概念，QUIC 连接上没有对应语义
+    let hop_by_hop = [
+        hyper::header::CONNECTION,
+        hyper::header::TRANSFER_ENCODING,
+        hyper::header::UPGRADE,
+        HeaderName::from_static("keep-alive"),
+    ];
+    for h in hop_by_hop {
+        resp_parts.headers.remove(h);
+    }
+    send.send_response(Response::from_parts(resp_parts, ()))
+        .await?;
+    while let Some(frame) = resp_body.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    if !data.is_empty() {
+                        send.send_data(data).await?;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    send.finish().await?;
+    Ok(())
 }
 
 #[cfg(test)]

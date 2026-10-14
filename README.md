@@ -76,6 +76,7 @@ all gateway logic is hand-written.
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
 | HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
 | `SIGHUP` graceful config reload | in-process hot swap of the routing table behind `RwLock<Arc<Router>>`; listeners never rebound (no accept gap), per-request snapshot, invalid config keeps old; portable `reload <interval>;` mtime poll | `server.rs`, `main.rs` |
+| HTTP/3 serving (`listen … quic`) | quinn QUIC endpoint (UDP) + h3 over it, TLS1.3/ALPN `h3` reusing the SNI cert store; same body-agnostic request core as h1/h2 (vhost/location/rewrite/access/proxy/lua); TCP-TLS on the same port serves h1/h2 and advertises `Alt-Svc: h3=":port"` | `server.rs`, `certs.rs`, `router.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
 | `init_by_lua` | runs once at startup | `lua_engine.rs` |
 | `lua_shared_dict` / `ngx.shared.DICT` | cross-request shared dict: get/set/add/replace/delete/incr/ttl/flush_all | `shared_dict.rs` |
@@ -356,6 +357,22 @@ Already done (previously listed as gaps, now implemented):
   conf is edited in place; a fresh connection opened every 40ms records zero failures across the whole
   reload window (no accept gap); an intentionally broken (unbalanced-brace) config leaves the old routing
   serving and is not adopted; the child process stays alive with an unchanged pid file throughout.)
+- **HTTP/3 serving (`listen … quic`)**: `listen <addr> quic` implies TLS and additionally binds a
+  **QUIC/UDP** endpoint on that address (separate from the TCP listener, so the same port serves
+  h1/h2 over TCP and h3 over UDP). The QUIC server config is pinned to TLS 1.3 with ALPN `h3` and reuses
+  the same SNI multi-cert resolver as the TCP path (`certs::build_quic_server_config`). Each accepted QUIC
+  connection runs an h3 server whose request streams feed the **same transport-agnostic request core**
+  (`handle_request`) as HTTP/1 and HTTP/2: the h3 request body is erased into `ProxyReqBody`, every phase
+  (vhost/location/rewrite/access/try_files/content/proxy/lua) is identical, and the returned `RespBody` is
+  framed back over h3 with hop-by-hop headers stripped per RFC 9114. The TCP-TLS sibling of a quic
+  endpoint advertises `Alt-Svc: h3=":<port>"; ma=3600` so real clients can discover HTTP/3. Hot-reload
+  works for h3 too (shared `RwLock<Arc<Router>>`; the UDP socket is never rebound). WebSocket `Upgrade`
+  tunnels remain HTTP/1.1-over-TCP only (h3 has no `Upgrade`).
+  (Verified by `tools/http3_e2e.py` with the in-repo `lon-h3check` probe — quinn+h3, since local curl/Node
+  have no HTTP/3: a real QUIC handshake + h3 GET returns `200` with protocol `HTTP/3` and the configured
+  body; a ~15 KB response arrives complete across h3 `DATA` frames; 5 concurrent streams on one QUIC
+  connection all reach `200`; and HTTP/1.1 over TLS still works on the same port with an `alt-svc: h3=`
+  header present.)
 
 Remaining tradeoffs / roadmap:
 

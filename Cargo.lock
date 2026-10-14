@@ -659,6 +659,7 @@ dependencies = [
  "futures-util",
  "h3",
  "h3-quinn",
+ "http",
  "http-body",
  "http-body-util",
  "hyper",

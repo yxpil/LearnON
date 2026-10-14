@@ -425,6 +425,10 @@ async fn run(
     let mut tasks = tokio::task::JoinSet::new();
     for (l, tcp) in bound {
         let state = Arc::clone(&state);
+        // QUIC/HTTP/3：同一 addr 再挂一个 UDP 端点（h3），TCP 侧照常提供 h1/h2（供 Alt-Svc 回退）
+        if l.quic {
+            tokio::spawn(server::serve_quic(Arc::clone(&state), l.clone(), rx.clone()));
+        }
         tasks.spawn(server::serve(state, l, tcp, rx.clone()));
     }
 

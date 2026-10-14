@@ -170,6 +170,9 @@ pub struct Listener {
     pub tls: Option<TlsOptions>,
     /// 明文监听是否接受 h2c（prior-knowledge）；TLS 监听的 h2 由 tls.http2 决定
     pub http2: bool,
+    /// `listen ... quic`：该端点用 QUIC/HTTP/3 服务（UDP），隐含 tls=Some。
+    /// 同一 addr 的 TCP 监听照常存在；QUIC 端点在 server.rs 里另起 UDP accept 循环。
+    pub quic: bool,
     /// `listen ... backlog=N`；None 用全局 accept_backlog
     pub backlog: Option<u32>,
     /// `listen [::]:80 ipv6only=off` 等；None = 默认（仅 IPv6）
@@ -224,6 +227,7 @@ struct ServerTemplate {
 struct ListenFlags {
     ssl: bool,
     http2: bool,
+    quic: bool,
     default_server: bool,
     backlog: Option<u32>,
     ipv6only: Option<bool>,
@@ -262,6 +266,11 @@ fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppE
         match a.as_str() {
             "ssl" => f.ssl = true,
             "http2" => f.http2 = true,
+            // QUIC 传输强制 TLS1.3（RFC 9001），`quic` 隐含 `ssl`：证书缺失时报错同 ssl 路径
+            "quic" => {
+                f.quic = true;
+                f.ssl = true;
+            }
             "default_server" => f.default_server = true,
             other => {
                 if let Some(v) = other.strip_prefix("backlog=") {
@@ -281,7 +290,7 @@ fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppE
                 } else {
                     // reuseport/proxy_protocol/setfib 等尚未实现，明确报错而不是静默忽略
                     return Err(AppError::Other(format!(
-                        "listen 暂不支持参数 '{other}'（已支持 ssl / http2 / default_server / backlog=N / ipv6only=on|off）"
+                        "listen 暂不支持参数 '{other}'（已支持 ssl / http2 / quic / default_server / backlog=N / ipv6only=on|off）"
                     )));
                 }
             }
@@ -437,6 +446,7 @@ impl Router {
         struct Endpoint {
             ssl: bool,
             http2: bool,
+            quic: bool,
             min_tls: TlsVersion,
             backlog: Option<u32>,
             ipv6only: Option<bool>,
@@ -499,6 +509,7 @@ impl Router {
                 let ep = endpoints.entry(addr).or_insert(Endpoint {
                     ssl: false,
                     http2: false,
+                    quic: false,
                     min_tls: tmpl.min_tls,
                     backlog: None,
                     ipv6only: None,
@@ -536,6 +547,7 @@ impl Router {
                     plain_conflicts.push(addr);
                 }
                 ep.http2 |= flags.http2 || tmpl.http2;
+                ep.quic |= flags.quic;
                 if tmpl.min_tls == TlsVersion::Tls12 {
                     ep.min_tls = TlsVersion::Tls12;
                 }
@@ -586,6 +598,7 @@ impl Router {
                 addr,
                 tls,
                 http2: ep.map(|e| e.http2).unwrap_or(false),
+                quic: ep.map(|e| e.quic).unwrap_or(false),
                 backlog: ep.and_then(|e| e.backlog),
                 ipv6only: ep.and_then(|e| e.ipv6only),
             });
@@ -1562,6 +1575,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("ssl_certificate"));
+    }
+
+    #[test]
+    fn quic_listen_implies_ssl_and_marks_the_listener() {
+        let r = build(
+            r#"server {
+                listen 127.0.0.1:18443 quic;
+                server_name x;
+                ssl_certificate c.pem;
+                ssl_certificate_key k.pem;
+            }"#,
+        );
+        let l = &r.listeners[0];
+        assert!(l.quic, "listen quic 应把 Listener.quic 置为 true");
+        assert!(l.tls.is_some(), "quic 隐含 ssl：必须带 TLS 配置");
+        // quic 但不带 http2（h2 走 TCP，h3 走 QUIC）
+        assert!(!l.http2);
     }
 
     #[test]
