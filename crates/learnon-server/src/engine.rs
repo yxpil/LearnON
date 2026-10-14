@@ -21,12 +21,17 @@ use crate::AppError;
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
     pub method: String,
-    /// 原始路径
+    /// 解码并归一化后的路径（用于 location 匹配与静态文件解析）
     pub path: String,
     pub query: String,
+    /// 客户端发来的原始 URI（含 query，未解码）——日志与 $request_uri 用它
     pub uri: String,
     pub host: Option<String>,
     pub remote_addr: String,
+    /// 客户端端口（`$remote_port`）
+    pub remote_port: u16,
+    /// 本服务监听端口（`$server_port`）
+    pub server_port: u16,
     pub req_headers: Vec<(String, String)>,
     pub resp_headers: Vec<(String, String)>,
     /// 处理过程中可能被 rewrite 修改后的路径
@@ -43,6 +48,13 @@ pub struct RequestCtx {
     pub exec_depth: u8,
     /// rewrite ... redirect/permanent 触发的外部重定向
     pub redirect: Option<(u16, String)>,
+    /// 客户端侧协议（http/https）；由连接的 TLS 状态决定，用于 X-Forwarded-Proto
+    pub scheme: String,
+    /// 本次请求是否为内部重定向产物（`internal;` location 只放行这类请求）
+    pub internal_request: bool,
+    /// body_filter_by_lua 参数：ngx.arg[1]=chunk, ngx.arg[2]=eof
+    pub filter_chunk: Option<Vec<u8>>,
+    pub filter_eof: bool,
 }
 
 impl RequestCtx {
@@ -50,12 +62,32 @@ impl RequestCtx {
         self.rewritten_path.as_deref().unwrap_or(&self.path)
     }
 
-    pub fn effective_uri(&self) -> String {
-        let p = self.effective_path().to_string();
-        if self.query.is_empty() {
-            p
-        } else {
-            format!("{p}?{}", self.query)
+    /// 定时器/后台任务用的游离上下文：不属于任何请求，ngx.say 等写入落到这里被丢弃
+    /// （对标 OpenResty 的 fake request client）
+    pub fn detached() -> RequestCtx {
+        RequestCtx {
+            method: "GET".to_string(),
+            path: "@timer".to_string(),
+            query: String::new(),
+            uri: "@timer".to_string(),
+            host: None,
+            remote_addr: "0.0.0.0".to_string(),
+            remote_port: 0,
+            server_port: 0,
+            req_headers: Vec::new(),
+            resp_headers: Vec::new(),
+            rewritten_path: None,
+            status: 200,
+            body: None,
+            done: false,
+            internal_redirect: false,
+            req_body: Vec::new(),
+            exec_depth: 0,
+            redirect: None,
+            scheme: "http".to_string(),
+            internal_request: true,
+            filter_chunk: None,
+            filter_eof: false,
         }
     }
 
@@ -64,6 +96,11 @@ impl RequestCtx {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// 语义上不带请求体的方法（转发时不给它们补 Content-Length）
+    pub fn is_bodyless_method(&self) -> bool {
+        matches!(self.method.as_str(), "GET" | "HEAD")
     }
 
     pub fn set_resp_header(&mut self, name: &str, value: &str) {

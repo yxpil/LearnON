@@ -14,6 +14,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
+http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
@@ -21,6 +22,10 @@ regex = "1"
 chrono = "0.4"
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "send"] }
 thiserror = "2"
+# 有界日志通道（std 的 SyncSender 不是 Sync，无法放进全局单例）
+crossbeam-channel = "0.5"
+# 监听 socket 的 backlog / ipv6only 选项，tokio 的 bind 无法设置
+socket2 = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"

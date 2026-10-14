@@ -4,7 +4,7 @@ import subprocess, sys, time, os, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.request, urllib.error
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))  # 仓库根：脚本与 conf/、target/ 同级
 
 class Backend(BaseHTTPRequestHandler):
     name = "backend-?"

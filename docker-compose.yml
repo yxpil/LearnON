@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  learnon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: learnon-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Mount configuration directory
+      - ./conf:/app/conf:ro
+      # Mount certificates for TLS
+      - ./certs:/app/certs:ro
+      # Persist logs
+      - learnon-logs:/app/logs
+      # Branding assets (logo)
+      - ./public:/app/public:ro
+    environment:
+      # Optional: Override config path
+      - LEARNON_CONFIG=/app/conf/learnon.conf
+      # Optional: Log level
+      - RUST_LOG=info
+    networks:
+      - learnon-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Add a demo backend service
+  demo-backend:
+    image: nginx:alpine
+    container_name: learnon-demo-backend
+    restart: unless-stopped
+    volumes:
+      - ./demo/html:/usr/share/nginx/html:ro
+    networks:
+      - learnon-net
+    expose:
+      - "80"
+
+volumes:
+  learnon-logs:
+    driver: local
+
+networks:
+  learnon-net:
+    driver: bridge

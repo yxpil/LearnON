@@ -15,7 +15,7 @@ import subprocess, sys, time, os, threading, socket, json
 import urllib.request, urllib.error
 import ssl as _ssl
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))  # 仓库根：脚本与 conf/、target/ 同级
 HOST = "127.0.0.1"
 PORT = 9443
 

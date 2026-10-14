@@ -1,0 +1,170 @@
+name: Cross-Platform Release Builds
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., v0.2.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux builds (x86_64, aarch64, armv7)
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - target: armv7-unknown-linux-gnueabihf
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-gnu
+            archive: tar.gz
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            gcc-riscv64-linux-gnu \
+            musl-tools
+          
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin learnon
+          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+      
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cd target/${{ matrix.target }}/release
+          if [[ "${{ matrix.archive }}" == "tar.gz" ]]; then
+            tar czf ../../../dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz learnon lon-gencert
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnon-linux-${{ matrix.target }}
+          path: dist/*.tar.gz
+  
+  # macOS builds (Intel + Apple Silicon)
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin learnon
+          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+      
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cd target/${{ matrix.target }}/release
+          zip ../../../../dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.zip learnon lon-gencert
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnon-macos-${{ matrix.target }}
+          path: dist/*.zip
+  
+  # Windows builds (x86_64, aarch64)
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            ext: .exe
+          - target: aarch64-pc-windows-msvc
+            ext: .exe
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin learnon
+          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+      
+      - name: Create archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path "target/${{ matrix.target }}/release/learnon${{ matrix.ext }}","target/${{ matrix.target }}/release/lon-gencert${{ matrix.ext }}" -DestinationPath "dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.zip"
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnon-windows-${{ matrix.target }}
+          path: dist/*.zip
+  
+  # Create GitHub Release
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f -exec sha256sum {} \; > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
