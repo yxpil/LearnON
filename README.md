@@ -215,6 +215,12 @@ Already done (previously listed as gaps, now implemented):
   body's exact `size_hint`, sets `Content-Encoding: gzip` + `Vary: Accept-Encoding`, and drops
   `Content-Length` so the access log's `bytes_sent` reflects the real compressed wire bytes.
   (`compress.rs::GzipBody`, `server.rs::finalize`, verified by `tools/gzip_e2e.sh`.)
+- **Upstream keep-alive pool tuning**: per-upstream `keepalive N` and `keepalive_timeout <t>` drive
+  hyper's client connection pool (`pool_max_idle_per_host` / `pool_idle_timeout`); the proxy caches
+  one pooled client per `(connect_timeout, max_idle, idle_timeout)` triple so differently-configured
+  upstreams get separate pools. (`upstream.rs::KeepaliveOpts`, `proxy.rs::client`, verified by
+  `tools/keepalive_e2e.sh`: `keepalive` reuses one backend connection, a short `keepalive_timeout`
+  reaps the idle one between spaced requests.)
 
 Remaining tradeoffs / roadmap:
 
@@ -222,4 +228,3 @@ Remaining tradeoffs / roadmap:
   concurrency inside one VM (OpenResty-style) is not implemented — parallelism comes from the VM pool.
 - **Buffered request-body forwarding**: the reverse proxy reads the body into memory before forwarding
   (roadmap: streaming pipe).
-- **Not yet implemented**: upstream keep-alive connection-pool tuning knobs (per-upstream `keepalive N`).

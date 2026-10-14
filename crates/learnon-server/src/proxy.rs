@@ -28,7 +28,7 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::engine::RequestCtx;
-use crate::upstream::{UpstreamGuard, UpstreamPool};
+use crate::upstream::{KeepaliveOpts, UpstreamGuard, UpstreamPool};
 use crate::{log_warn, log_info};
 
 type HyperClient = Client<HttpConnector, Full<Bytes>>;
@@ -49,10 +49,10 @@ pub struct ProxyOpts<'a> {
     pub next_upstream: &'a [String],
 }
 
-/// 每个监听进程一个共享连接池客户端；连接池按 connect 超时分组
+/// 每个监听进程一个共享连接池客户端；连接池按 (connect 超时, keepalive 参数) 分组
 pub struct ProxyEngine {
     pool: Arc<UpstreamPool>,
-    clients: Mutex<HashMap<u64, HyperClient>>,
+    clients: Mutex<HashMap<(u64, u64, u64), HyperClient>>,
 }
 
 impl ProxyEngine {
@@ -63,9 +63,15 @@ impl ProxyEngine {
         }
     }
 
-    /// 同一 connect 超时复用同一个客户端（= 同一个连接池），避免每个 location 建一套池
-    fn client(&self, connect: Duration) -> HyperClient {
-        let key = connect.as_millis() as u64;
+    /// 同一 (connect 超时 + keepalive 配置) 复用同一个客户端（= 同一套连接池），
+    /// 避免每个 location/upstream 各建一套池；keepalive 不同的上游则分到各自的池。
+    fn client(&self, connect: Duration, ka: KeepaliveOpts) -> HyperClient {
+        // 缓存键：用 u64 哨兵值编码 Option（usize::MAX / u64::MAX 表示"未设，走默认"）。
+        let key = (
+            connect.as_millis() as u64,
+            ka.max_idle.unwrap_or(usize::MAX) as u64,
+            ka.idle_timeout.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX),
+        );
         let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = map.get(&key) {
             return c.clone();
@@ -73,9 +79,15 @@ impl ProxyEngine {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect));
         connector.set_nodelay(true);
-        let client = Client::builder(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .build(connector);
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        if let Some(n) = ka.max_idle {
+            builder.pool_max_idle_per_host(n);
+        }
+        if let Some(t) = ka.idle_timeout {
+            builder.pool_idle_timeout(Some(t));
+        }
+        let client = builder.build(connector);
         map.insert(key, client.clone());
         client
     }
@@ -106,8 +118,11 @@ impl ProxyEngine {
         let mut guard_holder: Option<UpstreamGuard> = None;
         let mut tried: Vec<usize> = Vec::new();
         let mut max_attempts = 2;
+        // 命具 named upstream 时套用其 keepalive 调优；直连目标走默认（hyper 池默认）。
+        let mut keepalive = KeepaliveOpts::default();
         let backend = if let Some(up) = self.pool.get(&host_part) {
             max_attempts = up.server_count().max(1).min(8);
+            keepalive = up.keepalive;
             match up.acquire(&ctx.remote_addr, &tried) {
                 Some(g) => {
                     tried.push(g.idx());
@@ -227,7 +242,7 @@ impl ProxyEngine {
                 .map_err(|e| e.to_string())?;
             *req.headers_mut() = headers.clone();
 
-            let client = self.client(opts.timeouts.connect);
+            let client = self.client(opts.timeouts.connect, keepalive);
             // 整体作为"连接+发送+等响应头"一次等待；read 超时单独判定以便区分错误类型
             match tokio::time::timeout(opts.timeouts.read, client.request(req)).await {
                 Ok(Ok(r)) => {
@@ -611,12 +626,32 @@ mod tests {
     fn clients_are_shared_per_connect_timeout() {
         let pool = Arc::new(UpstreamPool::default());
         let e = ProxyEngine::new(pool);
-        let a = e.client(Duration::from_secs(3));
-        let b = e.client(Duration::from_secs(3));
-        let c = e.client(Duration::from_secs(7));
+        let k = KeepaliveOpts::default();
+        let a = e.client(Duration::from_secs(3), k);
+        let b = e.client(Duration::from_secs(3), k);
+        let c = e.client(Duration::from_secs(7), k);
         let _ = (&a, &b, &c);
         let n = e.clients.lock().unwrap().len();
         assert_eq!(n, 2, "两个不同的 connect 超时应有两个客户端池");
+    }
+
+    #[test]
+    fn keepalive_config_splits_pools() {
+        // 相同 connect 超时但不同 keepalive 配置应各自独立成套池；同配置复用同一套。
+        let pool = Arc::new(UpstreamPool::default());
+        let e = ProxyEngine::new(pool);
+        let base = KeepaliveOpts::default();
+        let capped = KeepaliveOpts { max_idle: Some(8), idle_timeout: None };
+        let timed = KeepaliveOpts { max_idle: None, idle_timeout: Some(Duration::from_secs(5)) };
+        let _ = e.client(Duration::from_secs(3), base);
+        let _ = e.client(Duration::from_secs(3), base); // 同键 → 命中缓存，不新增
+        let _ = e.client(Duration::from_secs(3), capped);
+        let _ = e.client(Duration::from_secs(3), timed);
+        assert_eq!(
+            e.clients.lock().unwrap().len(),
+            3,
+            "keepalive 不同的三个配置应各建一套池"
+        );
     }
 
     #[tokio::test]

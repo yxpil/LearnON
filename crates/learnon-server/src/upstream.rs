@@ -68,6 +68,18 @@ impl Default for HealthCheck {
     }
 }
 
+/// 上游 keep-alive 连接池调优（对标 nginx 的 `keepalive N` / `keepalive_timeout`）。
+/// 两者都用 `Option`：None 表示沿用 hyper 客户端池的默认值（不显式设上限/超时），
+/// 只有配置里出现对应指令时才收紧。代理层把它并入连接池客户端的缓存键，
+/// 使不同 keepalive 配置的上游各得一套独立池。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeepaliveOpts {
+    /// `keepalive N`：每个后端主机在池中保留的空闲连接上限
+    pub max_idle: Option<usize>,
+    /// `keepalive_timeout X`：空闲连接被回收前最多保活多久
+    pub idle_timeout: Option<Duration>,
+}
+
 #[derive(Debug)]
 pub struct UpstreamServer {
     pub addr: String,
@@ -193,6 +205,8 @@ pub struct Upstream {
     pub servers: Vec<UpstreamServer>,
     pub lb: LoadBalance,
     pub health_check: Option<HealthCheck>,
+    /// keep-alive 连接池调优（`keepalive` / `keepalive_timeout`）
+    pub keepalive: KeepaliveOpts,
     /// 调度锁：nginx 每个请求取一次 peer 锁，这里不做无锁近似，
     /// 否则并发请求会把 SWRR 的 current_weight 写成乱账
     schedule: Mutex<()>,
@@ -463,8 +477,24 @@ impl UpstreamPool {
         let mut servers = Vec::new();
         let mut lb = LoadBalance::RoundRobin;
         let mut health_check = None;
+        let mut keepalive = KeepaliveOpts::default();
         for child in &d.block {
             match child.name.as_str() {
+                "keepalive" => {
+                    let v = child.arg(0).ok_or_else(|| {
+                        AppError::Other(format!("upstream {name}: keepalive 需要一个正整数参数"))
+                    })?;
+                    keepalive.max_idle =
+                        Some(strict_positive(v, &name, "keepalive")?);
+                }
+                "keepalive_timeout" => {
+                    let v = child.arg(0).ok_or_else(|| {
+                        AppError::Other(format!("upstream {name}: keepalive_timeout 需要一个时长参数"))
+                    })?;
+                    keepalive.idle_timeout = Some(parse_duration(v).ok_or_else(|| {
+                        AppError::Other(format!("upstream {name}: keepalive_timeout={v} 非法"))
+                    })?);
+                }
                 "server" => {
                     let addr = child
                         .arg(0)
@@ -550,6 +580,7 @@ impl UpstreamPool {
             servers,
             lb,
             health_check,
+            keepalive,
             schedule: Mutex::new(()),
         })
     }
@@ -897,6 +928,25 @@ mod tests {
                 rises: 4,
                 uri: Some("/status".into()),
             })
+        );
+    }
+
+    #[test]
+    fn config_parses_keepalive_knobs() {
+        let up = upstream("server a; keepalive 16; keepalive_timeout 30s; ");
+        assert_eq!(up.keepalive.max_idle, Some(16));
+        assert_eq!(up.keepalive.idle_timeout, Some(Duration::from_secs(30)));
+        // 缺省 = None（沿用 hyper 客户端池默认，不显式设上限/超时）
+        let up2 = upstream("server a; ");
+        assert_eq!(up2.keepalive.max_idle, None);
+        assert_eq!(up2.keepalive.idle_timeout, None);
+        // 非法值必须报错，而不是猜一个默认
+        assert!(pool("server a; keepalive; ").is_err(), "keepalive 缺参数应拒绝");
+        assert!(pool("server a; keepalive 0; ").is_err(), "keepalive 必须正整数");
+        assert!(pool("server a; keepalive abc; ").is_err());
+        assert!(
+            pool("server a; keepalive_timeout abc; ").is_err(),
+            "keepalive_timeout 非法时长应拒绝"
         );
     }
 
