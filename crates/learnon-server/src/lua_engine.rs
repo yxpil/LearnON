@@ -36,20 +36,50 @@ pub enum LuaSource {
     File(PathBuf),
 }
 
-/// Lua 脚本文件全局缓存：文件内容只在首次请求时读盘（阻塞分析修复：
-/// 原实现每个请求都在 tokio worker 上同步 read_to_string）
-static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<PathBuf, Arc<str>>>> =
+/// Lua 脚本文件全局缓存：文件内容只在首次请求时读盘，后续通过 mtime 检测变更自动失效
+#[derive(Clone)]
+struct CachedLua {
+    content: Arc<str>,
+    mtime: std::time::SystemTime,
+}
+
+static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<PathBuf, CachedLua>>> =
     std::sync::OnceLock::new();
 
 fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
     let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    if let Some(s) = cache.read().unwrap().get(p) {
-        return Ok(Arc::clone(s));
+    
+    // 检查缓存并验证 mtime
+    {
+        let guard = cache.read().unwrap();
+        if let Some(cached) = guard.get(p) {
+            // 读取当前文件的 mtime
+            if let Ok(meta) = std::fs::metadata(p) {
+                if let Ok(current_mtime) = meta.modified() {
+                    if current_mtime == cached.mtime {
+                        return Ok(Arc::clone(&cached.content));
+                    }
+                }
+            }
+        }
     }
+    
+    // 缓存未命中或文件已修改，重新加载
     let s: Arc<str> = std::fs::read_to_string(p)
         .map_err(|e| AppError::Other(format!("读取 Lua 文件失败 {}: {e}", p.display())))?
         .into();
-    cache.write().unwrap().insert(p.clone(), Arc::clone(&s));
+    let mtime = std::fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    
+    cache.write().unwrap().insert(
+        p.clone(),
+        CachedLua {
+            content: Arc::clone(&s),
+            mtime,
+        },
+    );
     Ok(s)
 }
 
@@ -221,7 +251,7 @@ impl LuaEngine {
     }
 
     pub fn new(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
-        let dicts = SharedDicts::parse_all(config);
+        let dicts = SharedDicts::parse_all(config)?;
 
         // init_by_lua / init_by_lua_file：收集脚本（每个 VM 各执行一次，对标每 worker 一次 init）
         let mut inits: Vec<(String, String)> = Vec::new();
@@ -297,9 +327,56 @@ impl LuaEngine {
             ngx.set(fname, f)?;
         }
 
-        // ngx.log(level, msg...) —— 打到 stdout
-        let log = lua.create_function(|_lua, args: Variadic<String>| {
-            println!("[lua] {}", args.join(" "));
+        // ngx.log(level, msg...) —— 映射到 error_log 分级日志
+        let log = lua.create_function(|_lua, args: Variadic<LuaValue>| {
+            if args.is_empty() {
+                return Ok(());
+            }
+            // 第一个参数是级别（字符串或整数），其余是消息
+            let (level, start_idx) = match &args[0] {
+                LuaValue::String(s) => {
+                    let lvl_str = s.to_string_lossy().to_lowercase();
+                    let lvl = match lvl_str.as_str() {
+                        "emerg" | "alert" | "crit" => crate::log::Level::Crit,
+                        "error" => crate::log::Level::Error,
+                        "warn" => crate::log::Level::Warn,
+                        "notice" => crate::log::Level::Notice,
+                        "info" => crate::log::Level::Info,
+                        "debug" => crate::log::Level::Debug,
+                        _ => crate::log::Level::Info, // 未知级别默认 info
+                    };
+                    (lvl, 1)
+                }
+                LuaValue::Integer(n) => {
+                    // 数字级别：0=debug, 1=info, 2=notice, 3=warn, 4=error, 5=crit
+                    let lvl = match *n {
+                        0 => crate::log::Level::Debug,
+                        1 => crate::log::Level::Info,
+                        2 => crate::log::Level::Notice,
+                        3 => crate::log::Level::Warn,
+                        4 => crate::log::Level::Error,
+                        _ => crate::log::Level::Crit,
+                    };
+                    (lvl, 1)
+                }
+                _ => (crate::log::Level::Info, 0), // 没有级别参数，从第一条开始
+            };
+            
+            let msg = args[start_idx..]
+                .iter()
+                .map(|v| match v {
+                    LuaValue::String(s) => s.to_string_lossy().to_string(),
+                    LuaValue::Integer(n) => n.to_string(),
+                    LuaValue::Number(n) => format!("{}", n),
+                    LuaValue::Nil => "nil".to_string(),
+                    LuaValue::Boolean(true) => "true".to_string(),
+                    LuaValue::Boolean(false) => "false".to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            
+            crate::log::with_log(level, msg);
             Ok(())
         })?;
         ngx.set("log", log)?;
@@ -670,33 +747,52 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 .map(|b| LuaValue::String(lua.create_string(&b).unwrap())))
         });
         // d:set(key, value, ex?) / safe_set —— value 支持 string/number/boolean
-        for m in ["set", "safe_set"] {
-            methods.add_method(
-                m,
-                |_lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
-                    let bytes = lua_value_to_bytes(&value)
-                        .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
-                    this.set(&key, bytes, ex);
-                    Ok(())
-                },
-            );
-        }
-        // d:add(key, value, ex?) -> bool（已存在则 false）
+        // d:set(key, value, ex?) -> true | nil, "no memory"
         methods.add_method(
-            "add",
-            |_lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+            "set",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
                 let bytes = lua_value_to_bytes(&value)
-                    .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
-                Ok(this.add(&key, bytes, ex))
+                    .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
+                match this.set(&key, bytes, ex) {
+                    Ok(()) => Ok(LuaValue::Boolean(true)),
+                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                }
             },
         );
-        // d:replace(key, value, ex?) -> bool（不存在则 false）
+        // d:safe_set(key, value, ex?) -> true | nil, "no memory"
         methods.add_method(
-            "replace",
-            |_lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+            "safe_set",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
-                Ok(this.replace(&key, bytes, ex))
+                match this.safe_set(&key, bytes, ex) {
+                    Ok(()) => Ok(LuaValue::Boolean(true)),
+                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                }
+            },
+        );
+        // d:add(key, value, ex?) -> true | false | nil, "no memory"
+        methods.add_method(
+            "add",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+                let bytes = lua_value_to_bytes(&value)
+                    .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
+                match this.add(&key, bytes, ex) {
+                    Ok(ok) => Ok(LuaValue::Boolean(ok)),
+                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                }
+            },
+        );
+        // d:replace(key, value, ex?) -> true | false | nil, "no memory"
+        methods.add_method(
+            "replace",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+                let bytes = lua_value_to_bytes(&value)
+                    .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
+                match this.replace(&key, bytes, ex) {
+                    Ok(ok) => Ok(LuaValue::Boolean(ok)),
+                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                }
             },
         );
         // d:delete(key)
@@ -704,11 +800,14 @@ impl LuaUserData for crate::shared_dict::SharedZone {
             this.delete(&key);
             Ok(())
         });
-        // d:incr(key, delta, init?) -> new_value（失败抛错，对标返回 nil+err）
+        // d:incr(key, delta, init?) -> new_value | nil, err
         methods.add_method(
             "incr",
-            |_, this, (key, delta, init): (String, i64, Option<i64>)| {
-                this.incr(&key, delta, init).map_err(mlua::Error::external)
+            |lua, this, (key, delta, init): (String, i64, Option<i64>)| {
+                match this.incr(&key, delta, init) {
+                    Ok(v) => Ok(LuaValue::Integer(v)),
+                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                }
             },
         );
         // d:ttl(key) -> 剩余秒数 | -1（永不过期）| nil（不存在）
@@ -718,6 +817,14 @@ impl LuaUserData for crate::shared_dict::SharedZone {
             this.flush_all();
             Ok(())
         });
+        // d:flush_expired() -> 清理的条目数
+        methods.add_method("flush_expired", |_, this, ()| Ok(this.flush_expired()));
+        // d:num() -> 总条目数
+        methods.add_method("num", |_, this, ()| Ok(this.num()));
+        // d:capacity() -> 容量上限（字节）
+        methods.add_method("capacity", |_, this, ()| Ok(this.capacity()));
+        // d:free_space() -> 剩余可用空间（字节）
+        methods.add_method("free_space", |_, this, ()| Ok(this.free_space()));
     }
 }
 

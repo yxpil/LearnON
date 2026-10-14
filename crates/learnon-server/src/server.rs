@@ -659,6 +659,48 @@ async fn handle_request(
         }
     }
 
+    // ---- WebSocket/Upgrade 检测：在读取请求体之前判断（升级请求不带 body）----
+    let is_upgrade = crate::proxy::is_upgrade_request(headers);
+    
+    if is_upgrade {
+        // 升级请求不读 body，直接找 location 并尝试代理
+        let loc = Router::match_location(&server, ctx.effective_path());
+        if let Some(location) = loc {
+            if let Some(ref proxy_pass) = location.proxy_pass {
+                let timeouts = ProxyTimeouts {
+                    connect: Duration::from_secs(location.proxy_connect_timeout),
+                    read: Duration::from_secs(location.proxy_read_timeout),
+                };
+                // 转换 Vec<(String, String)> -> Vec<(&str, &str)>
+                let set_headers_ref: Vec<(&str, &str)> = location.proxy_set_headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let opts = ProxyOpts {
+                    set_headers: &set_headers_ref,
+                    timeouts,
+                    next_upstream: &location.proxy_next_upstream,
+                };
+                
+                match crate::proxy::proxy_upgrade(&ctx, proxy_pass, &opts).await {
+                    Ok(_backend_stream) => {
+                        // TODO: 这里需要把 backend_stream 和客户端流进行双向 tunnel
+                        // 由于 hyper Service 架构限制，暂时返回占位响应
+                        // 完整的 TCP tunnel 需要在更底层实现（accept 层）
+                        log_info!("WebSocket 升级请求已转发到后端 (TODO: tunnel 未完全实现)");
+                        return error_page(StatusCode::NOT_IMPLEMENTED);
+                    }
+                    Err(e) => {
+                        log_warn!("WebSocket 升级失败: {}", e);
+                        return error_page(StatusCode::BAD_GATEWAY);
+                    }
+                }
+            }
+        }
+        // 没有配置 proxy_pass，返回 400
+        return error_page(StatusCode::BAD_REQUEST);
+    }
+
     // ---- 请求体：边读边限长（单靠 Content-Length 挡不住分块上传与谎报长度的客户端）----
     let loc0 = Router::match_location(&server, ctx.effective_path());
     let limit = loc0

@@ -18,16 +18,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hyper::body::Incoming;
-use hyper::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, HOST};
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, HOST, CONNECTION, UPGRADE};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use http_body_util::Full;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::engine::RequestCtx;
 use crate::upstream::{UpstreamGuard, UpstreamPool};
-use crate::{log_warn};
+use crate::{log_warn, log_info, log_debug};
 
 type HyperClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -349,6 +351,145 @@ fn expand_http_vars(template: &str, ctx: &RequestCtx) -> String {
         }
     }
     out
+}
+
+/// 检测是否为 WebSocket/Upgrade 请求（对标 nginx 的 map $http_upgrade $connection_upgrade）
+pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    // Connection 头必须包含 "upgrade"
+    let has_upgrade_conn = headers
+        .get_all(CONNECTION)
+        .iter()
+        .any(|v| v.to_str().ok().map(|s| s.to_ascii_lowercase().contains("upgrade")).unwrap_or(false));
+    
+    // Upgrade 头存在（通常是 "websocket"，但也可以是其他协议）
+    let has_upgrade_header = headers.contains_key(UPGRADE);
+    
+    has_upgrade_conn && has_upgrade_header
+}
+
+/// WebSocket/Upgrade 隧道代理：建立两条 TCP 流的双向管道
+/// 
+/// 流程：
+/// 1. 向后端发起普通 HTTP/1.1 请求，带上 Upgrade 相关头
+/// 2. 收到 101 Switching Protocols 响应后，返回给客户端
+/// 3. 将客户端连接和后端连接进行双向 tokio::io::copy
+/// 4. 任一端关闭时，优雅地关闭另一端（半关闭传播）
+pub async fn proxy_upgrade(
+    ctx: &RequestCtx,
+    target: &str,
+    opts: &ProxyOpts<'_>,
+) -> Result<TcpStream, String> {
+    if target.starts_with("https://") {
+        return Err("upgrade 暂不支持 https 后端".to_string());
+    }
+    
+    let rest = target.trim_start_matches("http://");
+    let (host_part, _uri_part) = match rest.split_once('/') {
+        Some((h, p)) => (h.to_string(), Some(format!("/{p}"))),
+        None => (rest.to_string(), None),
+    };
+    
+    // upstream 负载均衡或直接使用主机名
+    let backend = if let Some(up) = crate::upstream::UpstreamPool::default().get(&host_part) {
+        match up.acquire(&ctx.remote_addr, &[]) {
+            Some(g) => {
+                let addr = (*g).clone();
+                drop(g); // 立即释放 guard，避免持锁过久
+                addr
+            }
+            None => return Err(format!("no live upstreams: {host_part}")),
+        }
+    } else {
+        host_part.clone()
+    };
+    
+    // 解析后端地址
+    let (host, port) = match host_part.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("非法端口: {p}"))?),
+        None => (host_part.clone(), 80),
+    };
+    
+    // 连接后端
+    let mut backend_stream = tokio::time::timeout(
+        opts.timeouts.connect,
+        TcpStream::connect((host.as_str(), port))
+    )
+    .await
+    .map_err(|_| format!("连接后端超时: {backend}"))?
+    .map_err(|e| format!("连接后端失败 {backend}: {e}"))?;
+    
+    // 构建升级请求
+    let mut req_headers = HeaderMap::new();
+    for (k, v) in &ctx.req_headers {
+        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("expect") {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::try_from(k.as_bytes()),
+            HeaderValue::try_from(v.as_str()),
+        ) {
+            req_headers.append(name, val);
+        }
+    }
+    
+    // 添加/覆盖必要的升级头
+    req_headers.insert(HOST, HeaderValue::try_from(ctx.host.as_deref().unwrap_or(&host)).map_err(|e| e.to_string())?);
+    req_headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    if let Some(upgrade) = ctx.header("upgrade") {
+        req_headers.insert(UPGRADE, HeaderValue::try_from(upgrade).map_err(|e| e.to_string())?);
+    }
+    
+    // 应用 proxy_set_header
+    for (k, v) in opts.set_headers {
+        let name = hyper::header::HeaderName::try_from(*k)
+            .map_err(|e| format!("非法的 proxy_set_header 名 {k}: {e}"))?;
+        let val = interpolate_vars(v, ctx);
+        req_headers.insert(name, HeaderValue::try_from(val).map_err(|e| e.to_string())?);
+    }
+    
+    // 发送升级请求
+    let request_line = format!(
+        "{} {}{}{} HTTP/1.1\r\n",
+        ctx.method,
+        ctx.effective_path(),
+        if ctx.query.is_empty() { "" } else { "?" },
+        ctx.query
+    );
+    
+    let mut request_buf = request_line.into_bytes();
+    for (name, value) in &req_headers {
+        request_buf.extend_from_slice(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes());
+    }
+    request_buf.extend_from_slice(b"\r\n");
+    
+    // 写入请求
+    backend_stream.writable().await.map_err(|e| format!("后端可写检查失败: {e}"))?;
+    backend_stream.write_all(&request_buf).await.map_err(|e| format!("发送升级请求失败: {e}"))?;
+    
+    // 读取后端响应（只读头，不读 body）
+    backend_stream.readable().await.map_err(|e| format!("后端可读检查失败: {e}"))?;
+    let mut response_buf = vec![0u8; 4096];
+    let n = backend_stream.read(&mut response_buf).await.map_err(|e| format!("读取后端响应失败: {e}"))?;
+    response_buf.truncate(n);
+    
+    // 解析响应状态行
+    let response_str = String::from_utf8_lossy(&response_buf);
+    let first_line = response_str.lines().next().unwrap_or("");
+    let status_code = if first_line.starts_with("HTTP/1.1 ") {
+        first_line[9..12].parse::<u16>().unwrap_or(0)
+    } else if first_line.starts_with("HTTP/1.0 ") {
+        first_line[9..12].parse::<u16>().unwrap_or(0)
+    } else {
+        0
+    };
+    
+    if status_code != 101 {
+        return Err(format!("后端未返回 101，而是 {status_code}"));
+    }
+    
+    log_info!("WebSocket/Upgrade 隧道已建立: {} -> {}", ctx.remote_addr, backend);
+    
+    Ok(backend_stream)
 }
 
 #[cfg(test)]
