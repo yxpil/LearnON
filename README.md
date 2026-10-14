@@ -196,15 +196,25 @@ them as standalone runnable assertion scripts.
 
 ## Design tradeoffs & roadmap
 
-- **Serial Lua execution**: process-level single VM + mutex (a simplification of OpenResty's
-  one-VM-per-worker model).
-- **Buffered request-body forwarding**: the reverse proxy reads the body into memory before forwarding
-  (roadmap: streaming pipe).
-- **`lua_shared_dict` capacity is declarative**: no enforced memory ceiling (OpenResty evicts/errors
-  when full).
-- **WebSocket/Upgrade tunnel**: `proxy_pass` auto-detects Upgrade requests and, after completing the
+Already done (previously listed as gaps, now implemented):
+
+- **Lua VM pool**: one VM per CPU core, so multiple requests execute scripts truly in parallel across
+  VMs (no single process-wide lock).
+- **`lua_shared_dict` capacity enforcement**: `set`/`incr` keep total usage within the declared
+  capacity via Redis-style approximate LRU eviction; `safe_set` refuses to evict and returns
+  `no memory` instead.
+- **Active health checks**: `health_check interval=… fails=… rises=… uri=… timeout=…` drives a
+  background prober per upstream (in addition to passive `max_fails`/`fail_timeout`).
+- **WebSocket / Upgrade tunnel**: `proxy_pass` auto-detects Upgrade requests and, after completing the
   101 handshake with the backend, hands off to hyper's upgrade mechanism for a bidirectional pipe
   (`server.rs::handle_upgrade` + `ProxyEngine::upgrade`); WS-frame bytes that race ahead of the
   backend's 101 are not lost (prefix buffer). `wss` (https backends) is not yet supported.
-- Not yet implemented: gzip, Lua coroutine multi-request concurrency, active health checks,
-  keep-alive upstream connection-pool tuning.
+
+Remaining tradeoffs / roadmap:
+
+- **Within-VM Lua serialization**: a single VM runs one request at a time; per-request coroutine
+  concurrency inside one VM (OpenResty-style) is not implemented — parallelism comes from the VM pool.
+- **Buffered request-body forwarding**: the reverse proxy reads the body into memory before forwarding
+  (roadmap: streaming pipe).
+- **Not yet implemented**: gzip response compression, upstream keep-alive connection-pool tuning knobs
+  (per-upstream `keepalive N`).
