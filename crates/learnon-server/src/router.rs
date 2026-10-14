@@ -121,6 +121,12 @@ pub struct Location {
     pub internal: bool,
     /// `client_max_body_size` 的 location 级覆盖
     pub client_max_body_size: Option<u64>,
+    /// ACCESS 阶段 IP 白/黑名单（allow/deny，有序，第一条命中生效，无命中默认放行）
+    pub access_rules: Vec<crate::access::AccessRule>,
+    /// `auth_basic "realm";`；None = 未启用。字面量 `off`/空串视为关闭。
+    pub auth_basic_realm: Option<String>,
+    /// `auth_basic_user_file <path>;` 解析后的绝对路径
+    pub auth_basic_user_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +147,10 @@ pub struct Server {
     pub proxy_set_headers: Vec<(String, String)>,
     /// server 级并发限制
     pub limit_conn: Vec<ConnRule>,
+    /// server 级 ACCESS IP 规则：location 无自身规则时继承（nginx 语义）
+    pub access_rules: Vec<crate::access::AccessRule>,
+    pub auth_basic_realm: Option<String>,
+    pub auth_basic_user_file: Option<PathBuf>,
 }
 
 /// 一个真实监听端点
@@ -184,6 +194,9 @@ struct ServerTemplate {
     proxy_send_timeout: u64,
     proxy_request_buffering: bool,
     limit_conn: Vec<ConnRule>,
+    access_rules: Vec<crate::access::AccessRule>,
+    auth_basic_realm: Option<String>,
+    auth_basic_user_file: Option<PathBuf>,
     ssl_cert: Option<PathBuf>,
     ssl_key: Option<PathBuf>,
     min_tls: TlsVersion,
@@ -355,7 +368,8 @@ impl Router {
                    "header_filter_by_lua", "header_filter_by_lua_file",
                    "body_filter_by_lua", "body_filter_by_lua_file",
                    "log_by_lua", "log_by_lua_file",
-                   "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust"],
+                   "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
+                   "allow", "deny", "auth_basic", "auth_basic_user_file"],
                 "server",
                 &mut warnings,
             );
@@ -438,6 +452,9 @@ impl Router {
                     add_headers: tmpl.add_headers.clone(),
                     proxy_set_headers: tmpl.proxy_set_headers.clone(),
                     limit_conn: tmpl.limit_conn.clone(),
+                    access_rules: tmpl.access_rules.clone(),
+                    auth_basic_realm: tmpl.auth_basic_realm.clone(),
+                    auth_basic_user_file: tmpl.auth_basic_user_file.clone(),
                 };
                 let list = groups.entry(addr).or_default();
                 if flags.default_server {
@@ -542,6 +559,9 @@ impl Router {
             proxy_send_timeout: 60,
             proxy_request_buffering: true,
             limit_conn: Vec::new(),
+            access_rules: Vec::new(),
+            auth_basic_realm: None,
+            auth_basic_user_file: None,
             ssl_cert: None,
             ssl_key: None,
             min_tls: TlsVersion::Tls12,
@@ -640,6 +660,11 @@ impl Router {
         }
         tmpl.error_pages = parse_error_pages(d);
         tmpl.add_headers = parse_add_headers(d);
+        let (a_rules, a_realm, a_file) =
+            parse_access_directives(d, base_dir, "server", warnings)?;
+        tmpl.access_rules = a_rules;
+        tmpl.auth_basic_realm = a_realm;
+        tmpl.auth_basic_user_file = a_file;
 
         for loc in d.block.iter().filter(|x| x.name == "location") {
             tmpl.locations
@@ -684,6 +709,9 @@ impl Router {
             limit_req: Vec::new(),
             internal: false,
             client_max_body_size: None,
+            access_rules: Vec::new(),
+            auth_basic_realm: None,
+            auth_basic_user_file: None,
         };
         Self::warn_unknown(
             d,
@@ -696,7 +724,8 @@ impl Router {
                "rewrite_by_lua_file", "header_filter_by_lua", "header_filter_by_lua_file",
                "body_filter_by_lua", "body_filter_by_lua_file",
                "log_by_lua", "log_by_lua_file",
-               "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust"],
+               "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
+               "allow", "deny", "auth_basic", "auth_basic_user_file"],
             &format!("location '{}'", loc.pattern),
             warnings,
         );
@@ -734,6 +763,11 @@ impl Router {
         {
             loc.client_max_body_size = Some(v);
         }
+        let (rules, realm, user_file) =
+            parse_access_directives(d, base_dir, &format!("location '{}'", loc.pattern), warnings)?;
+        loc.access_rules = rules;
+        loc.auth_basic_realm = realm;
+        loc.auth_basic_user_file = user_file;
         loc.error_pages = parse_error_pages(d);
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
             loc.proxy_pass = Some(pp.to_string());
@@ -1030,6 +1064,60 @@ fn parse_add_headers(d: &Directive) -> Vec<(String, String)> {
         .filter(|x| x.name == "add_header")
         .filter_map(|h| Some((h.arg(0)?.to_string(), h.arg(1)?.to_string())))
         .collect()
+}
+
+/// 解析 ACCESS 阶段指令：有序的 `allow`/`deny`，以及 `auth_basic`/`auth_basic_user_file`。
+/// location 与 server 级共用。非法地址报错（与 nginx 启动期校验一致）；realm 的字面量
+/// `off` 或空串视为关闭。
+fn parse_access_directives(
+    d: &Directive,
+    base_dir: &PathBuf,
+    where_name: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<crate::access::AccessRule>, Option<String>, Option<PathBuf>), AppError> {
+    let mut rules = Vec::new();
+    // 保持 allow/deny 出现的相对顺序：遍历 block，按 name 分派
+    for x in d.block.iter().filter(|x| x.name == "allow" || x.name == "deny") {
+        let allow = x.name == "allow";
+        if x.args.is_empty() {
+            warnings.push(format!("{where_name} 第 {} 行 {} 缺少地址参数，忽略", x.line, x.name));
+            continue;
+        }
+        let refs: Vec<&str> = x.args.iter().map(|s| s.as_str()).collect();
+        match crate::access::parse_allow_arg(allow, &refs) {
+            Some(rule) => rules.push(rule),
+            None => {
+                return Err(AppError::Other(format!(
+                    "{where_name} 第 {} 行 {} 的地址无法解析（需 IPv4/IPv6/CIDR/all，收到 {:?}）",
+                    x.line,
+                    x.name,
+                    x.args
+                )))
+            }
+        }
+    }
+
+    // realm 三态：None=本层未设置（继承上层），Some("off")=显式关闭，Some(其它)=启用
+    let realm = d
+        .find("auth_basic")
+        .and_then(|a| a.arg(0))
+        .map(|s| {
+            let t = s.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("off") {
+                "off".to_string()
+            } else {
+                t.to_string()
+            }
+        });
+    let user_file = d
+        .find("auth_basic_user_file")
+        .and_then(|a| a.arg(0))
+        .map(|p| crate::resolve_path(p, base_dir));
+
+    if realm.as_deref().is_some_and(|v| v != "off") && user_file.is_none() {
+        warnings.push(format!("{where_name} 配置了 auth_basic 却没有 auth_basic_user_file，认证将始终失败"));
+    }
+    Ok((rules, realm, user_file))
 }
 
 /// `proxy_set_header` 合并：server 级为默认，location 级同名覆盖

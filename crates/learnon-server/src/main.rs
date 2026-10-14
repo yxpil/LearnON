@@ -19,6 +19,7 @@
 //! 用法：`learnon [-t] [-V] [path/to/learnon.conf]`
 
 mod access_log;
+mod access;
 mod certs;
 mod compress;
 mod engine;

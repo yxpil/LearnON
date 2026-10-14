@@ -915,6 +915,10 @@ async fn process(
         if let Some(resp) = check_limit_req(state, ctx, loc) {
             return resp;
         }
+        // 3.5) ACCESS：内置 allow/deny（IP）+ auth_basic（basic auth），先于 access_by_*
+        if let Some(resp) = check_access_and_auth(state, ctx, loc, server).await {
+            return resp;
+        }
         // 4) ACCESS：access_by_rust / access_by_lua
         if !run_phases(state, ctx, loc, Phase::Access, server).await {
             if let Some((code, target)) = ctx.redirect.take() {
@@ -1113,6 +1117,87 @@ fn check_limit_req(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Location) 
         }
     }
     None
+}
+
+// ==================== ACCESS：内置 allow/deny + auth_basic ====================
+
+/// ACCESS 阶段内置访问控制：先 IP（allow/deny）后 HTTP Basic（auth_basic），都在
+/// access_by_* 之前执行（与 nginx 内置模块的注册顺序一致）。命中拒绝则返回统一错误页。
+async fn check_access_and_auth(
+    _state: &Arc<AppState>,
+    ctx: &mut RequestCtx,
+    loc: &Location,
+    server: &Arc<Server>,
+) -> Option<BoxResponse> {
+    // ---- IP allow/deny：location 有自身规则则用之，否则继承 server ----
+    let rules = if !loc.access_rules.is_empty() {
+        &loc.access_rules
+    } else {
+        &server.access_rules
+    };
+    if !rules.is_empty() {
+        if let Ok(ip) = ctx.remote_addr.parse::<std::net::IpAddr>() {
+            if !crate::access::check_access(rules, ip) {
+                log_debug!("allow/deny 拒绝 {}", ctx.remote_addr);
+                ctx.status = 403;
+                return Some(status_page(403));
+            }
+        }
+    }
+
+    // ---- auth_basic：realm 三态（None 继承 / "off" 关闭 / 其它启用）----
+    let realm = loc
+        .auth_basic_realm
+        .as_deref()
+        .or(server.auth_basic_realm.as_deref());
+    let realm = match realm {
+        Some(r) if r != "off" => r,
+        _ => return None,
+    };
+    let file = loc
+        .auth_basic_user_file
+        .as_ref()
+        .or(server.auth_basic_user_file.as_ref())?;
+
+    // 校验 Authorization（缺失/格式错/不匹配一律 401，附带 WWW-Authenticate）
+    let users = {
+        let path = file.clone();
+        tokio::task::spawn_blocking(move || crate::access::load_htpasswd(&path))
+            .await
+            .ok()
+            .flatten()
+    };
+    let users = match users {
+        Some(u) => u,
+        None => {
+            // 文件读不到：等同认证失败，但仍要给出 401 质询（与 nginx 行为一致）
+            log_error!("auth_basic_user_file 无法读取: {}", file.display());
+            ctx.status = 401;
+            return Some(basic_challenge(realm));
+        }
+    };
+    let authed_user = match crate::access::check_auth_header(ctx.header("authorization"), &users) {
+        crate::access::AuthOutcome::Ok(user) => Some(user),
+        _ => None,
+    };
+    match authed_user {
+        Some(user) => {
+            log_debug!("auth_basic 通过: {user}");
+            None
+        }
+        None => {
+            ctx.status = 401;
+            Some(basic_challenge(realm))
+        }
+    }
+}
+
+/// 401 质询：统一错误页 + `WWW-Authenticate: Basic realm="..."`（realm 里的反斜杠/引号转义）。
+fn basic_challenge(realm: &str) -> BoxResponse {
+    let escaped = realm.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut resp = status_page(401);
+    set_header(&mut resp, "www-authenticate", &format!("Basic realm=\"{escaped}\""));
+    resp
 }
 
 // ==================== 静态文件（try_files / index / autoindex / alias / 条件请求）====================

@@ -78,6 +78,8 @@ all gateway logic is hand-written.
 | `access_log` combined format | local file + stdout | `access_log.rs` |
 | third-party C modules | `content_by_rust` / `access_by_rust` compile-time registered Rust handlers | `engine.rs` |
 | `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
+| `allow` / `deny` | ACCESS-phase IP ACL: IPv4/IPv6/CIDR/`all`, ordered first-match-wins (default allow), location inherits server rules | `access.rs` |
+| `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`, mtime-cached file reload | `access.rs` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
 
 ## Directory layout
@@ -265,6 +267,19 @@ Already done (previously listed as gaps, now implemented):
   `tools/metrics_e2e.py`: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx`
   deltas track the real request counts, the active gauge stays ≥1 while a connection is in flight, and
   `capacity` equals the `worker_connections` default.)
+- **Access control (`allow`/`deny` + `auth_basic`)**: an ACCESS-phase gate runs before
+  `access_by_*` (matching nginx's built-in module order). `allow`/`deny` accept IPv4/IPv6/CIDR/`all`,
+  evaluated first-match-wins with default-allow, and a location with no own rules inherits the
+  server's. `auth_basic`/`auth_basic_user_file` enforce HTTP Basic with the realm as a tri-state
+  (`unset` inherits, `off`/`""` disables, else enables); the htpasswd file is loaded through a
+  process-wide cache keyed by mtime. Password records may be plaintext, `{SHA}` (SHA-1 base64),
+  `$1$` (glibc MD5-crypt) or `$apr1$` (Apache MD5-crypt) — MD5 and SHA-1 are implemented in pure Rust
+  (no crypto crates, so cross-compiles stay clean), and the MD5-crypt output is validated against
+  `openssl passwd` reference vectors. Comparisons are constant-time. (`access.rs`, `server.rs`,
+  `router.rs`, verified by `tools/auth_e2e.py`: missing/wrong credentials → `401` with a
+  `WWW-Authenticate: Basic realm=…` challenge, correct `{SHA}`/`$apr1$`/plaintext logins → `200`,
+  `deny all` → `403`, `allow 127.0.0.1/32` matches the loopback client.) crypt-DES and bcrypt
+  (`$2y$`) htpasswd records are not yet supported.
 
 Remaining tradeoffs / roadmap:
 
