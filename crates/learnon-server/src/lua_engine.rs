@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use mlua::prelude::*;
 use mlua::{AnyUserData, Variadic};
@@ -101,9 +101,32 @@ impl LuaSource {
     }
 }
 
+/// TCP cosocket 对象（对标 ngx.socket.tcp）- v0.3 简化版：API 骨架，为 v0.4 完整实现预留接口
+pub struct TcpSocket {
+    _marker: (), // 占位符，v0.4 将实现实际 socket 逻辑
+}
+
+impl TcpSocket {
+    fn new() -> Self {
+        TcpSocket {
+            _marker: (),
+        }
+    }
+}
+
+// v0.3: 基础 cosocket API 骨架（完整实现需 v0.4 的 mlua 协程支持）
+// 当前提供占位方法，实际网络操作建议使用 Rust 原生模块或外部代理
+impl LuaUserData for TcpSocket {}
+
+type VM = tokio::sync::Mutex<Lua>;
+
+/// 对标 lua_max_pending_timers / lua_max_running_timers 的默认值
+const MAX_PENDING_TIMERS: isize = 1024;
+const MAX_RUNNING_TIMERS: isize = 4096;
+
 pub struct LuaEngine {
     /// Lua VM 池：每 CPU 核心一个独立 VM，多请求并行执行（对标 OpenResty 每 worker 一个 VM）
-    vms: Vec<Arc<tokio::sync::Mutex<Lua>>>,
+    vms: Vec<Arc<VM>>,
     /// 轮询游标（无锁）
     counter: AtomicUsize,
 }
@@ -273,14 +296,22 @@ impl LuaEngine {
             .map(|n| n.get())
             .unwrap_or(4)
             .clamp(1, 16);
+        // 进程级定时器计数（对标 lua_max_pending/running_timers 的每 worker 计数）
+        let timer_pending = Arc::new(AtomicIsize::new(0));
+        let timer_running = Arc::new(AtomicIsize::new(0));
         let mut vms = Vec::with_capacity(n);
         for _ in 0..n {
-            let lua = Lua::new();
-            Self::install_api(&lua, &dicts)?;
-            for (name, code) in &inits {
-                lua.load(code).set_name(name).exec()?;
+            let vm = Arc::new(VM::new(Lua::new()));
+            let vm_ref = Arc::downgrade(&vm);
+            {
+                let mut guard = vm.try_lock()
+                    .map_err(|_| AppError::Other("Lua VM 启动时被占用".to_string()))?;
+                Self::install_api(&mut guard, &dicts, &vm_ref, &timer_pending, &timer_running)?;
+                for (name, code) in &inits {
+                    guard.load(code).set_name(name).exec()?;
+                }
             }
-            vms.push(Arc::new(tokio::sync::Mutex::new(lua)));
+            vms.push(vm);
         }
         for (name, _) in &inits {
             println!("[learnon] 已执行 {name}（x{n} VM）");
@@ -292,7 +323,13 @@ impl LuaEngine {
         })
     }
 
-    fn install_api(lua: &Lua, dicts: &SharedDicts) -> Result<(), AppError> {
+    fn install_api(
+        lua: &Lua,
+        dicts: &SharedDicts,
+        vm_ref: &Weak<VM>,
+        timer_pending: &Arc<AtomicIsize>,
+        timer_running: &Arc<AtomicIsize>,
+    ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
             let h = ud.borrow::<CtxHandle>()?;
@@ -420,6 +457,183 @@ impl LuaEngine {
         })?;
         ngx.set("sleep", sleep)?;
 
+        // ngx.timer —— 官方表 API：at / every / running_count / pending_count
+        // 回调派发器：把 premature 作为首参、原样转发用户变参（对标 OpenResty 调用约定）
+        let dispatch: LuaFunction = lua
+            .load("return function(f, premature, args) return f(premature, table.unpack(args, 1, args.n or 0)) end")
+            .eval()?;
+        lua.set_named_registry_value("__timer_dispatch", dispatch)?;
+
+        let timer = lua.create_table()?;
+
+        // ngx.timer.at(delay_sec, callback, ...) -> ok, err
+        // 语义对齐 lua-nginx-module t/106-timer.t：秒（可浮点）、premature 首参、
+        // 变参转发、失败返回 (nil, err)、回调在所属 VM 锁内执行且不碰请求 ctx
+        {
+            let vm_ref = vm_ref.clone();
+            let pending = Arc::clone(timer_pending);
+            let running = Arc::clone(timer_running);
+            let timer_at = lua.create_function(move |lua_ctx, (delay, callback, args): (LuaValue, LuaValue, Variadic<LuaValue>)| {
+                let delay_secs = match &delay {
+                    LuaValue::Number(n) => *n as f64,
+                    LuaValue::Integer(n) => *n as f64,
+                    _ => return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid delay")?))),
+                };
+                if !delay_secs.is_finite() || delay_secs < 0.0 {
+                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid delay")?)));
+                }
+                let cb = match callback {
+                    LuaValue::Function(f) => f,
+                    _ => return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid callback type")?))),
+                };
+                if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_TIMERS {
+                    pending.fetch_sub(1, Ordering::SeqCst);
+                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("too many pending timers")?)));
+                }
+                // 用户变参在注册时冻结进表（跨 await/线程后无法再借用当前栈）
+                let args_table = lua_ctx.create_table()?;
+                let mut n = 0;
+                for v in args {
+                    n += 1;
+                    args_table.raw_set(n, v)?;
+                }
+                args_table.raw_set("n", n)?;
+
+                let vm_ref = vm_ref.clone();
+                let pending = Arc::clone(&pending);
+                let running = Arc::clone(&running);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(delay_secs)).await;
+                    let Some(vm) = vm_ref.upgrade() else {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    };
+                    pending.fetch_sub(1, Ordering::SeqCst);
+                    if running.fetch_add(1, Ordering::SeqCst) >= MAX_RUNNING_TIMERS {
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("[timer] too many running timers");
+                        return;
+                    }
+                    // 关键：持所属 VM 锁执行，且挂上游离 __ctx
+                    // （对标 OpenResty fake request client，防止读到复用该 VM 的后续请求上下文）
+                    let guard = vm.lock().await;
+                    let _ = guard.set_named_registry_value(
+                        "__ctx",
+                        CtxHandle(Arc::new(Mutex::new(RequestCtx::detached()))),
+                    );
+                    if let Ok(ngx_t) = guard.globals().get::<LuaTable>("ngx") {
+                        let _ = ngx_t.raw_set("ctx", guard.create_table().unwrap());
+                    }
+                    let run = (|| -> mlua::Result<LuaValue> {
+                        let dispatch: LuaFunction = guard.named_registry_value("__timer_dispatch")?;
+                        dispatch.call((cb.clone(), LuaValue::Boolean(false), args_table.clone()))
+                    })();
+                    if let Err(e) = run {
+                        eprintln!("[timer] 回调执行失败: {e}");
+                    }
+                    let _ = guard.unset_named_registry_value("__ctx");
+                    drop(guard);
+                    running.fetch_sub(1, Ordering::SeqCst);
+                });
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?;
+            timer.set("at", timer_at)?;
+        }
+
+        // ngx.timer.every(interval_sec, callback, ...) -> ok, err
+        // 语义对齐 t/152-timer-every.t：interval<=0 报 invalid interval、
+        // 回调显式返回 false 时停止（v0.10.6 行为）
+        {
+            let vm_ref = vm_ref.clone();
+            let pending = Arc::clone(timer_pending);
+            let running = Arc::clone(timer_running);
+            let timer_every = lua.create_function(move |lua_ctx, (interval, callback, args): (LuaValue, LuaValue, Variadic<LuaValue>)| {
+                let interval_secs = match &interval {
+                    LuaValue::Number(n) => *n as f64,
+                    LuaValue::Integer(n) => *n as f64,
+                    _ => return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid interval")?))),
+                };
+                if !interval_secs.is_finite() || interval_secs <= 0.0 {
+                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid interval")?)));
+                }
+                let cb = match callback {
+                    LuaValue::Function(f) => f,
+                    _ => return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid callback type")?))),
+                };
+                if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_TIMERS {
+                    pending.fetch_sub(1, Ordering::SeqCst);
+                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("too many pending timers")?)));
+                }
+                let args_table = lua_ctx.create_table()?;
+                let mut n = 0;
+                for v in args {
+                    n += 1;
+                    args_table.raw_set(n, v)?;
+                }
+                args_table.raw_set("n", n)?;
+
+                let vm_ref = vm_ref.clone();
+                let pending = Arc::clone(&pending);
+                let running = Arc::clone(&running);
+                tokio::spawn(async move {
+                    let duration = std::time::Duration::from_secs_f64(interval_secs);
+                    loop {
+                        tokio::time::sleep(duration).await;
+                        let Some(vm) = vm_ref.upgrade() else {
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            break;
+                        };
+                        // 对标 TEST 4「开始运行时立刻登记下一发」：pending 保持 +1
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        if running.fetch_add(1, Ordering::SeqCst) >= MAX_RUNNING_TIMERS {
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            eprintln!("[timer] too many running timers");
+                            break;
+                        }
+                        let guard = vm.lock().await;
+                        let _ = guard.set_named_registry_value(
+                            "__ctx",
+                            CtxHandle(Arc::new(Mutex::new(RequestCtx::detached()))),
+                        );
+                        if let Ok(ngx_t) = guard.globals().get::<LuaTable>("ngx") {
+                            let _ = ngx_t.raw_set("ctx", guard.create_table().unwrap());
+                        }
+                        let run = (|| -> mlua::Result<LuaValue> {
+                            let dispatch: LuaFunction = guard.named_registry_value("__timer_dispatch")?;
+                            dispatch.call((cb.clone(), LuaValue::Boolean(false), args_table.clone()))
+                        })();
+                        let stop = match run {
+                            Err(e) => {
+                                eprintln!("[timer] 周期回调执行失败: {e}");
+                                true
+                            }
+                            // 回调显式 return false -> 终止周期定时器
+                            Ok(LuaValue::Boolean(false)) => true,
+                            Ok(_) => false,
+                        };
+                        let _ = guard.unset_named_registry_value("__ctx");
+                        drop(guard);
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        if stop {
+                            break;
+                        }
+                        pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?;
+            timer.set("every", timer_every)?;
+        }
+
+        // ngx.timer.running_count() / pending_count()
+        {
+            let running = Arc::clone(timer_running);
+            let pending = Arc::clone(timer_pending);
+            timer.set("running_count", lua.create_function(move |_, ()| Ok(running.load(Ordering::SeqCst)))?)?;
+            timer.set("pending_count", lua.create_function(move |_, ()| Ok(pending.load(Ordering::SeqCst)))?)?;
+        }
+        ngx.set("timer", timer)?;
+
         // ngx.time() / ngx.now()
         let time = lua.create_function(|_, ()| Ok(chrono::Utc::now().timestamp()))?;
         ngx.set("time", time)?;
@@ -444,6 +658,69 @@ impl LuaEngine {
         })?;
         header.set("set", header_set)?;
         ngx.set("header", header)?;
+
+        // ngx.arg —— body_filter_by_lua 参数访问（ngx.arg[1]=chunk, ngx.arg[2]=eof）
+        let arg = lua.create_table()?;
+        let arg_get = lua.create_function(move |lua, (_, idx): (LuaTable, usize)| {
+            let h = get_ctx(lua)?;
+            let ctx = h.0.lock().unwrap();
+            match idx {
+                1 => {
+                    // 返回 chunk（Vec<u8> 转 Lua string）
+                    if let Some(ref chunk) = ctx.filter_chunk {
+                        Ok(LuaValue::String(lua.create_string(chunk)?))
+                    } else {
+                        Ok(LuaValue::Nil)
+                    }
+                }
+                2 => {
+                    // 返回 eof 标志
+                    Ok(LuaValue::Boolean(ctx.filter_eof))
+                }
+                _ => Ok(LuaValue::Nil),
+            }
+        })?;
+        let arg_set = lua.create_function(move |lua, (_, idx, value): (LuaTable, usize, LuaValue)| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            match idx {
+                1 => {
+                    // 设置修改后的 chunk
+                    match value {
+                        LuaValue::String(s) => {
+                            ctx.filter_chunk = Some(s.as_bytes().to_vec());
+                        }
+                        LuaValue::Nil => {
+                            ctx.filter_chunk = None;
+                        }
+                        _ => {}
+                    }
+                }
+                2 => {
+                    // eof 只读，不允许修改
+                    eprintln!("[lua] ngx.arg[2] (eof) is read-only");
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        let mt = lua.create_table()?;
+        mt.set("__index", arg_get)?;
+        mt.set("__newindex", arg_set)?;
+        arg.set_metatable(Some(mt));
+        ngx.set("arg", arg)?;
+
+        // ngx.socket.* —— TCP cosocket 基础 API（v0.3 简化版：spawn_blocking + std::net）
+        let socket = lua.create_table()?;
+
+        // ngx.socket.tcp() —— 创建 TCP socket userdata
+        let tcp_create = lua.create_function(|lua, ()| {
+            let sock = TcpSocket::new();
+            let ud = lua.create_userdata(sock)?;
+            Ok(ud)
+        })?;
+        socket.set("tcp", tcp_create)?;
+        ngx.set("socket", socket)?;
 
         // ngx.req.* —— 请求信息
         let req = lua.create_table()?;

@@ -340,6 +340,8 @@ impl Router {
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
+                   "header_filter_by_lua", "header_filter_by_lua_file",
+                   "body_filter_by_lua", "body_filter_by_lua_file",
                    "content_by_rust", "access_by_rust", "rewrite_by_rust"],
                 "server",
                 &mut warnings,
@@ -667,7 +669,9 @@ impl Router {
                "alias", "index", "try_files", "autoindex", "error_page", "add_header",
                "limit_req", "internal", "client_max_body_size", "content_by_lua",
                "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
-               "rewrite_by_lua_file", "content_by_rust", "access_by_rust", "rewrite_by_rust"],
+               "rewrite_by_lua_file", "header_filter_by_lua", "header_filter_by_lua_file",
+               "body_filter_by_lua", "body_filter_by_lua_file",
+               "content_by_rust", "access_by_rust", "rewrite_by_rust"],
             &format!("location '{}'", loc.pattern),
             warnings,
         );
@@ -808,6 +812,10 @@ impl Router {
             "access_by_lua_file",
             "content_by_lua",
             "content_by_lua_file",
+            "header_filter_by_lua",
+            "header_filter_by_lua_file",
+            "body_filter_by_lua",
+            "body_filter_by_lua_file",
         ] {
             if let Some(dir) = d.find(name) {
                 let phase = match name.split('_').next().unwrap() {

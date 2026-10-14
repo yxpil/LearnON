@@ -144,7 +144,22 @@ Lua、反代、共享字典、POST 请求体在 HTTPS 下全部正常。生产�
 - 正则：`ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)`（flags 支持 `i`）
 - 编解码：`ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - 共享内存：`ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
+- 后台定时器：`ngx.timer.at(delay_sec, cb, ...) / ngx.timer.every(interval_sec, cb, ...) / running_count() / pending_count()`
+  —— 秒单位、回调首参 `premature`、用户变参原样转发、失败返回 `(nil, err)`、`return false` 停止周期（语义对齐官方 t/106/152/107）
+- 响应过滤：`header_filter_by_lua*`（发头前改响应头/清 Content-Length）、`body_filter_by_lua*`（经 `ngx.arg[1]` chunk、`ngx.arg[2]` eof 改写响应体）
+- cosocket：`ngx.socket.tcp()` 对象已就位（API 骨架，完整 connect/send/receive 待 v0.4 协程调度）
 - 其他：`ngx.ctx（每请求表）/ ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
+
+## E2E 测试（对齐 OpenResty 官方套件）
+
+OpenResty 官方把 E2E 测试发布在 `openresty/lua-nginx-module` 的 `t/` 目录（193 个 `.t` 文件，Perl Test::Nginx 驱动）。
+本仓库用「移植断言」策略对标：从官方 `.t` 的 `__DATA__` 段提取 config/request/response/error_log 期望，写成独立可跑的断言脚本。
+
+- `timer_e2e_test.py`：11/11 通过，移植自 `t/106-timer.t`、`t/152-timer-every.t`、`t/107-timer-errors.t`
+  （premature 首参、变参转发、every 的 `return false` 停止、四类错误串、无日志串扰）
+- 官方套件已 vendored 到 `vendor/lua-nginx-module/t/`（gitignored）作为语义参考；Test::Nginx 直接跑完整 `.t` 需要真实
+  OpenResty 二进制作 `TEST_NGINX_BINARY` + `*_by_lua_block` 语法 + Unix 信号，Windows 本机无法运行，故走移植断言路线。
+- 兼容性回归：`compat_test.py` 17/17、安全 `sec_test.py` 30 项、静态/场景/上游各套件见目录。
 
 ## 设计取舍与路线图
 

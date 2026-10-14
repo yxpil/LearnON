@@ -52,11 +52,43 @@ pub struct RequestCtx {
     pub scheme: String,
     /// 本次请求是否为内部重定向产物（`internal;` location 只放行这类请求）
     pub internal_request: bool,
+    /// body_filter_by_lua 参数：ngx.arg[1]=chunk, ngx.arg[2]=eof
+    pub filter_chunk: Option<Vec<u8>>,
+    pub filter_eof: bool,
 }
 
 impl RequestCtx {
     pub fn effective_path(&self) -> &str {
         self.rewritten_path.as_deref().unwrap_or(&self.path)
+    }
+
+    /// 定时器/后台任务用的游离上下文：不属于任何请求，ngx.say 等写入落到这里被丢弃
+    /// （对标 OpenResty 的 fake request client）
+    pub fn detached() -> RequestCtx {
+        RequestCtx {
+            method: "GET".to_string(),
+            path: "@timer".to_string(),
+            query: String::new(),
+            uri: "@timer".to_string(),
+            host: None,
+            remote_addr: "0.0.0.0".to_string(),
+            remote_port: 0,
+            server_port: 0,
+            req_headers: Vec::new(),
+            resp_headers: Vec::new(),
+            rewritten_path: None,
+            status: 200,
+            body: None,
+            done: false,
+            internal_redirect: false,
+            req_body: Vec::new(),
+            exec_depth: 0,
+            redirect: None,
+            scheme: "http".to_string(),
+            internal_request: true,
+            filter_chunk: None,
+            filter_eof: false,
+        }
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {

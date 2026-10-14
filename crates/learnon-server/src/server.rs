@@ -641,6 +641,8 @@ async fn handle_request(
         redirect: None,
         scheme: meta.scheme.to_string(),
         internal_request: false,
+        filter_chunk: None,
+        filter_eof: false,
     };
 
     // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
@@ -895,6 +897,36 @@ async fn process(
         if !ctx.done && ctx.body.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
             return serve_static_flow(state, ctx, server, loc, body).await;
         }
+        
+        // 执行 header_filter_by_lua（如果存在，用于修改响应头）
+        if let Some((_, hfilter_name, hfilter_src)) = loc.lua_phases.iter().find(|(p, n, _)| *p == Phase::Content && (n == "header_filter_by_lua" || n == "header_filter_by_lua_file")) {
+            if run_lua(state, ctx, hfilter_name, hfilter_src).await {
+                log_error!("header_filter_by_lua 执行失败");
+            }
+        }
+        
+        // 执行 body_filter_by_lua（如果存在）
+        if let Some((_, filter_name, filter_src)) = loc.lua_phases.iter().find(|(p, n, _)| *p == Phase::Content && (n == "body_filter_by_lua" || n == "body_filter_by_lua_file")) {
+            if let Some(response_body) = ctx.body.clone() {
+                // 设置 filter 参数
+                ctx.filter_chunk = Some(response_body);
+                ctx.filter_eof = true;
+                
+                // 执行过滤器
+                if run_lua(state, ctx, filter_name, filter_src).await {
+                    log_error!("body_filter_by_lua 执行失败");
+                    ctx.status = 500;
+                    ctx.body = None;
+                    return finish_response(ctx, server, Some(loc));
+                }
+                
+                // 读取修改后的 chunk
+                if let Some(modified_chunk) = ctx.filter_chunk.take() {
+                    ctx.body = Some(modified_chunk);
+                }
+            }
+        }
+        
         return finish_response(ctx, server, Some(loc));
     }
 
