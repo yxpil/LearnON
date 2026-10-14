@@ -1,5 +1,5 @@
 # LearnON Gateway - Production Docker Image
-FROM rust:1.75-slim-bookworm AS builder
+FROM rust:1.98-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -29,6 +29,7 @@ LABEL org.opencontainers.image.description="LearnON Gateway Server"
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r learnon && useradd -r -g learnon -d /app -s /sbin/nologin learnon
 
