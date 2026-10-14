@@ -69,6 +69,7 @@ all gateway logic is hand-written.
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
+| `proxy_cache` response caching | in-memory named zones, `proxy_cache_valid`/key/methods/min_uses, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
@@ -312,6 +313,20 @@ Already done (previously listed as gaps, now implemented):
   `test.invalid` — an RFC6761 reserved name the OS cannot resolve — proving the async path is taken,
   then shows a repeated request does **not** re-query thanks to the TTL cache.) `ngx.socket.tcp`
   `connect` still uses system resolution.
+- **`proxy_cache` response caching**: an in-memory, named-zone cache (`proxy_cache.rs`) for the
+  `proxy_pass` path. Directives: `proxy_cache <zone>|off`, `proxy_cache_key <template>` (default
+  `$scheme$proxy_host$request_uri`), `proxy_cache_valid <codes…|any> <time>` (multi-line),
+  `proxy_cache_methods` (default `GET HEAD`), `proxy_cache_min_uses` (default 1). Freshness precedence
+  matches nginx: the upstream's own `Cache-Control`/`Expires` wins (and an explicit `no-store`/`no-cache`/
+  `private`/`max-age=0` forbids caching outright), falling back to `proxy_cache_valid` only when the
+  upstream gives no hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety). Every
+  proxied response through a cached location gets an `X-Cache-Status: HIT|MISS|BYPASS` header. A hit
+  replays the buffered status/headers/body without contacting the backend.
+  (Verified by `tools/proxy_cache_e2e.py`: MISS→backend then HIT→same bytes with the backend counter
+  unchanged, distinct `?query` → distinct keys, `Set-Cookie` and `no-store` → `BYPASS`, and a
+  non-caching control location with no `X-Cache-Status`.) Not yet implemented: `proxy_cache_use_stale`,
+  revalidation (`If-None-Match` to origin), `proxy_cache_purge`, on-disk `keys_zone`, and `Vary`-aware
+  keying.
 
 Remaining tradeoffs / roadmap:
 

@@ -29,6 +29,7 @@ mod log;
 mod lua_engine;
 mod metrics;
 mod proxy;
+mod proxy_cache;
 mod router;
 mod server;
 mod settings;
@@ -329,6 +330,7 @@ async fn run(
         }
         None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
     };
+    let proxy_cache = proxy_cache::ProxyCache::new();
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();
@@ -341,6 +343,7 @@ async fn run(
         handlers,
         lua,
         proxy,
+        proxy_cache,
         access_log: Arc::clone(&access_log),
         settings: settings.clone(),
         limits: Arc::clone(&limits),

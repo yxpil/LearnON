@@ -127,6 +127,16 @@ pub struct Location {
     pub auth_basic_realm: Option<String>,
     /// `auth_basic_user_file <path>;` 解析后的绝对路径
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `proxy_cache <zone>|off;`：Some(zone) 启用命名缓存区，None 关闭
+    pub proxy_cache: Option<String>,
+    /// `proxy_cache_key <模板>;`，默认 `$scheme$proxy_host$request_uri`
+    pub proxy_cache_key: String,
+    /// `proxy_cache_methods`（默认 GET HEAD）
+    pub proxy_cache_methods: Vec<String>,
+    /// `proxy_cache_valid` 拆分后的 (状态码集合, ttl)；空表示仅按上游 Cache 头
+    pub proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
+    /// `proxy_cache_min_uses N`（默认 1）：同一 key 第 N 次起才写入
+    pub proxy_cache_min_uses: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +203,11 @@ struct ServerTemplate {
     proxy_read_timeout: u64,
     proxy_send_timeout: u64,
     proxy_request_buffering: bool,
+    proxy_cache: Option<String>,
+    proxy_cache_key: String,
+    proxy_cache_methods: Vec<String>,
+    proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
+    proxy_cache_min_uses: u32,
     limit_conn: Vec<ConnRule>,
     access_rules: Vec<crate::access::AccessRule>,
     auth_basic_realm: Option<String>,
@@ -324,6 +339,70 @@ fn parse_on_off(v: &str) -> Option<bool> {
     }
 }
 
+/// `proxy_cache*` 指令的解析产物：字段用 Option 表示"本块是否显式指定"，
+/// 以便 location 缺省时继承 server 级（nginx 的 location 可覆盖 http/server 值）。
+struct CacheSettings {
+    /// None=未写；Some(None)=写了 `off`；Some(Some(zone))=写了区名
+    zone: Option<Option<String>>,
+    key: Option<String>,
+    methods: Option<Vec<String>>,
+    valid: Vec<(Vec<String>, std::time::Duration)>,
+    has_valid: bool,
+    min_uses: Option<u32>,
+}
+
+fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSettings {
+    let mut cs = CacheSettings {
+        zone: None,
+        key: None,
+        methods: None,
+        valid: Vec::new(),
+        has_valid: false,
+        min_uses: None,
+    };
+    if let Some(v) = d.find("proxy_cache").and_then(|x| x.arg(0)) {
+        cs.zone = Some(if v.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(v.to_string())
+        });
+    }
+    if let Some(v) = d.find("proxy_cache_key").and_then(|x| x.arg(0)) {
+        cs.key = Some(v.to_string());
+    }
+    if let Some(m) = d.find("proxy_cache_methods") {
+        if !m.args.is_empty() {
+            cs.methods = Some(m.args.iter().map(|a| a.to_ascii_uppercase()).collect());
+        }
+    }
+    // proxy_cache_valid 可多行：`proxy_cache_valid 200 302 10m;` / `proxy_cache_valid any 1m;`
+    for vd in d.block.iter().filter(|x| x.name == "proxy_cache_valid") {
+        if vd.args.len() < 2 {
+            warnings.push(format!(
+                "第 {} 行 proxy_cache_valid 需要 `<码...> <时长>`，已忽略",
+                vd.line
+            ));
+            continue;
+        }
+        let (time_arg, code_args) = vd.args.split_last().unwrap();
+        match crate::settings::parse_duration(time_arg) {
+            Some(dur) => cs.valid.push((code_args.to_vec(), dur)),
+            None => warnings.push(format!(
+                "第 {} 行 proxy_cache_valid 时长非法 '{time_arg}'，已忽略",
+                vd.line
+            )),
+        }
+        cs.has_valid = true;
+    }
+    if let Some(v) = d.find("proxy_cache_min_uses").and_then(|x| x.arg(0)) {
+        match v.parse::<u32>() {
+            Ok(n) if n >= 1 => cs.min_uses = Some(n),
+            _ => warnings.push(format!("proxy_cache_min_uses 需为 ≥1 整数，已忽略 '{v}'")),
+        }
+    }
+    cs
+}
+
 impl Router {
     pub fn build(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
         let mut warnings: Vec<String> = Vec::new();
@@ -362,6 +441,7 @@ impl Router {
                    "error_page", "client_max_body_size", "return", "rewrite", "add_header",
                    "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
                    "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
+                   "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
@@ -558,6 +638,11 @@ impl Router {
             proxy_read_timeout: 60,
             proxy_send_timeout: 60,
             proxy_request_buffering: true,
+            proxy_cache: None,
+            proxy_cache_key: "$scheme$proxy_host$request_uri".to_string(),
+            proxy_cache_methods: vec!["GET".to_string(), "HEAD".to_string()],
+            proxy_cache_valid: Vec::new(),
+            proxy_cache_min_uses: 1,
             limit_conn: Vec::new(),
             access_rules: Vec::new(),
             auth_basic_realm: None,
@@ -639,6 +724,22 @@ impl Router {
                 )),
             }
         }
+        let cs = parse_cache_directives(d, warnings);
+        if let Some(z) = cs.zone {
+            tmpl.proxy_cache = z;
+        }
+        if cs.key.is_some() {
+            tmpl.proxy_cache_key = cs.key.unwrap();
+        }
+        if cs.methods.is_some() {
+            tmpl.proxy_cache_methods = cs.methods.unwrap();
+        }
+        if cs.has_valid {
+            tmpl.proxy_cache_valid = cs.valid;
+        }
+        if cs.min_uses.is_some() {
+            tmpl.proxy_cache_min_uses = cs.min_uses.unwrap();
+        }
         for c in d.block.iter().filter(|x| x.name == "limit_conn") {
             match crate::limit::parse_conn_rule(c) {
                 Some(rule) => {
@@ -697,6 +798,11 @@ impl Router {
             proxy_send_timeout: tmpl.proxy_send_timeout,
             proxy_next_upstream: vec!["error".to_string(), "timeout".to_string()],
             proxy_request_buffering: tmpl.proxy_request_buffering,
+            proxy_cache: tmpl.proxy_cache.clone(),
+            proxy_cache_key: tmpl.proxy_cache_key.clone(),
+            proxy_cache_methods: tmpl.proxy_cache_methods.clone(),
+            proxy_cache_valid: tmpl.proxy_cache_valid.clone(),
+            proxy_cache_min_uses: tmpl.proxy_cache_min_uses,
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
             root: None,
@@ -717,7 +823,9 @@ impl Router {
             d,
             &["rewrite", "return", "proxy_pass", "proxy_set_header", "proxy_read_timeout",
                "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
-               "proxy_request_buffering", "root",
+               "proxy_request_buffering",
+               "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
+               "root",
                "alias", "index", "try_files", "autoindex", "error_page", "add_header",
                "limit_req", "internal", "client_max_body_size", "content_by_lua",
                "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
@@ -797,6 +905,22 @@ impl Router {
                     if loc.proxy_request_buffering { "on" } else { "off" }
                 )),
             }
+        }
+        let lcs = parse_cache_directives(d, warnings);
+        if let Some(z) = lcs.zone {
+            loc.proxy_cache = z;
+        }
+        if lcs.key.is_some() {
+            loc.proxy_cache_key = lcs.key.unwrap();
+        }
+        if lcs.methods.is_some() {
+            loc.proxy_cache_methods = lcs.methods.unwrap();
+        }
+        if lcs.has_valid {
+            loc.proxy_cache_valid = lcs.valid;
+        }
+        if lcs.min_uses.is_some() {
+            loc.proxy_cache_min_uses = lcs.min_uses.unwrap();
         }
         for r in d.block.iter().filter(|x| x.name == "limit_req") {
             match crate::limit::parse_req_rule(r) {

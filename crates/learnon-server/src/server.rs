@@ -44,6 +44,7 @@ use crate::compress::{accepts_gzip, GzipBody};
 use crate::engine::{self, HandlerRegistry, Phase, RequestCtx};
 use crate::lua_engine::LuaEngine;
 use crate::proxy::{ProxyBody, ProxyEngine, ProxyOpts, ProxyTimeouts};
+use crate::proxy_cache::CacheHit;
 use crate::router::{self, Location, Router, Server};
 use crate::settings::Settings;
 use crate::{log_debug, log_error, log_info, log_warn, AppError};
@@ -74,6 +75,7 @@ pub struct AppState {
     pub handlers: Arc<HandlerRegistry>,
     pub lua: Arc<LuaEngine>,
     pub proxy: Arc<ProxyEngine>,
+    pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     pub access_log: Arc<AccessLog>,
     pub settings: Settings,
     pub limits: Arc<crate::limit::Limits>,
@@ -1056,17 +1058,110 @@ async fn process(
             },
             next_upstream: &loc.proxy_next_upstream,
         };
+
+        // ---- proxy_cache：仅幂等方法 + 缓冲请求体时参与缓存（流式体无法回放）----
+        let caching_zone = loc.proxy_cache.clone();
+        let cacheable_method = caching_zone.is_some()
+            && loc
+                .proxy_cache_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(&ctx.method))
+            && matches!(body, ProxyBody::Buffered(_));
+        let cache_key = if cacheable_method {
+            Some(build_cache_key(&loc.proxy_cache_key, ctx, target))
+        } else {
+            None
+        };
+        let lookup = match (&caching_zone, &cache_key) {
+            (Some(zone), Some(key)) => {
+                let (hit, cached, count) = state.proxy_cache.lookup(zone, key);
+                Some((zone.clone(), key.clone(), hit, cached, count))
+            }
+            _ => None,
+        };
+        if let Some((_, _, CacheHit::Hit, Some(resp), _)) = &lookup {
+            let resp = Arc::clone(resp);
+            return serve_from_cache(resp, loc, server, "HIT");
+        }
+
+        let status_tag = match &lookup {
+            Some((_, _, CacheHit::Expired, _, _)) => "MISS", // 无 use_stale：过期即回源重取
+            Some((_, _, CacheHit::Miss, _, _)) => "MISS",
+            _ if caching_zone.is_some() => "BYPASS", // 方法/请求体不满足缓存条件
+            _ => "",
+        };
+
         return match state
             .proxy
             .forward(ctx, target, &loc.pattern, &opts, body)
             .await
         {
-            Ok(upstream_resp) => convert_upstream_response(upstream_resp, loc, server),
+            Ok(upstream_resp) => {
+                // 未启用缓存：保持既有流式转发路径
+                if lookup.is_none() {
+                    return convert_upstream_response(upstream_resp, loc, server);
+                }
+                let (zone, key, _, _, count) = lookup.unwrap();
+                let status = upstream_resp.status().as_u16();
+                let (parts, ibody) = upstream_resp.into_parts();
+                let collected = match ibody.collect().await {
+                    Ok(c) => c.to_bytes(),
+                    Err(e) => {
+                        log_error!("代理响应体收集失败: {e}");
+                        return error_response(ctx, server, Some(loc), 502).await;
+                    }
+                };
+                // 存可回放的头：剔除 hop-by-hop 与 content-length（回发时按 body 重算）
+                let hdrs: Vec<(String, String)> = parts
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| !is_hop_by_hop(k.as_str()) && k.as_str().to_ascii_lowercase() != "content-length")
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let has_set_cookie = hdrs
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let ttl = crate::proxy_cache::effective_ttl(
+                    &loc.proxy_cache_valid,
+                    status,
+                    &hdrs,
+                    now_unix,
+                );
+                let cacheable = ttl.is_some()
+                    && !has_set_cookie
+                    && count >= loc.proxy_cache_min_uses;
+                let body = bytes::Bytes::from(collected.to_vec());
+                if cacheable {
+                    state.proxy_cache.store(
+                        &zone,
+                        &key,
+                        crate::proxy_cache::CachedResponse {
+                            status,
+                            headers: hdrs.clone(),
+                            body: Arc::new(body.clone()),
+                        },
+                        ttl.unwrap(),
+                    );
+                }
+                build_buffered_response(
+                    status,
+                    &hdrs,
+                    body,
+                    loc,
+                    server,
+                    if cacheable { status_tag } else { "BYPASS" },
+                    !status_tag.is_empty(),
+                )
+            }
             Err(e) => {
                 log_error!("代理失败 {}{}: {e}", target, ctx.effective_path());
                 error_response(ctx, server, Some(loc), 502).await
             }
-        };
+        }
     }
 
     if let Some((_, name, src)) = loc.lua_phases.iter().find(|(p, _, _)| *p == Phase::Content) {
@@ -1847,6 +1942,92 @@ fn convert_upstream_response(
         }
     }
     builder.body(body.boxed()).unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// 缓存键：把 `$proxy_host` 先用 proxy_pass 的 authority 替换，其余交给变量插值。
+/// 默认模板 `$scheme$proxy_host$request_uri` 对齐 nginx。
+fn build_cache_key(template: &str, ctx: &RequestCtx, target: &str) -> String {
+    let rest = target.trim_start_matches("http://").trim_start_matches("https://");
+    let proxy_host = match rest.split_once('/') {
+        Some((h, _)) => h,
+        None => rest,
+    };
+    let with_host = template.replace("$proxy_host", proxy_host);
+    crate::proxy::interpolate_vars(&with_host, ctx)
+}
+
+/// 命中缓存：用存储的状态/头/体重建响应，带上 X-Cache-Status 与 add_header。
+fn serve_from_cache(
+    resp: Arc<crate::proxy_cache::CachedResponse>,
+    loc: &Location,
+    server: &Server,
+    status_tag: &str,
+) -> BoxResponse {
+    build_buffered_response(
+        resp.status,
+        &resp.headers,
+        (*resp.body).clone(),
+        loc,
+        server,
+        status_tag,
+        true,
+    )
+}
+
+/// 由缓冲好的状态/头/字节构造最终响应；`with_status_tag` 为真时附带 `X-Cache-Status`。
+fn build_buffered_response(
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+    loc: &Location,
+    server: &Server,
+    status_tag: &str,
+    with_status_tag: bool,
+) -> BoxResponse {
+    let mut builder = Response::builder().status(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+    );
+    {
+        let hm = builder.headers_mut().unwrap();
+        if let Ok(v) = HeaderValue::from_str(SERVER_HEADER) {
+            hm.insert(SERVER, v);
+        }
+        for (k, v) in headers {
+            if is_hop_by_hop(k) || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::try_from(k.as_str()),
+                HeaderValue::try_from(v.as_str()),
+            ) {
+                hm.insert(name, val);
+            }
+        }
+        for (k, v) in router::effective_add_headers(Some(loc), server) {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::try_from(k.as_str()),
+                HeaderValue::try_from(v.as_str()),
+            ) {
+                hm.insert(name, val);
+            }
+        }
+        if with_status_tag {
+            if let Ok(val) = HeaderValue::from_str(status_tag) {
+                hm.insert(HeaderName::from_static("x-cache-status"), val);
+            }
+        }
+    }
+    let len = body.len();
+    let resp = builder.body(full_body(body));
+    match resp {
+        Ok(mut r) => {
+            if let Ok(v) = HeaderValue::from_str(&len.to_string()) {
+                r.headers_mut().insert(CONTENT_LENGTH, v);
+            }
+            r
+        }
+        Err(_) => error_page(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 pub fn is_hop_by_hop(name: &str) -> bool {
