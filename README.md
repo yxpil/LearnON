@@ -172,6 +172,11 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   failures return `(nil, err)`, `return false` stops the interval (semantics aligned with official t/106/152/107)
 - Response filters: `header_filter_by_lua*` (mutate response headers / clear Content-Length before
   sending), `body_filter_by_lua*` (rewrite the response body via `ngx.arg[1]` chunk, `ngx.arg[2]` eof)
+- Log phase: `log_by_lua` / `log_by_lua_file` (runs after the response is formed, reads the final
+  `ngx.status` incl. 5xx and request info; its `ngx.say` writes go to a throwaway copy so they can't
+  alter the already-built response — verified by `tools/log_by_lua_e2e.py`)
+- Constants: `ngx.OK / ngx.ERROR`, log levels `ngx.STDERR/EMERG/ALERT/CRIT/ERR/WARN/NOTICE/INFO/DEBUG`
+  (OpenResty's numeric values, recognized by `ngx.log`), and the common `ngx.HTTP_*` status codes
 - cosocket: `ngx.socket.tcp()` with `connect/send/receive(*l|*a|n)/settimeout/close` — ops run in
   tokio tasks (no VM lock held) and yield to the scheduler, so many socket-bound requests share one
   VM concurrently; partial-data + timeout semantics mirror ngx_lua (`nil, err, partial`)

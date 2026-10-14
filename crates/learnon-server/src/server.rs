@@ -790,9 +790,40 @@ async fn handle_request(
     };
 
     let resp = process(&state, &mut ctx, &server, inbound).await;
+    // ---- LOG 阶段：log_by_lua / log_by_rust（响应已成形）。脚本在 ctx 的副本上运行，
+    // 其 ngx.say 等写入落到副本、不回灌已发送的 resp；失败只记日志，不改变响应。----
+    if let Some(loc) = Router::match_location(&server, ctx.effective_path()) {
+        let has_log = loc.lua_phases.iter().any(|(p, _, _)| *p == Phase::Log)
+            || loc.rust_phases.iter().any(|(p, _)| *p == Phase::Log);
+        if has_log {
+            ctx.status = resp.status().as_u16();
+            run_log_phase(&state, &mut ctx, loc).await;
+        }
+    }
     // conn_guards 到这里才释放：整个请求处理期间都占着并发额度
     drop(conn_guards);
     resp
+}
+
+/// 运行 LOG 阶段。rust 处理器直接用 &mut ctx；lua 在 ctx 的克隆上跑，避免影响已发送响应。
+async fn run_log_phase(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Location) {
+    for (p, spec) in &loc.rust_phases {
+        if *p != Phase::Log {
+            continue;
+        }
+        if let Err(e) = state.handlers.run_phase(Phase::Log, spec, ctx).await {
+            log_error!("log_by_rust '{}' 失败: {e}", spec.name);
+        }
+    }
+    for (p, name, src) in &loc.lua_phases {
+        if *p != Phase::Log {
+            continue;
+        }
+        let shared = Arc::new(Mutex::new(ctx.clone()));
+        if let Err(e) = state.lua.run_phase(name, src, Arc::clone(&shared)).await {
+            log_error!("{name} 执行失败: {e}");
+        }
+    }
 }
 
 /// 有界 + 超时的请求体读取（chunked 与定长都适用）

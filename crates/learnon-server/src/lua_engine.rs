@@ -2,15 +2,18 @@
 //!
 //! - VM：mlua (Lua 5.4)，按 CPU 核心组建 VM 池（每核心一个，对标 OpenResty 每 worker 一个 VM）。
 //!   每个 VM 由一个专属调度器任务持有锁，以「同步 resume 一段、段间释放锁」的协程方式并发
-//!   多条在途请求（对标 OpenResty 单 worker 内的 C10K）：请求脚本只在 ngx.sleep 处
+//!   多条在途请求（对标 OpenResty 单 worker 内的 C10K）：请求脚本在 ngx.sleep 与 cosocket op 处
 //!   coroutine.yield 让出，让出期间同 VM 的其它请求继续推进，锁在步与步之间释放以便
 //!   ngx.timer 回调与 tokio 睡眠定时器取得进展。
 //! - 非阻塞 I/O：ngx.sleep 与 ngx.socket.tcp() cosocket（connect/send/receive）都走同一套
 //!   「协程让出 + 调度器带结果 resume」机制——op 在 tokio 任务里跑，不持 VM 锁，完成后把
 //!   唤醒值 (op_id, [结果…]) 投回调度器，coroutine.yield 因此拿到返回值，实现单 VM 上的真并发。
+//! - 阶段：rewrite_by_lua / access_by_lua / content_by_lua / header_filter_by_lua /
+//!   body_filter_by_lua / log_by_lua（LOG 阶段在响应成形后于 ctx 副本上运行，输出不回灌响应）
 //! - API：ngx.say/print/status/exit/header/req.*/ctx/sleep/socket.tcp/time/log/
 //!   shared.DICT/redirect/exec/re.*/encode_base64/decode_base64/
-//!   escape_uri/unescape_uri/decode_args/encode_args/config —— 语义对齐 ngx_lua
+//!   escape_uri/unescape_uri/decode_args/encode_args/config/OK/ERROR/ERR/WARN/INFO…/HTTP_*
+//!   —— 语义对齐 ngx_lua
 //! - 请求状态放在 `Arc<Mutex<RequestCtx>>`，脚本通过 userdata 句柄读写；每次同步 resume
 //!   前按协程挂回各自的 __ctx / ngx.ctx（每请求一张表，跨让出保持），阶段结束后由 Rust 侧
 //!   继续接管同一个 ctx
@@ -688,14 +691,15 @@ impl LuaEngine {
                     (lvl, 1)
                 }
                 LuaValue::Integer(n) => {
-                    // 数字级别：0=debug, 1=info, 2=notice, 3=warn, 4=error, 5=crit
+                    // 数字级别：对齐 OpenResty ngx.STDERR/EMERG/.../DEBUG 常量取值
                     let lvl = match *n {
-                        0 => crate::log::Level::Debug,
-                        1 => crate::log::Level::Info,
-                        2 => crate::log::Level::Notice,
-                        3 => crate::log::Level::Warn,
-                        4 => crate::log::Level::Error,
-                        _ => crate::log::Level::Crit,
+                        -1 => crate::log::Level::Debug, // STDERR：当作最详细级落盘
+                        0..=2 => crate::log::Level::Crit, // EMERG/ALERT/CRIT
+                        3 => crate::log::Level::Error,  // ERROR
+                        4 => crate::log::Level::Warn,   // WARN
+                        5 => crate::log::Level::Notice, // NOTICE
+                        6 => crate::log::Level::Info,   // INFO
+                        _ => crate::log::Level::Debug,  // DEBUG 及以上
                     };
                     (lvl, 1)
                 }
@@ -1333,6 +1337,27 @@ impl LuaEngine {
         ngx.set("ctx", ctx_new)?;
 
         ngx.raw_set("version", env!("CARGO_PKG_VERSION"))?;
+
+        // ngx.* 常量 —— 日志级别（OpenResty 取值）+ 控制值 + 常用 HTTP 状态码
+        for (name, val) in [
+            ("STDERR", -1i64), ("EMERG", 0), ("ALERT", 1), ("CRIT", 2), ("ERR", 3),
+            ("WARN", 4), ("NOTICE", 5), ("INFO", 6), ("DEBUG", 7),
+            ("OK", 0i64), ("ERROR", -1i64),
+        ] {
+            ngx.raw_set(name, val)?;
+        }
+        for (name, code) in [
+            ("HTTP_OK", 200u16), ("HTTP_CREATED", 201), ("HTTP_ACCEPTED", 202),
+            ("HTTP_NO_CONTENT", 204), ("HTTP_MOVED_PERMANENTLY", 301), ("HTTP_MOVED_TEMPORARILY", 302),
+            ("HTTP_NOT_MODIFIED", 304), ("HTTP_BAD_REQUEST", 400), ("HTTP_UNAUTHORIZED", 401),
+            ("HTTP_FORBIDDEN", 403), ("HTTP_NOT_FOUND", 404), ("HTTP_REQUEST_TIMEOUT", 408),
+            ("HTTP_CONFLICT", 409), ("HTTP_UNPROCESSABLE_ENTITY", 422), ("HTTP_TOO_MANY_REQUESTS", 429),
+            ("HTTP_INTERNAL_SERVER_ERROR", 500), ("HTTP_BAD_GATEWAY", 502), ("HTTP_SERVICE_UNAVAILABLE", 503),
+            ("HTTP_GATEWAY_TIMEOUT", 504),
+        ] {
+            ngx.raw_set(name, code)?;
+        }
+
         lua.globals().set("ngx", ngx)?;
 
         Ok(())

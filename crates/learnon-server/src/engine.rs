@@ -220,11 +220,13 @@ pub enum Phase {
     Rewrite,
     Access,
     Content,
+    /// LOG：响应完成后运行（log_by_lua / log_by_rust），其输出被丢弃、不影响已发送的响应
+    Log,
 }
 
 impl Phase {
     pub fn directive_names() -> &'static [&'static str] {
-        &["rewrite_by_rust", "access_by_rust", "content_by_rust"]
+        &["rewrite_by_rust", "access_by_rust", "content_by_rust", "log_by_rust"]
     }
 
     pub fn from_directive(name: &str) -> Option<Phase> {
@@ -232,6 +234,7 @@ impl Phase {
             "rewrite_by_rust" => Some(Phase::Rewrite),
             "access_by_rust" => Some(Phase::Access),
             "content_by_rust" => Some(Phase::Content),
+            "log_by_rust" => Some(Phase::Log),
             _ => None,
         }
     }
