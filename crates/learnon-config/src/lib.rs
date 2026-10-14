@@ -48,11 +48,25 @@ pub struct Config {
     pub root: Directive,
 }
 
+/// nginx 完整布局兼容：顶层 http{} 的内容展平到根（LearnON 原生写法没有 http 包装），
+/// events{} 无对应语义直接丢弃。学习/迁移 nginx.conf 时二者可原样喂给 LearnON。
+fn flatten_nginx_wrapper(block: Vec<Directive>) -> Vec<Directive> {
+    let mut out: Vec<Directive> = Vec::with_capacity(block.len());
+    for d in block {
+        match d.name.as_str() {
+            "http" => out.extend(flatten_nginx_wrapper(d.block)),
+            "events" => {}
+            _ => out.push(d),
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         let tokens = lex(input)?;
         let mut parser = Parser { tokens, pos: 0 };
-        let block = parser.parse_block(None)?;
+        let block = flatten_nginx_wrapper(parser.parse_block(None)?);
         Ok(Config {
             root: Directive {
                 name: "root".to_string(),

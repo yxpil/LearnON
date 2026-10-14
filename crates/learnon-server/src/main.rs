@@ -71,6 +71,10 @@ struct Args {
     conf: PathBuf,
     /// -t：只校验配置（含证书），不启动服务
     test: bool,
+    /// -p <dir>：nginx 前缀目录（conf/日志/pid 的相对路径基准），nginx-tests 兼容
+    prefix: Option<PathBuf>,
+    /// -g "<directive; ...>"：命令行全局指令，合并进配置根部（可重复）
+    globals: Vec<String>,
 }
 
 const USAGE: &str = "\
@@ -79,6 +83,9 @@ learnon —— Rust 版 Nginx/OpenResty 风格网关
 用法: learnon [选项] [配置文件]
 
   -c <file>      指定配置文件（默认 conf/learnon.conf）
+  -p <dir>       前缀目录，配置内相对路径以此为基准（nginx 兼容）
+  -g <directives> 命令行全局指令，如 -g 'pid run.pid; error_log err.log warn;'
+  -e <file>      错误日志覆盖（接受并忽略，error_log 由 -g/conf 控制）
   -t             测试配置是否有效（含证书与限流引用），不启动
   -V             显示版本
   -h, --help     显示本帮助
@@ -87,6 +94,8 @@ learnon —— Rust 版 Nginx/OpenResty 风格网关
 fn parse_args() -> Result<Args, String> {
     let mut conf: Option<PathBuf> = None;
     let mut test = false;
+    let mut prefix: Option<PathBuf> = None;
+    let mut globals: Vec<String> = Vec::new();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -107,6 +116,27 @@ fn parse_args() -> Result<Args, String> {
                 conf = Some(PathBuf::from(p));
                 i += 1;
             }
+            "-p" | "--prefix" => {
+                let Some(p) = argv.get(i + 1) else {
+                    return Err("-p 需要一个目录路径".to_string());
+                };
+                prefix = Some(PathBuf::from(p));
+                i += 1;
+            }
+            "-g" => {
+                let Some(g) = argv.get(i + 1) else {
+                    return Err("-g 需要一个指令串".to_string());
+                };
+                globals.push(g.clone());
+                i += 1;
+            }
+            // Test::Nginx 固定传 `-e error.log`；错误日志目标由 conf/-g 的 error_log 决定
+            "-e" => {
+                if argv.get(i + 1).is_none() {
+                    return Err("-e 需要一个文件路径".to_string());
+                }
+                i += 1;
+            }
             other => {
                 if other.starts_with('-') {
                     return Err(format!("未知选项 '{other}'（-h 查看用法）"));
@@ -122,7 +152,23 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         conf: conf.unwrap_or_else(|| PathBuf::from("conf/learnon.conf")),
         test,
+        prefix,
+        globals,
     })
+}
+
+/// `-g 'a b; c d;'` 解析成指令并插到配置根部最前面（与 conf 同级指令冲突时命令行优先，
+/// 与 nginx 行为一致：-g 的值覆盖配置文件里的同名全局指令）
+fn merge_globals(config: &mut Config, globals: &[String]) -> Result<(), String> {
+    if globals.is_empty() {
+        return Ok(());
+    }
+    let text = globals.join(" ");
+    let extra = Config::parse(&text).map_err(|e| format!("-g 指令解析失败: {e}"))?;
+    let mut block = extra.root.block;
+    block.append(&mut config.root.block);
+    config.root.block = block;
+    Ok(())
 }
 
 fn main() {
@@ -139,19 +185,35 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let conf_path = args.conf.clone();
-    let base_dir = conf_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let conf_path = if let Some(pfx) = &args.prefix {
+        let raw = &args.conf;
+        if raw.is_absolute() {
+            raw.clone()
+        } else {
+            pfx.join(raw)
+        }
+    } else {
+        args.conf.clone()
+    };
+    let base_dir = match &args.prefix {
+        Some(pfx) => pfx.clone(),
+        None => conf_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
 
-    let config = match Config::load(&conf_path) {
+    let mut config = match Config::load(&conf_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[learnon] 配置加载失败 {conf_path:?}: {e}");
             std::process::exit(1);
         }
     };
+    if let Err(e) = merge_globals(&mut config, &args.globals) {
+        eprintln!("[learnon] {e}");
+        std::process::exit(1);
+    }
 
     // 日志器要最先初始化：之后所有模块的告警都走 error_log 而不是 stderr
     let _err_log = log::init(&config, &base_dir);
@@ -176,6 +238,11 @@ fn main() {
     for w in &router.warnings {
         log_warn!("{w}");
     }
+
+    let pid_path = config
+        .find("pid")
+        .and_then(|d| d.arg(0))
+        .map(|p| resolve_path(p, &base_dir));
 
     if args.test {
         std::process::exit(match check(&router, &settings) {
@@ -205,6 +272,7 @@ fn main() {
         base_dir,
         conf_path.display().to_string(),
         workers,
+        pid_path,
     )) {
         log_error!("启动失败: {e}");
         eprintln!("[learnon] 启动失败: {e}");
@@ -244,6 +312,7 @@ async fn run(
     base_dir: PathBuf,
     conf_display: String,
     workers: usize,
+    pid_path: Option<PathBuf>,
 ) -> Result<(), AppError> {
     let pool = UpstreamPool::parse_all(&config)?;
     let pool = Arc::new(pool);
@@ -281,6 +350,16 @@ async fn run(
     }
 
     let (tx, rx) = watch::channel(false);
+
+    // 全部端口绑定成功后再落 pid 文件：Test::Nginx 用 waitforfile(nginx.pid) 判定启动完成
+    if let Some(pp) = &pid_path {
+        if let Some(dir) = pp.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(pp, format!("{}\n", std::process::id())) {
+            log_warn!("写 pid 文件 {pp:?} 失败: {e}");
+        }
+    }
 
     // 后台维护：清理限流状态表里的闲置 key（防状态表随客户端数量膨胀）
     let maintain = {
