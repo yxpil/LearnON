@@ -393,6 +393,12 @@ enum ResumeVal {
     Int(i64),
     Str(String),
     Bytes(Vec<u8>),
+    /// 子请求（ngx.location.capture）结果：让出恢复时转成 {status=,body=,header=} 表
+    SubReq {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
 }
 
 /// 调度器内部：一个在途协程的 Rust 侧状态。
@@ -408,11 +414,17 @@ struct CoState {
 
 pub struct LuaEngine {
     /// Lua VM 池：每 CPU 核心一个独立 VM，VM 之间完全并行；
-    /// 每个 VM 内部由调度器以协程方式并发多条在途请求（对标 OpenResty 单 worker 内的 C10K）。
+    /// 每个 VM 内部由调度器以协程方式并发多条在途请求（对标 OpenResty 每 worker 一个 VM）。
     vms: Vec<Arc<VmSlot>>,
     /// 轮询游标（无锁）
     counter: AtomicUsize,
+    /// 子请求用的 AppState 晚绑定槽：LuaEngine 在 AppState 之前构造，故捕获
+    /// Weak<AppState> 只能在 main 建好 state 后回填（见 `bind_app_state`）。
+    subreq_slot: SubreqSlot,
 }
+
+/// 子请求晚句柄：安装 API 时各 VM 捕获其克隆，运行期升级成 `Arc<AppState>` 跑 run_capture。
+pub type SubreqSlot = Arc<std::sync::OnceLock<Weak<crate::server::AppState>>>;
 
 // ---------- 编解码工具（无第三方依赖的 base64 / percent-encoding） ----------
 
@@ -582,6 +594,7 @@ impl LuaEngine {
         // 进程级定时器计数（对标 lua_max_pending/running_timers 的每 worker 计数）
         let timer_pending = Arc::new(AtomicIsize::new(0));
         let timer_running = Arc::new(AtomicIsize::new(0));
+        let subreq_slot: SubreqSlot = Arc::new(std::sync::OnceLock::new());
         let mut vms: Vec<Arc<VmSlot>> = Vec::with_capacity(n);
         for _ in 0..n {
             let vm = Arc::new(VM::new(Lua::new()));
@@ -602,6 +615,7 @@ impl LuaEngine {
                     &timer_running,
                     &ev_tx,
                     &op_counter,
+                    &subreq_slot,
                 )?;
                 for (name, code) in &inits {
                     guard.load(code).set_name(name).exec()?;
@@ -624,7 +638,14 @@ impl LuaEngine {
         Ok(LuaEngine {
             vms,
             counter: AtomicUsize::new(0),
+            subreq_slot,
         })
+    }
+
+    /// 晚绑定 AppState：main 构造好 `Arc<AppState>` 后调用一次，把 Weak 句柄填进子请求槽。
+    /// 之前 capture 调用会安全地返回 status=0（LuaEngine 不可能在 state 就绪前收到请求）。
+    pub fn bind_app_state(&self, state: &Arc<crate::server::AppState>) {
+        let _ = self.subreq_slot.set(Arc::downgrade(state));
     }
 
     fn install_api(
@@ -635,6 +656,7 @@ impl LuaEngine {
         timer_running: &Arc<AtomicIsize>,
         ev_tx: &mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
         op_counter: &Arc<AtomicU64>,
+        subreq_slot: &SubreqSlot,
     ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
@@ -1089,6 +1111,61 @@ impl LuaEngine {
             .eval()?;
         cosocket_mod.call::<()>(socket.clone())?;
         ngx.set("socket", socket)?;
+
+        // ngx.location.capture(uri, opts?) —— 内部子请求（对标 OpenResty）。
+        // Rust 侧只提供「不 yield 的启动原语」_learnon_capture_start：读父 ctx、spawn
+        // 一个跑完整管线的 tokio 任务（经晚绑定的 AppState），把结果作为 SubReq 唤醒值投回
+        // 调度器；Lua 侧 coroutine.yield(op_id) 让出（不持 VM 锁），恢复时拿到 {status,body,header} 表。
+        {
+            let ev_tx = ev_tx.clone();
+            let counter = Arc::clone(op_counter);
+            let slot = Arc::clone(subreq_slot);
+            let capture_start = lua.create_function(move |lua, (uri, method): (String, String)| {
+                let h = get_ctx(lua)?;
+                let parent = h.0.lock().unwrap().clone();
+                let id = counter.fetch_add(1, Ordering::Relaxed);
+                let ev = ev_tx.clone();
+                let slot = Arc::clone(&slot);
+                tokio::spawn(async move {
+                    let payload = match slot.get().and_then(|w| w.upgrade()) {
+                        None => vec![ResumeVal::Nil, ResumeVal::Str("subrequests unavailable".into())],
+                        Some(state) => {
+                            match crate::server::run_capture(&state, &parent, &uri, &method).await {
+                                Ok(r) => vec![ResumeVal::SubReq {
+                                    status: r.status,
+                                    headers: r.headers,
+                                    body: r.body,
+                                }],
+                                Err(e) => vec![ResumeVal::Nil, ResumeVal::Str(e)],
+                            }
+                        }
+                    };
+                    let _ = ev.send((id, payload));
+                });
+                Ok(id)
+            })?;
+            lua.globals().set("_learnon_capture_start", capture_start)?;
+        }
+        let location_mod: LuaFunction = lua
+            .load(
+                r#"
+                return function()
+                    local function capture(uri, opts)
+                        local method = "GET"
+                        if opts and opts.method then method = tostring(opts.method) end
+                        local res = coroutine.yield(_learnon_capture_start(uri, method))
+                        if res == nil then
+                            return { status = 0, body = nil, header = {} }
+                        end
+                        return res
+                    end
+                    return { capture = capture }
+                end
+                "#,
+            )
+            .eval()?;
+        let location_tbl: LuaTable = location_mod.call(())?;
+        ngx.set("location", location_tbl)?;
 
         // ngx.req.* —— 请求信息
         let req = lua.create_table()?;
@@ -1609,6 +1686,21 @@ fn resume_val_to_lua(lua: &Lua, v: ResumeVal) -> LuaResult<LuaValue> {
         ResumeVal::Int(i) => LuaValue::Integer(i),
         ResumeVal::Str(s) => LuaValue::String(lua.create_string(s)?),
         ResumeVal::Bytes(b) => LuaValue::String(lua.create_string(&b)?),
+        ResumeVal::SubReq {
+            status,
+            headers,
+            body,
+        } => {
+            let t = lua.create_table()?;
+            t.set("status", status as i64)?;
+            t.set("body", lua.create_string(&body)?)?;
+            let ht = lua.create_table()?;
+            for (k, val) in headers {
+                ht.set(k, val)?;
+            }
+            t.set("header", ht)?;
+            LuaValue::Table(t)
+        }
     })
 }
 

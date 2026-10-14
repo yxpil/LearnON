@@ -340,6 +340,9 @@ async fn run(
         permits: server::permits_for(&settings),
     });
 
+    // 子请求（ngx.location.capture）晚绑定：LuaEngine 早于 AppState 构造，这里回填其运行句柄
+    state.lua.bind_app_state(&state);
+
     // 运行时指标单例：记录 worker_connections 容量与进程启动时刻，供 /metrics 渲染
     crate::metrics::global(settings.worker_connections);
 

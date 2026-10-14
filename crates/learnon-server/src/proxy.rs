@@ -616,6 +616,8 @@ mod tests {
             internal_request: false,
             filter_chunk: None,
             filter_eof: false,
+            listener: None,
+            capture_depth: 0,
         }
     }
 

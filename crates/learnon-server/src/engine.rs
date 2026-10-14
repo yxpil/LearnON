@@ -8,6 +8,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -55,6 +56,10 @@ pub struct RequestCtx {
     /// body_filter_by_lua 参数：ngx.arg[1]=chunk, ngx.arg[2]=eof
     pub filter_chunk: Option<Vec<u8>>,
     pub filter_eof: bool,
+    /// 本请求所属监听端点地址；子请求（ngx.location.capture）据此重新匹配 vhost
+    pub listener: Option<SocketAddr>,
+    /// 子请求嵌套深度（ngx.location.capture 的循环/超深防护）
+    pub capture_depth: u8,
 }
 
 impl RequestCtx {
@@ -88,6 +93,8 @@ impl RequestCtx {
             internal_request: true,
             filter_chunk: None,
             filter_eof: false,
+            listener: None,
+            capture_depth: 0,
         }
     }
 

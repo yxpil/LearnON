@@ -183,6 +183,12 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - cosocket: `ngx.socket.tcp()` with `connect/send/receive(*l|*a|n)/settimeout/close` — ops run in
   tokio tasks (no VM lock held) and yield to the scheduler, so many socket-bound requests share one
   VM concurrently; partial-data + timeout semantics mirror ngx_lua (`nil, err, partial`)
+- Subrequests: `ngx.location.capture(uri, opts?)` → `{ status, body, header }` (and `opts.method`) —
+  runs the *full* pipeline for the captured location (rewrite → access → content: static / `return` /
+  `proxy_pass` / nested Lua all work) as an internal subrequest against the same vhost, then yields to
+  the VM scheduler (like the cosocket ops) so the parent coroutine and other in-flight requests keep
+  progressing; nested captures are supported with a depth guard (`status = 0` on overflow, mirroring
+  ngx_lua's error sentinel). Verified by `tools/subrequest_e2e.py`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 
 ## E2E tests (aligned with the OpenResty official suite)
@@ -280,12 +286,25 @@ Already done (previously listed as gaps, now implemented):
   `WWW-Authenticate: Basic realm=…` challenge, correct `{SHA}`/`$apr1$`/plaintext logins → `200`,
   `deny all` → `403`, `allow 127.0.0.1/32` matches the loopback client.) crypt-DES and bcrypt
   (`$2y$`) htpasswd records are not yet supported.
+- **Subrequests (`ngx.location.capture`)**: a captured location runs the entire request pipeline
+  (rewrite → access → content: static, `return`, `proxy_pass`, and nested Lua content all work) as an
+  internal subrequest resolved against the parent's vhost, returning a `{ status, body, header }`
+  table. It is a scheduler yield point (`coroutine.yield(op_id)`) exactly like the cosocket ops — the
+  subrequest runs in a tokio task that reaches `AppState` through a late-bound `Weak<AppState>` handle
+  (the Lua engine is constructed before `AppState`, so main.rs binds it after startup) — so the parent
+  coroutine releases the VM lock and other in-flight requests keep progressing. Nested captures work
+  because a subrequest's own Lua re-enters the scheduler without deadlock, and a `capture_depth` guard
+  caps runaway recursion (returns `status = 0`, the ngx_lua error sentinel). `internal;` locations are
+  reachable only via capture, not from the client. (`server.rs::run_capture`, `lua_engine.rs`,
+  verified by `tools/subrequest_e2e.py`: Lua/return/query/404 captures, a two-level nested capture, a
+  self-referential capture hitting the depth guard, and an external request to an `internal` location
+  still returning 404.) `share_all_vars`/`ctx` option passing is not yet implemented.
 
 Remaining tradeoffs / roadmap:
 
 - **Cosocket coverage**: `ngx.socket.tcp` runs `connect/send/receive(*l|*a|n)/settimeout/close` as
   scheduler yield points (see the API section above), but not yet `receiveany`, the timed `*l` third
-  return variant, `connect` over SSL (`ssl:connect`), or `ngx.socket.udp`. Subrequests
-  (`ngx.location.capture`) and `balancer_by_lua` remain open.
+  return variant, `connect` over SSL (`ssl:connect`), or `ngx.socket.udp`. `balancer_by_lua` and
+  `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open.
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).

@@ -732,6 +732,8 @@ async fn handle_request(
         internal_request: false,
         filter_chunk: None,
         filter_eof: false,
+        listener: Some(meta.listener),
+        capture_depth: 0,
     };
 
     // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
@@ -860,6 +862,91 @@ async fn read_body(body: Incoming, limit: Option<u64>, timeout: Duration) -> Res
     Ok(Bytes::from(out))
 }
 
+/// 子请求（`ngx.location.capture`）的捕获结果：状态码 + 响应头 + 完整响应体。
+pub struct CaptureResult {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// 子请求最大嵌套深度（对标 nginx 的子请求计数上限，防 capture 递归成环）。
+const MAX_CAPTURE_DEPTH: u8 = 10;
+
+/// 运行一个内部子请求：在与父请求相同的 vhost 下，对 `uri` 跑完整请求管线
+/// （rewrite → access → content：静态/return/proxy/嵌套 Lua 皆可），收集响应体返回。
+/// 由 Lua 的 capture op 任务在 tokio 任务里调用（父协程此刻已 yield、不持 VM 锁）。
+pub async fn run_capture(
+    state: &Arc<AppState>,
+    parent: &RequestCtx,
+    uri: &str,
+    method: &str,
+) -> Result<CaptureResult, String> {
+    if parent.capture_depth >= MAX_CAPTURE_DEPTH {
+        return Err("subrequest capture depth limit exceeded".to_string());
+    }
+    let listener = parent
+        .listener
+        .ok_or_else(|| "subrequest: parent has no listener".to_string())?;
+    // 拆出 path/query 并归一化（与主请求入口一致：解码 + dot-segment 消除）
+    let (raw_path, query) = match uri.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (uri.to_string(), String::new()),
+    };
+    let path = decode_and_normalize(&raw_path).ok_or_else(|| "subrequest: invalid uri".to_string())?;
+    let server = state
+        .router
+        .match_server(listener, parent.host.as_deref())
+        .map(Arc::clone)
+        .ok_or_else(|| "subrequest: no matching server".to_string())?;
+
+    // 子请求 ctx：继承父请求的连接画像（host/remote/scheme/listener），但用独立的
+    // path/query/uri/method；内部请求标记为真（可命中 internal location），无请求体。
+    let mut ctx = RequestCtx {
+        method: method.to_string(),
+        path,
+        query,
+        uri: uri.to_string(),
+        host: parent.host.clone(),
+        remote_addr: parent.remote_addr.clone(),
+        remote_port: parent.remote_port,
+        server_port: parent.server_port,
+        req_headers: parent.req_headers.clone(),
+        resp_headers: Vec::new(),
+        rewritten_path: None,
+        status: 200,
+        body: None,
+        done: false,
+        internal_redirect: false,
+        req_body: Vec::new(),
+        exec_depth: 0,
+        redirect: None,
+        scheme: parent.scheme.clone(),
+        internal_request: true,
+        filter_chunk: None,
+        filter_eof: false,
+        listener: Some(listener),
+        capture_depth: parent.capture_depth + 1,
+    };
+
+    let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None)).await;
+    let (parts, body) = resp.into_parts();
+    let collected = body
+        .collect()
+        .await
+        .map_err(|e| format!("subrequest body collect failed: {e}"))?
+        .to_bytes();
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    Ok(CaptureResult {
+        status: parts.status.as_u16(),
+        headers,
+        body: collected.to_vec(),
+    })
+}
+
 async fn process(
     state: &Arc<AppState>,
     ctx: &mut RequestCtx,
@@ -867,7 +954,6 @@ async fn process(
     body: ProxyBody,
 ) -> BoxResponse {
     // ---- REWRITE / POST_REWRITE / PREACCESS / ACCESS 循环 ----
-    // rewrite ... last、ngx.exec、try_files 兜底都会重新匹配 location（最多 10 跳）
     let mut current_loc: Option<&Location> = None;
     // 停在"还在跳转"状态跑满 10 跳 = 配置成环（nginx: rewrite or internal redirection cycle → 500）
     let mut cycle = false;
@@ -1940,6 +2026,8 @@ async fn handle_upgrade(
         internal_request: false,
         filter_chunk: None,
         filter_eof: false,
+        listener: Some(meta.listener),
+        capture_depth: 0,
     };
 
     let timeouts = ProxyTimeouts {
