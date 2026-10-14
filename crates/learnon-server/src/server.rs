@@ -71,7 +71,9 @@ const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_CONCURRENT_STREAMS: u32 = 128;
 
 pub struct AppState {
-    pub router: Router,
+    /// 路由表放在热交换的 RwLock<Arc<Router>> 里：热重载任务只换这个 Arc，
+    /// 每个请求开头取一次快照（Arc clone），在途请求继续用旧快照跑完 → 零停机。
+    pub router: std::sync::RwLock<Arc<Router>>,
     pub handlers: Arc<HandlerRegistry>,
     pub lua: Arc<LuaEngine>,
     pub proxy: Arc<ProxyEngine>,
@@ -81,6 +83,26 @@ pub struct AppState {
     pub limits: Arc<crate::limit::Limits>,
     /// 全局并发连接额度（worker_connections）
     pub permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl AppState {
+    /// 取当前路由表快照：热重载只替换其中的 Arc，这里读锁极短（仅克隆 Arc），
+    /// 绝不跨越 await 持锁。在途请求持有旧快照即可跑完，实现零停机。
+    pub fn routing(&self) -> Arc<Router> {
+        self.router
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 热重载：原子替换路由表（写锁只覆盖一次 Arc 赋值）。
+    pub fn swap_router(&self, next: Router) {
+        let mut w = self
+            .router
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *w = Arc::new(next);
+    }
 }
 
 /// 一条连接的可共享元信息（TLS/SNI 决定 scheme，vhost 匹配决定用哪个地址）
@@ -738,7 +760,8 @@ async fn handle_request(
         .get(HOST_NAME)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let server = match state.router.match_server(meta.listener, host.as_deref()) {
+    let router = state.routing();
+    let server = match router.match_server(meta.listener, host.as_deref()) {
         Some(s) => Arc::clone(s),
         None => return error_page(StatusCode::NOT_FOUND),
     };
@@ -927,8 +950,8 @@ pub async fn run_capture(
         None => (uri.to_string(), String::new()),
     };
     let path = decode_and_normalize(&raw_path).ok_or_else(|| "subrequest: invalid uri".to_string())?;
-    let server = state
-        .router
+    let router = state.routing();
+    let server = router
         .match_server(listener, parent.host.as_deref())
         .map(Arc::clone)
         .ok_or_else(|| "subrequest: no matching server".to_string())?;
@@ -2202,7 +2225,8 @@ async fn handle_upgrade(
         .get(HOST_NAME)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let server = match state.router.match_server(meta.listener, host.as_deref()) {
+    let router = state.routing();
+    let server = match router.match_server(meta.listener, host.as_deref()) {
         Some(s) => Arc::clone(s),
         None => return error_page(StatusCode::NOT_FOUND),
     };

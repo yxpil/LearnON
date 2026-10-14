@@ -16,6 +16,7 @@
 //! gzip_min_length 20;
 //! gzip_comp_level 1;
 //! gzip_types text/css application/json;
+//! reload 2s;
 //! ```
 
 use std::time::Duration;
@@ -44,6 +45,9 @@ pub struct Settings {
     pub accept_backlog: u32,
     /// 响应 gzip 压缩参数
     pub gzip: GzipSettings,
+    /// `reload <interval>;`：配置热重载的轮询间隔（mtime 变化才真正重载）。
+    /// None = 不自动重载（unix 仍可用 SIGHUP 触发），Some(d) = 每 d 检查一次配置。
+    pub reload: Option<Duration>,
 }
 
 /// 响应体 gzip 压缩配置（对标 nginx ngx_http_gzip_module）
@@ -121,6 +125,7 @@ impl Default for Settings {
             tcp_nodelay: true,
             accept_backlog: 512,
             gzip: GzipSettings::default(),
+            reload: None,
         }
     }
 }
@@ -234,6 +239,21 @@ impl Settings {
             s.gzip.types = types;
         }
 
+        // reload：配置热重载轮询间隔。`reload 2s;` 每 2s 检查 mtime；`reload on;` 默认 1s；
+        // `reload off;`（默认）不自动重载，但 unix 仍可用 SIGHUP 触发。
+        if let Some(v) = config.find("reload").and_then(|d| d.arg(0)) {
+            match v.to_ascii_lowercase().as_str() {
+                "off" => s.reload = None,
+                "on" => s.reload = Some(Duration::from_secs(1)),
+                other => match parse_duration(other) {
+                    Some(d) => s.reload = Some(d.max(Duration::from_millis(200))),
+                    None => warnings.push(format!(
+                        "reload 取值非法: {other}（应为 on/off 或时长，如 2s）"
+                    )),
+                },
+            }
+        }
+
         // hyper 的 http1 只有一个读头超时，它同时覆盖"慢速发头"与"keep-alive 空闲"，
         // 因此取两者较大值：否则 keep-alive 空闲会被 header 超时提前掐断导致频繁重连。
         s.client_header_timeout = s.client_header_timeout.max(s.keepalive_timeout);
@@ -296,6 +316,26 @@ mod tests {
         assert!(!s.gzip.enabled); // 非法 on/off → 保持默认 off
         assert_eq!(s.gzip.comp_level, 1); // 越界级别被忽略
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn reload_parses_variants() {
+        let (s, _) = Settings::from_config(&Config::parse("").unwrap());
+        assert_eq!(s.reload, None); // 默认不自动重载
+
+        let (s, _) = Settings::from_config(&Config::parse("reload on;").unwrap());
+        assert_eq!(s.reload, Some(Duration::from_secs(1)));
+
+        let (s, _) = Settings::from_config(&Config::parse("reload 2s;").unwrap());
+        assert_eq!(s.reload, Some(Duration::from_secs(2)));
+
+        // 下限：过短的间隔被抬到 200ms，避免忙轮询
+        let (s, _) = Settings::from_config(&Config::parse("reload 50ms;").unwrap());
+        assert_eq!(s.reload, Some(Duration::from_millis(200)));
+
+        let (s, warnings) = Settings::from_config(&Config::parse("reload banana;").unwrap());
+        assert_eq!(s.reload, None);
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]

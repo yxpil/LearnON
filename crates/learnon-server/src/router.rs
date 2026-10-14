@@ -407,6 +407,25 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
 
 impl Router {
     pub fn build(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
+        Self::build_with_listeners(config, base_dir, None)
+    }
+
+    /// 热重载：复用进程已绑定的监听集合，只按新配置重建 vhost/location 路由表。
+    /// reload 期间从不触碰 listen socket（无 accept 空窗），因此新增/改动的
+    /// server/location 对新请求立即生效；配置里新引入的监听地址不会被绑定（需重启）。
+    pub fn rebuild_routing(
+        config: &Config,
+        base_dir: &PathBuf,
+        listeners: &[Listener],
+    ) -> Result<Self, AppError> {
+        Self::build_with_listeners(config, base_dir, Some(listeners.to_vec()))
+    }
+
+    fn build_with_listeners(
+        config: &Config,
+        base_dir: &PathBuf,
+        listener_override: Option<Vec<Listener>>,
+    ) -> Result<Self, AppError> {
         let mut warnings: Vec<String> = Vec::new();
         // addr -> servers
         let mut groups: HashMap<SocketAddr, Vec<Arc<Server>>> = HashMap::new();
@@ -594,7 +613,7 @@ impl Router {
 
         Ok(Router {
             groups: out_groups,
-            listeners,
+            listeners: listener_override.unwrap_or(listeners),
             warnings,
         })
     }
@@ -1554,5 +1573,51 @@ mod tests {
         let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
         assert_eq!(r.match_server(a, Some("unknown.com")).unwrap().server_name, "chosen");
         assert_eq!(r.match_server(a, None).unwrap().server_name, "chosen");
+    }
+
+    #[test]
+    fn rebuild_routing_updates_locations_but_keeps_bound_listeners() {
+        let base = r#"
+            server {
+                listen 127.0.0.1:18090;
+                server_name reload.test;
+                location = /x { return 200 "old"; }
+            }
+        "#;
+        let r0 = build(base);
+        // 模拟进程实际绑定的监听集合（reload 期间不得改变）
+        let bound = r0.listeners.clone();
+
+        let updated = r#"
+            server {
+                listen 127.0.0.1:18090;
+                server_name reload.test;
+                location = /x { return 200 "new"; }
+                location = /added { return 200 "added"; }
+            }
+        "#;
+        let r1 = Router::rebuild_routing(&cfg(updated), &PathBuf::from("."), &bound).unwrap();
+
+        let a: SocketAddr = "127.0.0.1:18090".parse().unwrap();
+        // 路由表更新：新增的 location 现在能命中，正文也换成新值
+        let srv = r1.match_server(a, Some("reload.test")).unwrap();
+        let loc = Router::match_location(srv, "/added").unwrap();
+        assert!(loc.ret.as_ref().and_then(|r| r.text.as_ref()).is_some_and(|b| b.contains("added")));
+        let loc_x = Router::match_location(srv, "/x").unwrap();
+        assert!(loc_x.ret.as_ref().and_then(|r| r.text.as_ref()).is_some_and(|b| b.contains("new")));
+
+        // 监听集合原样保留（即便新配置里没提这个地址，也不新增/删除 socket）
+        let addrs = |ls: &[Listener]| ls.iter().map(|l| l.addr).collect::<Vec<_>>();
+        assert_eq!(addrs(&r1.listeners), addrs(&bound));
+
+        // 新配置引入了一个**未绑定**的监听地址：rebuild_routing 不应把它加进来
+        let with_new_port = r#"
+            server { listen 127.0.0.1:18090; location = /x { return 200 "a"; } }
+            server { listen 127.0.0.1:18099; location = /x { return 200 "b"; } }
+        "#;
+        let r2 = Router::rebuild_routing(&cfg(with_new_port), &PathBuf::from("."), &bound).unwrap();
+        assert_eq!(addrs(&r2.listeners), addrs(&bound), "热重载不绑定新监听地址（需重启）");
+        // 已绑定的 18090 仍能正常路由
+        assert!(r2.match_server(a, None).is_some());
     }
 }

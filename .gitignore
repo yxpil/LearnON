@@ -8,7 +8,9 @@
 
 # 运行日志
 /logs/
+/conf/logs/
 *.log
+*.pid
 
 # 临时脚本与输出
 _*.py

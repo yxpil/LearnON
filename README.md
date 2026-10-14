@@ -75,6 +75,7 @@ all gateway logic is hand-written.
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
 | HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
+| `SIGHUP` graceful config reload | in-process hot swap of the routing table behind `RwLock<Arc<Router>>`; listeners never rebound (no accept gap), per-request snapshot, invalid config keeps old; portable `reload <interval>;` mtime poll | `server.rs`, `main.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
 | `init_by_lua` | runs once at startup | `lua_engine.rs` |
 | `lua_shared_dict` / `ngx.shared.DICT` | cross-request shared dict: get/set/add/replace/delete/incr/ttl/flush_all | `shared_dict.rs` |
@@ -339,6 +340,22 @@ Already done (previously listed as gaps, now implemented):
   cleartext h2c and TLS-ALPN h2 both return the configured bodies, HTTP/1.1 still works on the same
   cleartext port, and 3 concurrent streams on one h2 connection all reach `200`.)
   HTTP/2 to *upstreams* (h2 `proxy_pass`) and `server_tokens`/hpack tuning remain open.
+- **Zero-downtime config hot-reload**: the routing table lives behind an
+  `RwLock<Arc<Router>>` in `AppState`; every request takes a one-time snapshot of that `Arc`, and a
+  background reload task swaps it for a freshly built one. On unix, `SIGHUP` triggers the reload
+  (`SIGUSR1` still reopens logs; only `SIGTERM`/`SIGINT` shut down); on every platform a top-level
+  `reload <interval>;` (e.g. `reload 2s;`, or `reload on;` = 1s) makes the task poll the main config's
+  mtime and reload only when it changes. The reload rebuilds only the vhost/location table
+  (`Router::rebuild_routing`) and reuses the process's already-bound listener set, so **no socket is ever
+  closed or rebound** — there is no accept gap, existing keep-alive connections are never dropped, and
+  new requests immediately hit the new routing (a connection sees the change on its very next request). A
+  config that fails to parse or build is rejected and the old routing keeps serving. Reload does not
+  re-bind newly-added `listen` addresses and does not re-apply `-g` globals or process-global runtime
+  knobs (`worker_connections`, TLS acceptors) — those still need a restart.
+  (Verified by `tools/hotreload_e2e.py`: a single never-reconnecting connection observes `v1→v2→v3` as the
+  conf is edited in place; a fresh connection opened every 40ms records zero failures across the whole
+  reload window (no accept gap); an intentionally broken (unbalanced-brace) config leaves the old routing
+  serving and is not adopted; the child process stays alive with an unchanged pid file throughout.)
 
 Remaining tradeoffs / roadmap:
 

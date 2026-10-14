@@ -275,7 +275,7 @@ fn main() {
         settings,
         limits,
         base_dir,
-        conf_path.display().to_string(),
+        conf_path,
         workers,
         pid_path,
     )) {
@@ -315,10 +315,11 @@ async fn run(
     settings: Settings,
     limits: Arc<limit::Limits>,
     base_dir: PathBuf,
-    conf_display: String,
+    conf_path: PathBuf,
     workers: usize,
     pid_path: Option<PathBuf>,
 ) -> Result<(), AppError> {
+    let conf_display = conf_path.display().to_string();
     let pool = UpstreamPool::parse_all(&config)?;
     let pool = Arc::new(pool);
     let handlers = Arc::new(HandlerRegistry::with_builtins());
@@ -339,7 +340,7 @@ async fn run(
     }
 
     let state = Arc::new(server::AppState {
-        router,
+        router: std::sync::RwLock::new(Arc::new(router)),
         handlers,
         lua,
         proxy,
@@ -406,7 +407,20 @@ async fn run(
     // 主动健康检查：配了 health_check 的 upstream 各起一个后台探测任务
     let health = pool.spawn_health_checks(rx.clone());
 
-    let signals = spawn_signal_handlers(tx.clone());
+    // 配置热重载：SIGHUP（unix）或 `reload <interval>` 轮询触发，原子替换路由表而不动
+    // 已绑定监听（无 accept 空窗）。任务常驻，未配 reload 时也支持 SIGHUP。
+    let reload_notify = Arc::new(tokio::sync::Notify::new());
+    let reload = {
+        let state = Arc::clone(&state);
+        let conf_path = conf_path.clone();
+        let base_dir = base_dir.clone();
+        let listeners = listener_specs.clone();
+        let notify = Arc::clone(&reload_notify);
+        let poll = settings.reload;
+        spawn_reload_task(state, conf_path, base_dir, listeners, poll, notify, rx.clone())
+    };
+
+    let signals = spawn_signal_handlers(tx.clone(), reload_notify.clone());
 
     let mut tasks = tokio::task::JoinSet::new();
     for (l, tcp) in bound {
@@ -418,7 +432,7 @@ async fn run(
         "[learnon] 启动完成：{} 个监听，{workers} 个 worker 线程，配置 {conf_display}",
         listener_specs.len()
     );
-    for line in state.router.describe_listeners() {
+    for line in state.routing().describe_listeners() {
         log_info!("监听 {line}");
     }
     for line in limits.describe() {
@@ -434,6 +448,7 @@ async fn run(
     // 所有 accept 循环在停机信号后置位并排空在途连接，这里等它们自然结束
     while tasks.join_next().await.is_some() {}
     maintain.abort();
+    reload.abort();
     for h in health {
         h.abort();
     }
@@ -448,8 +463,11 @@ async fn run(
     Ok(())
 }
 
-/// 停机信号：unix 用 SIGTERM/SIGINT（+ SIGHUP/SIGUSR1 重开日志），windows 用 Ctrl+C
-fn spawn_signal_handlers(tx: watch::Sender<bool>) -> Option<tokio::task::JoinHandle<()>> {
+/// 停机信号：unix 用 SIGTERM/SIGINT 优雅停机，SIGHUP 热重载配置（+ 重开日志），SIGUSR1 重开日志；windows 用 Ctrl+C
+fn spawn_signal_handlers(
+    tx: watch::Sender<bool>,
+    reload: Arc<tokio::sync::Notify>,
+) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
         Some(tokio::spawn(async move {
@@ -460,21 +478,28 @@ fn spawn_signal_handlers(tx: watch::Sender<bool>) -> Option<tokio::task::JoinHan
             let mut user1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 注册失败");
             loop {
                 tokio::select! {
-                    _ = terminate.recv() => log_info!("收到 SIGTERM，开始优雅停机"),
-                    _ = interrupt.recv() => log_info!("收到 SIGINT，开始优雅停机"),
-                    // nginx: reopen_log_file / kill -USR1
-                    _ = hangup.recv() => { log::reopen(); access_log::reopen(); log_info!("SIGHUP：日志已重新打开") }
-                    _ = user1.recv() => { log::reopen(); access_log::reopen(); log_info!("SIGUSR1：日志已重新打开") }
+                    _ = terminate.recv() => { log_info!("收到 SIGTERM，开始优雅停机"); break; }
+                    _ = interrupt.recv() => { log_info!("收到 SIGINT，开始优雅停机"); break; }
+                    // nginx: SIGHUP = 重载配置（这里同时重开日志）；SIGUSR1 = 仅重开日志
+                    _ = hangup.recv() => {
+                        log::reopen();
+                        access_log::reopen();
+                        log_info!("收到 SIGHUP：重开日志并热重载配置");
+                        reload.notify_one();
+                    }
+                    _ = user1.recv() => {
+                        log::reopen();
+                        access_log::reopen();
+                        log_info!("收到 SIGUSR1：日志已重新打开");
+                    }
                 }
-                if *tx.borrow() {
-                    continue;
-                }
-                let _ = tx.send(true);
             }
+            let _ = tx.send(true);
         }))
     }
     #[cfg(not(unix))]
     {
+        let _ = reload; // Windows 无信号式重载；用 conf 的 `reload <interval>;` 轮询
         Some(tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             log_info!("收到 Ctrl+C，开始优雅停机");
@@ -484,5 +509,71 @@ fn spawn_signal_handlers(tx: watch::Sender<bool>) -> Option<tokio::task::JoinHan
             log_warn!("再次收到中断信号，强制退出");
             std::process::exit(1);
         }))
+    }
+}
+
+/// 配置热重载后台任务：监听 SIGHUP 通知与（可选）`reload <interval>` 轮询；
+/// 检测到主配置文件 mtime 变化即重建路由表并原子替换（Router::rebuild_routing 复用
+/// 已绑定的监听集合，绝不 rebind socket → 无 accept 空窗）。构建失败则保留旧路由并记日志。
+fn spawn_reload_task(
+    state: Arc<server::AppState>,
+    conf_path: PathBuf,
+    base_dir: PathBuf,
+    listeners: Vec<router::Listener>,
+    poll: Option<Duration>,
+    notify: Arc<tokio::sync::Notify>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // 未配 reload 时只等 SIGHUP；给轮询兜一个长间隔，SIGHUP 仍能即时唤醒
+        let poll = poll.unwrap_or_else(|| Duration::from_secs(3600));
+        let mut tick = tokio::time::interval(poll);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last = conf_mtime(&conf_path);
+        loop {
+            let from_signal = tokio::select! {
+                _ = notify.notified() => true,
+                _ = tick.tick() => false,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            // 轮询触发时以 mtime 变化为准；SIGHUP 触发时无条件尝试
+            if !from_signal && conf_mtime(&conf_path) == last {
+                continue;
+            }
+            do_reload(&state, &conf_path, &base_dir, &listeners);
+            last = conf_mtime(&conf_path);
+        }
+    })
+}
+
+fn conf_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// 真正执行一次重载：重新读盘 → 仅重建路由（保留监听）→ 成功则原子替换，失败保留旧配置。
+fn do_reload(
+    state: &Arc<server::AppState>,
+    conf_path: &PathBuf,
+    base_dir: &PathBuf,
+    listeners: &[router::Listener],
+) {
+    match learnon_config::Config::load(conf_path) {
+        Err(e) => log_error!("热重载失败：配置解析出错，保持旧配置继续服务: {e}"),
+        Ok(cfg) => match router::Router::rebuild_routing(&cfg, base_dir, listeners) {
+            Err(e) => log_error!("热重载失败：路由构建出错，保持旧配置继续服务: {e}"),
+            Ok(new_router) => {
+                let warnings = new_router.warnings.clone();
+                state.swap_router(new_router);
+                for w in warnings {
+                    log_warn!("热重载告警: {w}");
+                }
+                log_info!("热重载完成：路由表已原子替换（监听未变动，无停机）");
+            }
+        },
     }
 }
