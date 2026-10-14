@@ -8,9 +8,11 @@
 //! - `proxy_next_upstream error timeout ...` 决定是否换节点重试
 //!
 //! 与 nginx 的差异（有意为之，避免踩坑）：
-//! - 请求体先缓冲再转发（Lua/限流/体大小检查都需要完整体），因此
-//!   `proxy_send_timeout` 无法单独生效；响应体仍是流式转发。
-//! - 转发时重算 `Content-Length`：客户端谎报长度或同时带 TE/CL 时不能把畸形透传给后端。
+//! - 默认先把请求体缓冲完整再转发（Lua/限流/体大小检查都需要完整体）；
+//!   `proxy_request_buffering off` 的 proxy location 改为边收边转发（流式，见 `ProxyBody::Streaming`），
+//!   此时 Lua 读不到请求体、且无法换节点重试（字节一旦发给后端就不能回放），与 nginx 语义一致。
+//! - 转发时的 `Content-Length`：缓冲路径按真实字节数重算（客户端谎报长度时不透传畸形）；
+//!   流式路径由 hyper 依据转发体的 `size_hint` 重新决定成帧。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +25,8 @@ use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -31,7 +34,32 @@ use crate::engine::RequestCtx;
 use crate::upstream::{KeepaliveOpts, UpstreamGuard, UpstreamPool};
 use crate::{log_warn, log_info};
 
-type HyperClient = Client<HttpConnector, Full<Bytes>>;
+/// 转发请求体统一擦除成 BoxBody：缓冲路径塞 `Full<Bytes>`，流式路径塞客户端的 `Incoming`，
+/// 二者共用同一套连接池客户端（`Client` 的请求体类型是编译期固定的）。
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type ProxyReqBody = BoxBody<Bytes, BoxError>;
+type HyperClient = Client<HttpConnector, ProxyReqBody>;
+
+fn full_boxed(b: Bytes) -> ProxyReqBody {
+    Full::new(b)
+        .map_err(|e| match e {})
+        .boxed()
+}
+
+fn incoming_boxed(inc: Incoming) -> ProxyReqBody {
+    inc.map_err(|e| Box::new(e) as BoxError).boxed()
+}
+
+/// 转发给后端的请求体来源。
+/// - `Buffered`：整体已在内存里，可按 Content-Length 精确重发，因此允许换节点重试
+/// - `Streaming`：直接把客户端的 `Incoming` 管道给后端，边收边发、内存 O(1)；
+///   字节一旦被后端消费就无法回放，故流式路径不参与换节点重试（对齐 nginx
+///   `proxy_request_buffering off`）
+pub enum ProxyBody {
+    Buffered(Option<Bytes>),
+    Streaming(Option<Incoming>),
+}
+
 
 /// 每个代理 location 的超时（连接级 + 读响应头级）
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +128,7 @@ impl ProxyEngine {
         target: &str,
         loc_prefix: &str,
         opts: &ProxyOpts<'_>,
-        raw_body: Option<Bytes>,
+        mut body: ProxyBody,
     ) -> Result<Response<Incoming>, String> {
         if target.starts_with("https://") {
             return Err(
@@ -198,12 +226,21 @@ impl ProxyEngine {
             }
         }
 
-        // 请求体已由 server 层缓冲后传入：Content-Length 按真实字节数重算
-        let body_bytes = raw_body.unwrap_or_default();
-        if !(ctx.is_bodyless_method() || body_bytes.is_empty()) {
-            if let Ok(v) = HeaderValue::try_from(body_bytes.len().to_string()) {
-                headers.insert(CONTENT_LENGTH, v);
+        // 请求体来源决定转发方式：
+        // - Buffered：整体已在内存，Content-Length 按真实字节数重算（客户端谎报长度时不把畸形透传给后端）
+        // - Streaming：把客户端 Incoming 直接管道给后端，不重算长度，由 hyper 依据 body 的 size_hint
+        //   决定 Content-Length（原始定长）或分块传输（原始 chunked）
+        let streamed = matches!(body, ProxyBody::Streaming(_));
+        if let ProxyBody::Buffered(Some(b)) = &body {
+            if !ctx.is_bodyless_method() && !b.is_empty() {
+                if let Ok(v) = HeaderValue::try_from(b.len().to_string()) {
+                    headers.insert(CONTENT_LENGTH, v);
+                }
             }
+        }
+        // 流式请求体一旦被后端消费就无法回放，禁止换节点重试（对齐 nginx buffering off）
+        if streamed {
+            max_attempts = 1;
         }
 
         // proxy_next_upstream：off 完全禁止换节点；非幂等请求（POST/LOCK/PATCH）默认不重试
@@ -234,11 +271,18 @@ impl ProxyEngine {
                 "http://{backend}{}{query}",
                 encode_path(&out_path),
             );
+            // 每次尝试重建请求体：缓冲体可回放（clone Bytes），流式体只能取用一次
+            let req_body: ProxyReqBody = match &mut body {
+                ProxyBody::Buffered(b) => full_boxed(b.as_ref().cloned().unwrap_or_default()),
+                ProxyBody::Streaming(inc) => {
+                    incoming_boxed(inc.take().expect("streaming body 仅用于单次尝试"))
+                }
+            };
             let mut req = Request::builder()
                 .method(ctx.method.as_str())
                 .uri(&uri)
                 .version(hyper::Version::HTTP_11)
-                .body(Full::new(body_bytes.clone()))
+                .body(req_body)
                 .map_err(|e| e.to_string())?;
             *req.headers_mut() = headers.clone();
 
@@ -667,7 +711,10 @@ mod tests {
             },
             next_upstream: &[],
         };
-        let err = e.forward(&c, "https://example.com", "/api", &opts, None).await.unwrap_err();
+        let err = e
+            .forward(&c, "https://example.com", "/api", &opts, ProxyBody::Buffered(None))
+            .await
+            .unwrap_err();
         assert!(err.contains("https"), "{err}");
     }
 }

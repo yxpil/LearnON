@@ -43,7 +43,7 @@ use crate::certs;
 use crate::compress::{accepts_gzip, GzipBody};
 use crate::engine::{self, HandlerRegistry, Phase, RequestCtx};
 use crate::lua_engine::LuaEngine;
-use crate::proxy::{ProxyEngine, ProxyOpts, ProxyTimeouts};
+use crate::proxy::{ProxyBody, ProxyEngine, ProxyOpts, ProxyTimeouts};
 use crate::router::{self, Location, Router, Server};
 use crate::settings::Settings;
 use crate::{log_debug, log_error, log_info, log_warn, AppError};
@@ -746,28 +746,50 @@ async fn handle_request(
         }
     }
 
-    // ---- 请求体：边读边限长（单靠 Content-Length 挡不住分块上传与谎报长度的客户端）----
+    // ---- 请求体：默认边读边限长缓冲；`proxy_request_buffering off` 的 proxy location 走流式转发 ----
     let loc0 = Router::match_location(&server, ctx.effective_path());
     let limit = loc0
         .and_then(|l| l.client_max_body_size)
         .or(server.client_max_body_size);
     let has_body = chunked || cl_values.first().is_some();
-    let body_bytes = if has_body {
-        match read_body(body, limit, state.settings.client_body_timeout).await {
-            Ok(b) => b,
-            Err(BodyFail::TooLarge) => {
-                // 体没读完就返回：必须断开，否则残留字节会被当成下一个请求
-                return close_now(error_page(StatusCode::PAYLOAD_TOO_LARGE));
+    // 流式条件：命中带 proxy_pass 且 buffering=off 的 location，且确实带请求体
+    let stream_body = has_body
+        && loc0
+            .map(|l| l.proxy_pass.is_some() && !l.proxy_request_buffering)
+            .unwrap_or(false);
+    let inbound = if stream_body {
+        // 分块无法预先限长；仅在客户端声明了 Content-Length 时做 upfront 拒绝
+        if let Some(max) = limit {
+            if let Some(declared) = cl_values
+                .first()
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                if declared > max {
+                    return close_now(error_page(StatusCode::PAYLOAD_TOO_LARGE));
+                }
             }
-            Err(BodyFail::Timeout) => return close_now(error_page(StatusCode::REQUEST_TIMEOUT)),
-            Err(BodyFail::Io) => return close_now(error_page(StatusCode::BAD_REQUEST)),
         }
+        ProxyBody::Streaming(Some(body))
     } else {
-        Bytes::new()
+        let body_bytes = if has_body {
+            match read_body(body, limit, state.settings.client_body_timeout).await {
+                Ok(b) => b,
+                Err(BodyFail::TooLarge) => {
+                    // 体没读完就返回：必须断开，否则残留字节会被当成下一个请求
+                    return close_now(error_page(StatusCode::PAYLOAD_TOO_LARGE));
+                }
+                Err(BodyFail::Timeout) => return close_now(error_page(StatusCode::REQUEST_TIMEOUT)),
+                Err(BodyFail::Io) => return close_now(error_page(StatusCode::BAD_REQUEST)),
+            }
+        } else {
+            Bytes::new()
+        };
+        ctx.req_body = body_bytes.to_vec();
+        ProxyBody::Buffered(Some(body_bytes))
     };
-    ctx.req_body = body_bytes.to_vec();
 
-    let resp = process(&state, &mut ctx, &server, body_bytes).await;
+    let resp = process(&state, &mut ctx, &server, inbound).await;
     // conn_guards 到这里才释放：整个请求处理期间都占着并发额度
     drop(conn_guards);
     resp
@@ -807,7 +829,7 @@ async fn process(
     state: &Arc<AppState>,
     ctx: &mut RequestCtx,
     server: &Arc<Server>,
-    body: Bytes,
+    body: ProxyBody,
 ) -> BoxResponse {
     // ---- REWRITE / POST_REWRITE / PREACCESS / ACCESS 循环 ----
     // rewrite ... last、ngx.exec、try_files 兜底都会重新匹配 location（最多 10 跳）
@@ -911,7 +933,7 @@ async fn process(
         };
         return match state
             .proxy
-            .forward(ctx, target, &loc.pattern, &opts, Some(body))
+            .forward(ctx, target, &loc.pattern, &opts, body)
             .await
         {
             Ok(upstream_resp) => convert_upstream_response(upstream_resp, loc, server),
@@ -1076,7 +1098,7 @@ async fn serve_static_flow(
     ctx: &mut RequestCtx,
     server: &Arc<Server>,
     loc: &Location,
-    body: Bytes,
+    body: ProxyBody,
 ) -> BoxResponse {
     let Some(snap) = static_snapshot(ctx, server, loc) else {
         return error_response(ctx, server, Some(loc), 404).await;

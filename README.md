@@ -221,10 +221,16 @@ Already done (previously listed as gaps, now implemented):
   upstreams get separate pools. (`upstream.rs::KeepaliveOpts`, `proxy.rs::client`, verified by
   `tools/keepalive_e2e.sh`: `keepalive` reuses one backend connection, a short `keepalive_timeout`
   reaps the idle one between spaced requests.)
+- **Streaming request-body forwarding**: `proxy_request_buffering off` (per server/location, default
+  `on` as in nginx) pipes the client request body straight to the backend as it arrives instead of
+  buffering the whole thing first — the proxy sends a `BoxBody` wrapping the incoming `Incoming` so
+  memory stays O(1) and hyper derives `Content-Length`/chunked framing from the body's `size_hint`.
+  Because streamed bytes can't be replayed, the streaming path disables `proxy_next_upstream` node
+  switching. (`proxy.rs::ProxyBody`, `server.rs::handle_request`, verified by
+  `tools/streaming_body_e2e.py`: a body dribbled to the backend over ~1.2s shows a ~1.1s read span
+  through `off` but a single burst read through `on`, with matching sha256 both ways.)
 
 Remaining tradeoffs / roadmap:
 
 - **Within-VM Lua serialization**: a single VM runs one request at a time; per-request coroutine
   concurrency inside one VM (OpenResty-style) is not implemented — parallelism comes from the VM pool.
-- **Buffered request-body forwarding**: the reverse proxy reads the body into memory before forwarding
-  (roadmap: streaming pipe).

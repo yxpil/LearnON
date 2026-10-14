@@ -103,6 +103,9 @@ pub struct Location {
     pub proxy_send_timeout: u64,
     /// `proxy_next_upstream off | error | timeout | http_500 | ...`（默认 error,timeout）
     pub proxy_next_upstream: Vec<String>,
+    /// `proxy_request_buffering on|off`（默认 on）。off 且该 location 有 proxy_pass 时，
+    /// 请求体边收边转发给后端，网关不再整体缓冲（nginx 语义）。
+    pub proxy_request_buffering: bool,
     pub rust_phases: Vec<(Phase, HandlerSpec)>,
     pub lua_phases: Vec<(Phase, String, LuaSource)>,
     pub root: Option<PathBuf>,
@@ -179,6 +182,7 @@ struct ServerTemplate {
     proxy_connect_timeout: u64,
     proxy_read_timeout: u64,
     proxy_send_timeout: u64,
+    proxy_request_buffering: bool,
     limit_conn: Vec<ConnRule>,
     ssl_cert: Option<PathBuf>,
     ssl_key: Option<PathBuf>,
@@ -299,6 +303,14 @@ fn parse_time_secs(v: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_on_off(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 impl Router {
     pub fn build(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
         let mut warnings: Vec<String> = Vec::new();
@@ -336,7 +348,7 @@ impl Router {
                 &["listen", "server_name", "root", "index", "autoindex", "try_files",
                    "error_page", "client_max_body_size", "return", "rewrite", "add_header",
                    "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
-                   "proxy_send_timeout", "proxy_next_upstream", "limit_conn", "http2",
+                   "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
@@ -527,6 +539,7 @@ impl Router {
             proxy_connect_timeout: 3,
             proxy_read_timeout: 60,
             proxy_send_timeout: 60,
+            proxy_request_buffering: true,
             limit_conn: Vec::new(),
             ssl_cert: None,
             ssl_key: None,
@@ -597,6 +610,14 @@ impl Router {
                 *slot = parse_time_secs(v, *slot);
             }
         }
+        if let Some(v) = d.find("proxy_request_buffering").and_then(|x| x.arg(0)) {
+            match parse_on_off(v) {
+                Some(b) => tmpl.proxy_request_buffering = b,
+                None => warnings.push(format!(
+                    "proxy_request_buffering 只接受 on/off（收到 '{v}'），保持 on"
+                )),
+            }
+        }
         for c in d.block.iter().filter(|x| x.name == "limit_conn") {
             match crate::limit::parse_conn_rule(c) {
                 Some(rule) => {
@@ -649,6 +670,7 @@ impl Router {
             proxy_connect_timeout: tmpl.proxy_connect_timeout,
             proxy_send_timeout: tmpl.proxy_send_timeout,
             proxy_next_upstream: vec!["error".to_string(), "timeout".to_string()],
+            proxy_request_buffering: tmpl.proxy_request_buffering,
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
             root: None,
@@ -665,7 +687,8 @@ impl Router {
         Self::warn_unknown(
             d,
             &["rewrite", "return", "proxy_pass", "proxy_set_header", "proxy_read_timeout",
-               "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream", "root",
+               "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
+               "proxy_request_buffering", "root",
                "alias", "index", "try_files", "autoindex", "error_page", "add_header",
                "limit_req", "internal", "client_max_body_size", "content_by_lua",
                "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
@@ -729,6 +752,15 @@ impl Router {
         }
         if let Some(nu) = d.find("proxy_next_upstream") {
             loc.proxy_next_upstream = nu.args.clone();
+        }
+        if let Some(v) = d.find("proxy_request_buffering").and_then(|x| x.arg(0)) {
+            match parse_on_off(v) {
+                Some(b) => loc.proxy_request_buffering = b,
+                None => warnings.push(format!(
+                    "proxy_request_buffering 只接受 on/off（收到 '{v}'），保持 {}",
+                    if loc.proxy_request_buffering { "on" } else { "off" }
+                )),
+            }
         }
         for r in d.block.iter().filter(|x| x.name == "limit_req") {
             match crate::limit::parse_req_rule(r) {
@@ -1219,6 +1251,34 @@ mod tests {
         assert!(merged.contains(&("X-A", "1")));
         assert!(merged.contains(&("X-B", "2")));
         assert!(!merged.contains(&("X-B", "1")));
+    }
+
+    #[test]
+    fn proxy_request_buffering_defaults_on_and_inherits_overrides() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; proxy_request_buffering off;
+                 location /inherited { proxy_pass http://127.0.0.1:1; }
+                 location /forced-on  { proxy_pass http://127.0.0.1:1; proxy_request_buffering on; } }
+            server { listen 127.0.0.1:18081; location / { proxy_pass http://127.0.0.1:1; } }"#,
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        // server 级 off 被 location 继承
+        assert!(!Router::match_location(&s, "/inherited").unwrap().proxy_request_buffering);
+        // location 级 on 覆盖 server 级 off
+        assert!(Router::match_location(&s, "/forced-on").unwrap().proxy_request_buffering);
+        // 未声明时默认 on（nginx 一致）
+        let s2 = r.match_server("127.0.0.1:18081".parse().unwrap(), None).unwrap().clone();
+        assert!(Router::match_location(&s2, "/").unwrap().proxy_request_buffering);
+    }
+
+    #[test]
+    fn proxy_request_buffering_rejects_bad_value_keeps_default() {
+        let r = build(
+            "server { listen 127.0.0.1:18080; proxy_request_buffering maybe; location / { proxy_pass http://127.0.0.1:1; } }",
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        assert!(Router::match_location(&s, "/").unwrap().proxy_request_buffering, "非法取值应回落默认 on");
+        assert!(r.warnings.iter().any(|w| w.contains("proxy_request_buffering")), "{:?}", r.warnings);
     }
 
     #[test]
