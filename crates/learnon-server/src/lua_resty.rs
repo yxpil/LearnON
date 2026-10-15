@@ -136,7 +136,251 @@ end
 return _M
 "##;
 
-/// 在给定 VM 上注册 resty.* 模块到 `package.preload`，使 `require "resty.xxx"` 可用。
+/// resty.http —— 基于原生 cosocket 的纯 Lua HTTP/1.1 客户端（本项目原创实现，
+/// 对照 lua-resty-http 公开 API 语义手写，未复制上游源码）。支持 connect/request、
+/// Content-Length 与 chunked 响应体、HEAD/204/304 空体、keepalive 连接复用与 TLS 升级。
+const RESTY_HTTP: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local lower = string.lower
+local sub   = string.sub
+local find  = string.find
+local byte  = string.byte
+local tonumber = tonumber
+
+-- 大写化方法名（仅 ASCII，避免本地化影响）
+local function upper_ascii(s)
+    local out = {}
+    for i = 1, #s do
+        local b = byte(s, i)
+        if b >= 97 and b <= 122 then out[i] = string.char(b - 32) else out[i] = sub(s, i, i) end
+    end
+    return table.concat(out)
+end
+
+-- 状态行 "HTTP/1.1 200 OK" -> { version, status, reason }
+local function parse_status(line)
+    local code = tonumber(line:match("^HTTP/%d%.%d%s+(%d+)"))
+    if not code then return nil, "bad status line: " .. tostring(line) end
+    local reason = line:match("^HTTP/%d%.%d%s+%d+%s+(.*)$") or ""
+    return { status = code, reason = reason }
+end
+
+-- 逐行读响应头（大小写归一为小写键），空行结束
+local function read_headers(sock)
+    local h = {}
+    while true do
+        local line, err = sock:receive("*l")
+        if not line then return nil, err end
+        if line == "" then break end
+        local k, v = line:match("^([^:]+):%s*(.-)%s*$")
+        if k then
+            local lk = lower(k)
+            -- 重复头聚合为逗号分隔（对标常见行为）
+            if h[lk] then h[lk] = h[lk] .. ", " .. v else h[lk] = v end
+        end
+    end
+    return h
+end
+
+-- 组装并读取响应体：chunked / Content-Length / 读到关闭；HEAD 与 204/304 恒空。
+local function read_body(sock, headers, method, status)
+    if method == "HEAD" or status == 204 or status == 304 then
+        return ""
+    end
+    local te = headers["transfer-encoding"]
+    if te and lower(te):find("chunked", 1, true) then
+        local parts = {}
+        while true do
+            local szline, e1 = sock:receive("*l")
+            if not szline then return nil, e1 or "chunk size error" end
+            local sz = tonumber(szline:match("^%x+") or "", 16)
+            if not sz then return nil, "bad chunk size: " .. szline end
+            if sz == 0 then
+                sock:receive("*l") -- 消费收尾空行（无 trailer 情形）
+                break
+            end
+            local data, e2 = sock:receive(sz)
+            if not data then return nil, e2 or "chunk data error" end
+            parts[#parts + 1] = data
+            sock:receive(2) -- 吃掉块后 CRLF
+        end
+        return table.concat(parts)
+    end
+    local cl = headers["content-length"]
+    if cl then
+        local n = tonumber(cl)
+        if not n then return nil, "bad content-length" end
+        if n == 0 then return "" end
+        local data, err = sock:receive(n)
+        if not data then return nil, err end
+        return data
+    end
+    -- 无长度信息：读到连接关闭
+    local data, err = sock:receive("*a")
+    sock:close()
+    if not data then
+        if err == "closed" then return "" end
+        return nil, err
+    end
+    return data
+end
+
+-- new() -> 客户端对象
+function _M.new(_)
+    return setmetatable({
+        sock = nil,
+        connected = false,
+        keepalive = false,
+        timeout_ms = 30000,
+        host = nil,
+        port = nil,
+        scheme = "http",
+    }, mt)
+end
+
+-- set_timeout(ms)：cosocket 各操作的超时（毫秒，与 OpenResty settimeout 单位一致）
+function _M.set_timeout(self, ms)
+    self.timeout_ms = ms
+    if self.sock then self.sock:settimeout(ms) end
+    return true
+end
+
+-- set_keepalive(timeout_sec, pool_size)：请求结束后把空闲连接归还 cosocket 连接池
+function _M.set_keepalive(self, timeout, pool_size)
+    if not self.sock then return nil, "closed" end
+    local ok, err = self.sock:setkeepalive(timeout, pool_size)
+    if ok then self.connected = false end
+    return ok, err
+end
+
+-- connect(opts)：opts = { scheme, host, port, ssl_verify, ssl_cafile, server_name }
+function _M.connect(self, opts)
+    opts = opts or {}
+    local scheme = lower(opts.scheme or self.scheme or "http")
+    local host = opts.host or self.host
+    if not host then return nil, "no host specified" end
+    local port = opts.port or (scheme == "https" and 443 or 80)
+    if self.connected and self.host == host and self.port == port then
+        return 1
+    end
+    self.sock = self.sock or ngx.socket.tcp()
+    self.sock:settimeout(self.timeout_ms)
+    local ok, err = self.sock:connect(host, port)
+    if not ok then return nil, err end
+    if scheme == "https" then
+        local hs, herr = self.sock:tlshandshake({
+            server_name = opts.server_name or host,
+            verify = opts.ssl_verify,
+            ca = opts.ssl_cafile,
+        })
+        if not hs then return nil, "tls handshake failed: " .. tostring(herr) end
+    end
+    self.connected = true
+    self.host, self.port, self.scheme = host, port, scheme
+    return ok
+end
+
+-- request(opts)：opts = { method, path, headers, body, query, keepalive, scheme/host/port }
+-- 成功返回 { status_code, headers, body, reason }；失败返回 nil, err。
+function _M.request(self, opts)
+    opts = opts or {}
+    if opts.keepalive == nil then opts.keepalive = self.keepalive end
+    if not self.connected or opts.host or opts.scheme or opts.port then
+        local ok, err = self:connect(opts)
+        if not ok then return nil, err end
+    end
+    local method = upper_ascii(opts.method or "GET")
+    local path = opts.path or "/"
+    if opts.query then
+        local q = type(opts.query) == "table" and ngx.encode_args(opts.query) or tostring(opts.query)
+        if q ~= "" then
+            path = path .. (find(path, "?", 1, true) and "&" or "?") .. q
+        end
+    end
+    local headers = opts.headers or {}
+
+    -- 规范化 headers：允许数组式 {["K"]="V"}，检测 Host/Content-Length/Connection 是否已给
+    local line = {}
+    line[#line + 1] = method .. " " .. path .. " HTTP/1.1\r\n"
+    local has_host, has_cl, has_conn = false, false, false
+    for k, v in pairs(headers) do
+        local lk = lower(tostring(k))
+        if lk == "host" then has_host = true
+        elseif lk == "content-length" then has_cl = true
+        elseif lk == "connection" then has_conn = true end
+        line[#line + 1] = tostring(k) .. ": " .. tostring(v) .. "\r\n"
+    end
+    if not has_host then
+        local hp = tostring(self.host)
+        local default_port = (self.scheme == "https") and 443 or 80
+        if self.port ~= default_port then hp = hp .. ":" .. self.port end
+        line[#line + 1] = "Host: " .. hp .. "\r\n"
+    end
+    local body = opts.body
+    if body and not has_cl then
+        line[#line + 1] = "Content-Length: " .. #body .. "\r\n"
+    end
+    if not has_conn then
+        if opts.keepalive then
+            line[#line + 1] = "Connection: keep-alive\r\n"
+        else
+            line[#line + 1] = "Connection: close\r\n"
+        end
+    end
+    line[#line + 1] = "\r\n"
+
+    local bytes, serr = self.sock:send(table.concat(line))
+    if not bytes then return nil, serr end
+    if body and #body > 0 then
+        local b2, berr = self.sock:send(body)
+        if not b2 then return nil, berr end
+    end
+
+    local sline, rerr = self.sock:receive("*l")
+    if not sline then return nil, rerr end
+    local st, perr = parse_status(sline)
+    if not st then return nil, perr end
+    local hdrs, herror = read_headers(self.sock)
+    if not hdrs then return nil, herror end
+    local rbody, berror = read_body(self.sock, hdrs, method, st.status)
+    if not rbody then return nil, berror end
+
+    local conn = lower(hdrs["connection"] or "")
+    if find(conn, "close", 1, true) then self.connected = false end
+
+    self._status = st.status
+    self._headers = hdrs
+    return {
+        status_code = st.status,
+        reason      = st.reason,
+        headers     = hdrs,
+        body        = rbody,
+        code        = st.status,
+    }
+end
+
+function _M.get_status_code(self) return self._status end
+function _M.get_headers(self) return self._headers end
+
+function _M.set_client_cert(self, _) return true end
+
+-- close()：关闭底层连接
+function _M.close(self)
+    if self.sock then self.sock:close() end
+    self.connected = false
+    return true
+end
+
+-- 便捷方法
+function _M.request_path(self, path, timeout)
+    if timeout then self:set_timeout(timeout) end
+    return self:request({ path = path })
+end
+
+return _M
+"##;
 /// mlua 的 `Lua::new()` 已打开标准库（含 `package`），故 `require` 与 preload 搜索器就绪；
 /// 这里对 `package`/`preload` 表做存在性兜底，避免个别精简运行时缺表时失败。
 pub fn install_modules(lua: &Lua) -> LuaResult<()> {
@@ -145,6 +389,9 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     })?;
     let lock_loader = lua.create_function(|lua, _: ()| {
         lua.load(RESTY_LOCK).set_name("resty.lock").eval::<LuaValue>()
+    })?;
+    let http_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_HTTP).set_name("resty.http").eval::<LuaValue>()
     })?;
 
     let globals = lua.globals();
@@ -166,5 +413,62 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     };
     preload.set("resty.string", string_loader)?;
     preload.set("resty.lock", lock_loader)?;
+    preload.set("resty.http", http_loader)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resty_modules_register_and_require() {
+        let lua = mlua::Lua::new();
+        install_modules(&lua).unwrap();
+        // require "resty.string" → to_hex 可用且正确
+        let hex: String = lua
+            .load(r#"local s = require "resty.string"; return s.to_hex("AB")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(hex, "4142");
+        // require "resty.http" → 模块面对象具备公开方法
+        for name in ["new", "connect", "request", "set_timeout", "set_keepalive", "close"] {
+            let ok: bool = lua
+                .load(format!(
+                    r#"local h = require "resty.http"; return type(h.{name}) == 'function'"#
+                ))
+                .eval()
+                .unwrap();
+            assert!(ok, "resty.http missing method {name}");
+        }
+        // require "resty.lock" → new/lock/unlock 存在
+        for name in ["new", "lock", "unlock"] {
+            let ok: bool = lua
+                .load(format!(
+                    r#"local l = require "resty.lock"; return type(l.{name}) == 'function'"#
+                ))
+                .eval()
+                .unwrap();
+            assert!(ok, "resty.lock missing method {name}");
+        }
+    }
+
+    // resty.http 客户端对象：new() 返回带方法的实例，未连接前 get_headers/get_status_code 为 nil。
+    #[test]
+    fn resty_http_new_instance_shape() {
+        let lua = mlua::Lua::new();
+        // 桩：模块加载只定义函数，不触碰 ngx；request/connect 才被调用。
+        install_modules(&lua).unwrap();
+        let res: bool = lua
+            .load(
+                r#"
+                local h = require "resty.http"
+                local c = h.new()
+                return type(c) == 'table' and c:get_status_code() == nil and c:get_headers() == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(res);
+    }
 }

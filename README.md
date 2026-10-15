@@ -227,6 +227,14 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   a shared-dict `add`-based mutex with `ngx.sleep` backoff polling and a monotonic owner token so an
   expired lock is never unlocked by the wrong holder). Verified by `tools/resty_e2e.py`, including N-way
   concurrent `resty.lock` critical sections where the shared counter is exact (no lost updates) across VMs.
+  Also `resty.http` (`new / connect / request / set_timeout / set_keepalive / close` + `get_status_code /
+  get_headers`): a full HTTP/1.1 client built purely on the native cosocket — request-line + header + body
+  assembly, `Host`/`Content-Length`/`Connection` defaults, response status-line and header parsing
+  (lower-cased keys, repeated-header aggregation), `Content-Length`, `chunked`, and read-until-close body
+  framing, HEAD/204/304 empty-body handling, `query` table auto-encoding via `ngx.encode_args`, `https`
+  via `sock:tlshandshake`, and connection-pool reuse through `set_keepalive`. Verified by
+  `tools/resty_http_e2e.py` (21 checks) against a real Python HTTP backend serving chunked /
+  content-length / 204 / HEAD / POST-echo / custom-header responses.
 - Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
   (IMF + Netscape-cookie formats, `parse_http_time` returns `nil` on garbage)
 - Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)
