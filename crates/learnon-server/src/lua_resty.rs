@@ -381,7 +381,202 @@ end
 
 return _M
 "##;
-/// mlua 的 `Lua::new()` 已打开标准库（含 `package`），故 `require` 与 preload 搜索器就绪；
+
+/// resty.redis —— 基于原生 cosocket 的纯 Lua RESP 客户端（本项目原创实现，对照
+/// lua-resty-redis 公开 API 语义手写，未复制上游源码）。支持 connect/command、
+/// 动态命令派发（redis:get(...)）、+/-/:/$/* 全类型回复解析、pipeline/commit、
+/// keepalive 连接池复用与错误/nil 回复。
+const RESTY_REDIS: &str = r##"
+local _M = {}
+local mt = { __index = nil }   -- __index 稍后设为函数（已知方法 or 动态命令派发）
+
+local sub      = string.sub
+local concat   = table.concat
+local tonumber = tonumber
+local select   = select
+
+-- 读取一条 RESP 回复。返回约定：simple string→字符串；error→nil,err；integer→数字；
+-- bulk→字符串 / false(nil) / ""(空)；array→表 / false(nil)。
+local function read_reply(sock)
+    local line, err = sock:receive("*l")
+    if not line then return nil, err end
+    local t = sub(line, 1, 1)
+    local body = sub(line, 2)
+    if t == "+" then
+        return body
+    elseif t == "-" then
+        return nil, body
+    elseif t == ":" then
+        return tonumber(body)
+    elseif t == "$" then
+        local n = tonumber(body)
+        if n == -1 then return false end
+        if n == 0 then return "" end
+        local data, e = sock:receive(n)
+        if not data then return nil, e end
+        sock:receive(2) -- 吃掉数据后 CRLF
+        return data
+    elseif t == "*" then
+        local cnt = tonumber(body)
+        if cnt == -1 then return false end
+        local out = {}
+        for i = 1, cnt do
+            local r, e = read_reply(sock)
+            if r == nil and e ~= nil then return nil, e end
+            out[i] = r
+        end
+        return out
+    end
+    return nil, "unknown RESP reply type: " .. tostring(t)
+end
+
+-- new() -> 客户端对象
+function _M.new(_)
+    return setmetatable({
+        sock = nil,
+        connected = false,
+        timeout = 5000,
+        host = nil,
+        port = nil,
+        err = nil,
+    }, mt)
+end
+
+-- connect(host, port, opts?)：opts.timeout（毫秒）
+function _M.connect(self, host, port, opts)
+    opts = opts or {}
+    self.sock = self.sock or ngx.socket.tcp()
+    local ms = opts.timeout or self.timeout
+    self.sock:settimeout(ms)
+    local ok, err = self.sock:connect(host, port)
+    if not ok then
+        self.connected = false
+        self.err = err
+        return nil, err
+    end
+    self.connected = true
+    self.host, self.port = host, port
+    self.err = nil
+    return ok
+end
+
+-- set_timeout(ms)：读写超时（毫秒）
+function _M.set_timeout(self, ms)
+    self.timeout = ms
+    if self.sock then self.sock:settimeout(ms) end
+    return true
+end
+
+-- close() -> 1：关闭底层连接
+function _M.close(self)
+    if not self.sock then return true end
+    local ok = self.sock:close()
+    self.connected = false
+    return ok
+end
+
+-- set_keepalive(timeout_ms?, pool_size?)：把空闲连接归还 cosocket 连接池
+function _M.set_keepalive(self, timeout, pool_size)
+    if not self.sock then return nil, "closed" end
+    local ok, err = self.sock:setkeepalive(timeout, pool_size)
+    if ok then self.connected = false end
+    return ok, err
+end
+
+-- reconnect(host?, port?, opts?)：断开并重连（默认复用上次对端）
+function _M.reconnect(self, host, port, opts)
+    self:close()
+    return self:connect(host or self.host, port or self.port, opts)
+end
+
+-- command(arr)：arr 为 RESP 命令各 token（如 {"SET","k","v"}）；编码发送并读回复。
+function _M.command(self, arr)
+    if type(arr) ~= "table" or #arr == 0 then
+        return nil, "bad command"
+    end
+    if not self.connected then
+        local ok, err = self:connect(self.host, self.port)
+        if not ok then return nil, err end
+    end
+    local parts = { "*" .. #arr .. "\r\n" }
+    for i = 1, #arr do
+        local v = tostring(arr[i])
+        parts[#parts + 1] = "$" .. #v .. "\r\n" .. v .. "\r\n"
+    end
+    local bytes, err = self.sock:send(concat(parts))
+    if not bytes then
+        self.connected = false
+        self.err = err
+        return nil, err
+    end
+    local r, e = read_reply(self.sock)
+    if r == nil and e then self.err = e end
+    return r, e
+end
+
+-- pipeline() -> 流水线对象：pipe:cmd(...) 累积（动态派发，同单命令）、pipe:commit() 批量发送并读回全部回复。
+function _M.pipeline(self)
+    local owner = self
+    local p = { buf = {} }
+    -- 动态命令：pipe:get("k") / pipe:set("k","v") 累积为一条命令，等 commit 一起发出。
+    setmetatable(p, { __index = function(tbl, key)
+        local v = rawget(tbl, key)
+        if v ~= nil then return v end
+        if key == "buf" then return nil end
+        return function(_, ...)
+            local arr = { key }
+            local n = select('#', ...)
+            local rest = { ... }
+            for i = 1, n do arr[#arr + 1] = rest[i] end
+            tbl.buf[#tbl.buf + 1] = arr
+            return true
+        end
+    end })
+    function p.commit(tbl)
+        if not owner.connected then
+            local ok, err = owner:connect(owner.host, owner.port)
+            if not ok then return nil, err end
+        end
+        for i = 1, #tbl.buf do
+            local arr = tbl.buf[i]
+            local parts = { "*" .. #arr .. "\r\n" }
+            for j = 1, #arr do
+                local v = tostring(arr[j])
+                parts[#parts + 1] = "$" .. #v .. "\r\n" .. v .. "\r\n"
+            end
+            local bytes, err = owner.sock:send(concat(parts))
+            if not bytes then return nil, err end
+        end
+        local replies = {}
+        for i = 1, #tbl.buf do
+            local r, e = read_reply(owner.sock)
+            if r == nil and e then return nil, e end
+            replies[i] = r
+        end
+        tbl.buf = {}
+        return replies
+    end
+    return p
+end
+
+-- 未知键 → 动态命令派发：redis:get("k") 等价于 redis:command({"get","k"})
+-- 但对象自身的状态字段（尚未赋值时从实例表读为 nil）必须原样返回 nil，绝不能被派发成命令。
+local STATE = { sock = true, connected = true, timeout = true, host = true, port = true, err = true }
+mt.__index = function(self, key)
+    local known = rawget(_M, key)
+    if known then return known end
+    if STATE[key] then return nil end
+    return function(s, ...)
+        local arr = { key }
+        local n = select('#', ...)
+        local rest = { ... }
+        for i = 1, n do arr[#arr + 1] = rest[i] end
+        return s:command(arr)
+    end
+end
+
+return _M
+"##;
 /// 这里对 `package`/`preload` 表做存在性兜底，避免个别精简运行时缺表时失败。
 pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     let string_loader = lua.create_function(|lua, _: ()| {
@@ -392,6 +587,9 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     })?;
     let http_loader = lua.create_function(|lua, _: ()| {
         lua.load(RESTY_HTTP).set_name("resty.http").eval::<LuaValue>()
+    })?;
+    let redis_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_REDIS).set_name("resty.redis").eval::<LuaValue>()
     })?;
 
     let globals = lua.globals();
@@ -414,6 +612,7 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     preload.set("resty.string", string_loader)?;
     preload.set("resty.lock", lock_loader)?;
     preload.set("resty.http", http_loader)?;
+    preload.set("resty.redis", redis_loader)?;
     Ok(())
 }
 
@@ -470,5 +669,34 @@ mod tests {
             .eval()
             .unwrap();
         assert!(res);
+    }
+
+    #[test]
+    fn resty_redis_surface_and_state_guard() {
+        let lua = mlua::Lua::new();
+        install_modules(&lua).unwrap();
+        // require 与公开方法面
+        for name in ["new", "connect", "command", "set_timeout", "set_keepalive", "reconnect", "close", "pipeline"] {
+            let ok: bool = lua
+                .load(format!(r#"local r = require "resty.redis"; return type(r.{name}) == 'function'"#))
+                .eval()
+                .unwrap();
+            assert!(ok, "resty.redis missing method {name}");
+        }
+        // 关键回归：动态 __index 不能把对象状态字段（sock/connected/...）合成成命令函数
+        let ok: bool = lua
+            .load(
+                r#"
+                local redis = require "resty.redis"
+                local r = redis:new()
+                local is_fn = type(r.sock) == "function" or type(r.connected) == "function"
+                -- 未知命令名仍应派发为可调用函数
+                local cmd_callable = type(r.get) == "function"
+                return (not is_fn) and r.sock == nil and cmd_callable
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok, "resty.redis __index leaked a command function for a state field");
     }
 }

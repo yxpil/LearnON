@@ -234,7 +234,13 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   framing, HEAD/204/304 empty-body handling, `query` table auto-encoding via `ngx.encode_args`, `https`
   via `sock:tlshandshake`, and connection-pool reuse through `set_keepalive`. Verified by
   `tools/resty_http_e2e.py` (21 checks) against a real Python HTTP backend serving chunked /
-  content-length / 204 / HEAD / POST-echo / custom-header responses.
+  content-length / 204 / HEAD / POST-echo / custom-header responses. Also `resty.redis`
+  (`new / connect / command / set_timeout / set_keepalive / reconnect / close / pipeline` plus dynamic
+  command dispatch so `redis:get("k")` == `redis:command({"get","k"})`): a RESP client on the native
+  cosocket — request arrays encoded as `*N/$len`, replies parsed for all five types (simple string,
+  error→`nil,err`, integer, bulk incl. nil→`false`, nested multi-bulk), `pipeline()`/`commit()` batching,
+  and pool reuse via `set_keepalive`. Verified by `tools/resty_redis_e2e.py` (19 checks) against a real
+  RESP stub server exercising SET/GET/INCR/DEL/EXISTS/MGET/PING, nil and error replies, and pipelines.
 - Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
   (IMF + Netscape-cookie formats, `parse_http_time` returns `nil` on garbage)
 - Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)
