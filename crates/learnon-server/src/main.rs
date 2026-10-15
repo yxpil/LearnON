@@ -33,6 +33,7 @@ mod proxy;
 mod proxy_cache;
 mod proxy_tls;
 mod realip;
+mod resp_rewrite;
 mod router;
 mod server;
 mod settings;

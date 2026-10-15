@@ -2095,6 +2095,52 @@ fn url_encode_path_segment(s: &str) -> String {
 
 // ==================== 响应构造 ====================
 
+/// 对上游响应头应用 proxy_redirect（Location/Refresh）与 proxy_cookie_domain/path（Set-Cookie）改写。
+/// 两条代理响应缝（流式 convert_upstream_response 与缓冲 build_buffered_response）共用。
+fn apply_proxied_header_rewrites(hm: &mut hyper::HeaderMap, loc: &Location) {
+    use crate::resp_rewrite as rw;
+    // proxy_redirect：Location / Refresh（各取当前值，命中第一条规则即改写）。
+    if !loc.proxy_redirect.off && !loc.proxy_redirect.rules.is_empty() {
+        for name in ["location", "refresh"] {
+            let hn = HeaderName::from_static(name);
+            let cur = hm.get(&hn).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            if let Some(cur) = cur {
+                if let Some(new) = rw::apply_redirect(&loc.proxy_redirect.rules, &cur) {
+                    if let Ok(val) = HeaderValue::from_str(&new) {
+                        hm.insert(hn, val);
+                    }
+                }
+            }
+        }
+    }
+    // proxy_cookie_domain / proxy_cookie_path：Set-Cookie（保留多条）。
+    let do_domain = !loc.proxy_cookie_domain.off && !loc.proxy_cookie_domain.rules.is_empty();
+    let do_path = !loc.proxy_cookie_path.off && !loc.proxy_cookie_path.rules.is_empty();
+    if do_domain || do_path {
+        let hn = HeaderName::from_static("set-cookie");
+        let olds: Vec<String> = hm
+            .get_all(&hn)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+            .collect();
+        if !olds.is_empty() {
+            hm.remove(&hn);
+            for old in olds {
+                let mut v = old;
+                if do_domain {
+                    v = rw::rewrite_cookie_attr(&v, &loc.proxy_cookie_domain, "domain");
+                }
+                if do_path {
+                    v = rw::rewrite_cookie_attr(&v, &loc.proxy_cookie_path, "path");
+                }
+                if let Ok(val) = HeaderValue::from_str(&v) {
+                    hm.append(hn.clone(), val);
+                }
+            }
+        }
+    }
+}
+
 fn convert_upstream_response(
     resp: Response<Incoming>,
     loc: &Location,
@@ -2107,12 +2153,28 @@ fn convert_upstream_response(
         if let Ok(v) = HeaderValue::from_str(SERVER_HEADER) {
             hm.insert(SERVER, v);
         }
+        // drain() 只在每个 key 的第一个值上带出 HeaderName，重复值以 None 续传——需承接上一名，
+        // 否则会丢弃多值头（如多条 Set-Cookie）。
+        let mut last_name: Option<HeaderName> = None;
         for (k, v) in parts.headers.drain() {
-            let Some(name) = k else { continue };
+            let name = match k {
+                Some(n) => {
+                    last_name = Some(n.clone());
+                    n
+                }
+                None => match last_name.clone() {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
             if is_hop_by_hop(name.as_str()) {
                 continue;
             }
-            hm.insert(name, v);
+            if name.as_str() == "set-cookie" {
+                hm.append(name, v);
+            } else {
+                hm.insert(name, v);
+            }
         }
         for (k, v) in router::effective_add_headers(Some(loc), server) {
             if let (Ok(name), Ok(val)) = (
@@ -2122,6 +2184,7 @@ fn convert_upstream_response(
                 hm.insert(name, val);
             }
         }
+        apply_proxied_header_rewrites(hm, loc);
     }
     builder.body(body.boxed()).unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
 }
@@ -2182,7 +2245,12 @@ fn build_buffered_response(
                 HeaderName::try_from(k.as_str()),
                 HeaderValue::try_from(v.as_str()),
             ) {
-                hm.insert(name, val);
+                // Set-Cookie 允许多条共存（append 而非 insert，避免折叠重复头）。
+                if name.as_str() == "set-cookie" {
+                    hm.append(name, val);
+                } else {
+                    hm.insert(name, val);
+                }
             }
         }
         for (k, v) in router::effective_add_headers(Some(loc), server) {
@@ -2198,6 +2266,7 @@ fn build_buffered_response(
                 hm.insert(HeaderName::from_static("x-cache-status"), val);
             }
         }
+        apply_proxied_header_rewrites(hm, loc);
     }
     // sub_filter 输出过滤器：改写缓冲好的响应体（Content-Length 之后按新体重算）。
     let body = if loc.sub_filter.is_some() {

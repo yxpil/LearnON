@@ -77,6 +77,7 @@ all gateway logic is hand-written.
 | `split_clients <key> $dst { … }` weighted-derived variables | MurmurHash2 over an interpolated key template, `%` buckets (fractional allowed) + `*` catch-all, same shared resolver | `engine.rs`, `router.rs` |
 | `sub_filter <m> <r>;` response rewrite | literal + `~`/`~*` regex match, `&` back-reference in the replacement, `sub_filter_once`/`sub_filter_types`, applied on buffered proxy/cache/static/Lua bodies | `engine.rs`, `server.rs`, `router.rs` |
 | `set_real_ip_from` + `real_ip_header`/`real_ip_recursive` | realip module: trust the client IP from a header only when the direct peer is in a trusted CIDR, XFF chain right-most (off) / recursive-trusted-skip (on); overrides `$remote_addr` before geo/limit/auth | `realip.rs`, `router.rs`, `server.rs` |
+| `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path` | rewrite upstream `Location`/`Refresh` (literal prefix, `~regex` with captures, or `default` = origin→location-prefix relative form) and `Set-Cookie` `domain=`/`path=` (literal/regex, `none` deletes, path prefix-preserving); applied on both proxy seams (streaming + buffered), multi `Set-Cookie` preserved | `resp_rewrite.rs`, `router.rs`, `server.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -325,6 +326,24 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   peer, the same `X-Forwarded-For` value yielding the right-most proxy address under `recursive off` vs
   the true client under `recursive on`, and a `geo $net` derived variable tracking the rewritten IP
   through each case) + pure unit tests in `realip.rs` and router tests `parse_real_ip_directives_into_server`.
+- Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
+  (`resp_rewrite.rs`). These are config-time string rewrites applied to the upstream `Location`/`Refresh`
+  and `Set-Cookie` response headers. `proxy_redirect <match> <replacement>` (repeatable) treats `match` as a
+  literal prefix, or a `~regex` whose replacement expands `$1`/`${name}` captures; `proxy_redirect default`
+  synthesises one rule mapping the upstream origin (`scheme://authority` of `proxy_pass`) to the location's
+  public prefix, producing a **relative** `Location` (nginx's common default effect). `proxy_cookie_domain`
+  and `proxy_cookie_path` rewrite the `domain=`/`path=` attributes of `Set-Cookie` (literal or `~regex`; a
+  replacement of `none` **deletes** the attribute; `domain` matches case-insensitively tolerating a leading
+  dot, `path` is a prefix replacement that keeps the tail). Deliberate deviation: when no `proxy_redirect`
+  is declared the `Location` is passed through **unchanged** (nginx would apply an implicit default) — write
+  `proxy_redirect default;` to opt in, so existing proxy tests aren't surprised. The rewrite runs at both
+  proxy output seams — the streaming fast path (`convert_upstream_response`) and the buffered path forced by
+  `sub_filter`/body/header filters or a cache replay (`build_buffered_response`) — and preserves multiple
+  `Set-Cookie` headers. Verified by `tools/proxy_redirect_cookie_e2e.py` (17 checks: literal-prefix redirect
+  + cookie domain/path rewrite with tail preserved, `default` → `/def/target` relative Location, regex + `$1`
+  capture, `none` deleting `domain` across **two** Set-Cookie that both survive, the all-`off` pass-through
+  control, and the buffered `sub_filter` seam rewriting headers while leaving the body byte-exact) + pure
+  unit tests in `resp_rewrite.rs` and router tests `parse_proxy_redirect_and_cookie_directives`.
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

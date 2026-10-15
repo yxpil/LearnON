@@ -145,6 +145,12 @@ pub struct Location {
     pub proxy_tls: TlsPolicy,
     /// `sub_filter ...`：响应体文本替换输出过滤器（None=未启用）
     pub sub_filter: Option<crate::engine::SubFilterConf>,
+    /// `proxy_redirect ...`：改写上游 `Location`/`Refresh` 响应头
+    pub proxy_redirect: crate::resp_rewrite::ProxyRedirect,
+    /// `proxy_cookie_domain ...`：改写 `Set-Cookie` 的 `domain=` 属性
+    pub proxy_cookie_domain: crate::resp_rewrite::CookieRewrite,
+    /// `proxy_cookie_path ...`：改写 `Set-Cookie` 的 `path=` 属性
+    pub proxy_cookie_path: crate::resp_rewrite::CookieRewrite,
 }
 
 #[derive(Debug, Clone)]
@@ -1171,6 +1177,9 @@ impl Router {
             auth_basic_realm: None,
             auth_basic_user_file: None,
             sub_filter: None,
+            proxy_redirect: crate::resp_rewrite::ProxyRedirect::default(),
+            proxy_cookie_domain: crate::resp_rewrite::CookieRewrite::default(),
+            proxy_cookie_path: crate::resp_rewrite::CookieRewrite::default(),
         };
         Self::warn_unknown(
             d,
@@ -1190,7 +1199,8 @@ impl Router {
                "balancer_by_lua", "balancer_by_lua_file",
                "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
                "allow", "deny", "auth_basic", "auth_basic_user_file",
-               "sub_filter", "sub_filter_once", "sub_filter_types"],
+               "sub_filter", "sub_filter_once", "sub_filter_types",
+               "proxy_redirect", "proxy_cookie_domain", "proxy_cookie_path"],
             &format!("location '{}'", loc.pattern),
             warnings,
         );
@@ -1281,6 +1291,101 @@ impl Router {
         }
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
             loc.proxy_pass = Some(pp.to_string());
+        }
+        // proxy_redirect：off | default | <redirect> <replacement>（可重复）。
+        // 有意偏离 nginx：未显式声明时不改写 Location（nginx 默认会隐式 default），
+        // 以免破坏既有代理测试；需要默认行为时写 `proxy_redirect default;`。
+        {
+            use crate::resp_rewrite::{MatchPattern, ProxyRedirect, RedirectRule};
+            let mut pr = ProxyRedirect::default();
+            for rd in d.block.iter().filter(|x| x.name == "proxy_redirect") {
+                match rd.arg(0).map(|s| s.to_string()).as_deref() {
+                    Some("off") => {
+                        pr.off = true;
+                        pr.rules.clear();
+                    }
+                    Some("default") => {
+                        if let Some(pp) = loc.proxy_pass.as_deref() {
+                            match crate::resp_rewrite::default_redirect_rule(pp, &loc.pattern) {
+                                Some(r) => pr.rules.push(r),
+                                None => warnings.push(format!(
+                                    "proxy_redirect default 无法从 proxy_pass 推断（第 {} 行）",
+                                    rd.line
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "proxy_redirect default 需要 proxy_pass（第 {} 行）",
+                                rd.line
+                            ));
+                        }
+                    }
+                    Some(redirect) => {
+                        let replacement = match rd.arg(1) {
+                            Some(v) => v.to_string(),
+                            None => {
+                                warnings.push(format!(
+                                    "proxy_redirect 需要 <redirect> <replacement> 两个参数（第 {} 行）",
+                                    rd.line
+                                ));
+                                continue;
+                            }
+                        };
+                        match MatchPattern::from_token(redirect) {
+                            Some(m) => pr.rules.push(RedirectRule { m, replacement }),
+                            None => warnings.push(format!(
+                                "proxy_redirect 正则错误 {redirect}（第 {} 行）",
+                                rd.line
+                            )),
+                        }
+                    }
+                    None => warnings.push(format!("proxy_redirect 缺少参数（第 {} 行）", rd.line)),
+                }
+            }
+            loc.proxy_redirect = pr;
+        }
+        // proxy_cookie_domain / proxy_cookie_path：off | <old> <new>（new 为字面量 none 即删除）（可重复）。
+        for (name, slot) in [
+            ("proxy_cookie_domain", &mut loc.proxy_cookie_domain),
+            ("proxy_cookie_path", &mut loc.proxy_cookie_path),
+        ] {
+            let mut cr = crate::resp_rewrite::CookieRewrite::default();
+            for cd in d.block.iter().filter(|x| x.name == name) {
+                match cd.arg(0).map(|s| s.to_string()).as_deref() {
+                    Some("off") => {
+                        cr.off = true;
+                        cr.rules.clear();
+                    }
+                    Some(old) => {
+                        let new = match cd.arg(1) {
+                            Some(v) => v.to_string(),
+                            None => {
+                                warnings.push(format!(
+                                    "{name} 需要 <old> <new> 两个参数（第 {} 行）",
+                                    cd.line
+                                ));
+                                continue;
+                            }
+                        };
+                        match crate::resp_rewrite::MatchPattern::from_token(old) {
+                            Some(m) => {
+                                let remove = new.eq_ignore_ascii_case("none");
+                                cr.rules.push(crate::resp_rewrite::CookieAttrRule {
+                                    m,
+                                    replacement: new,
+                                    remove,
+                                });
+                            }
+                            None => warnings.push(format!(
+                                "{name} 正则错误 {old}（第 {} 行）",
+                                cd.line
+                            )),
+                        }
+                    }
+                    None => warnings.push(format!("{name} 缺少参数（第 {} 行）", cd.line)),
+                }
+            }
+            *slot = cr;
         }
         for h in d.block.iter().filter(|x| x.name == "proxy_set_header") {
             if let (Some(k), Some(v)) = (h.arg(0), h.arg(1)) {
@@ -1786,6 +1891,67 @@ mod tests {
             crate::engine::SubPattern::Regex(_)
         ));
         assert_eq!(sf.filters[1].replacement, "hi");
+    }
+
+    #[test]
+    fn parse_proxy_redirect_and_cookie_directives() {
+        let conf = r#"
+            server {
+                listen 127.0.0.1:18194;
+                location /api/ {
+                    proxy_pass http://10.0.0.5:8080;
+                    proxy_redirect default;
+                    proxy_redirect http://backend.internal:8080 http://public.example;
+                    proxy_redirect ~^http://x:[0-9]+/(.*)$ https://pub/$1;
+                    proxy_cookie_domain backend.internal public.example;
+                    proxy_cookie_domain .old none;
+                    proxy_cookie_path /app /gateway;
+                    proxy_cookie_path off;
+                }
+            }
+        "#;
+        let r = build(conf);
+        let loc = &r.groups[&"127.0.0.1:18194".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0]
+            .locations[0];
+        // proxy_redirect：default 合成 + 字面量 + 正则，共 3 条；未 off
+        assert!(!loc.proxy_redirect.off);
+        assert_eq!(loc.proxy_redirect.rules.len(), 3);
+        assert!(matches!(
+            &loc.proxy_redirect.rules[0].m,
+            crate::resp_rewrite::MatchPattern::Literal(s) if s == "http://10.0.0.5:8080"
+        ));
+        assert_eq!(loc.proxy_redirect.rules[0].replacement, "/api/");
+        assert_eq!(loc.proxy_redirect.rules[1].replacement, "http://public.example");
+        assert!(matches!(&loc.proxy_redirect.rules[2].m, crate::resp_rewrite::MatchPattern::Regex(_)));
+        // default 合成产出相对 Location
+        assert_eq!(
+            crate::resp_rewrite::apply_redirect(&loc.proxy_redirect.rules, "http://10.0.0.5:8080/login").as_deref(),
+            Some("/api/login")
+        );
+        // proxy_cookie_domain：两条规则，第二条 none → remove
+        assert!(!loc.proxy_cookie_domain.off);
+        assert_eq!(loc.proxy_cookie_domain.rules.len(), 2);
+        assert!(!loc.proxy_cookie_domain.rules[0].remove);
+        assert!(loc.proxy_cookie_domain.rules[1].remove);
+        // proxy_cookie_path：先一条规则后被 off 清空
+        assert!(loc.proxy_cookie_path.off);
+        assert!(loc.proxy_cookie_path.rules.is_empty());
+    }
+
+    #[test]
+    fn proxy_redirect_absent_is_pass_through() {
+        // 未声明 proxy_redirect → 不改写（有意偏离 nginx 隐式 default）。
+        let conf = r#"
+            server { listen 127.0.0.1:18195; location /api/ { proxy_pass http://10.0.0.5:8080; } }
+        "#;
+        let r = build(conf);
+        let loc = &r.groups[&"127.0.0.1:18195".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0]
+            .locations[0];
+        assert!(loc.proxy_redirect.rules.is_empty());
+        assert!(!loc.proxy_redirect.off);
+        assert!(loc.proxy_cookie_domain.rules.is_empty() && loc.proxy_cookie_path.rules.is_empty());
     }
 
     #[test]
