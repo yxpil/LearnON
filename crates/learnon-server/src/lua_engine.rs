@@ -62,6 +62,28 @@ struct CachedLua {
 static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<PathBuf, CachedLua>>> =
     std::sync::OnceLock::new();
 
+// ngx.re 的进程级正则缓存（对齐 ngx.re 的 o/预编译缓存语义）：opt() 把编译结果存入，
+// 返回一个 __lon_re 句柄；match 家族可用句柄复用，避免热路径反复编译。
+static RE_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<regex::Regex>>> =
+    std::sync::OnceLock::new();
+
+fn regex_cache() -> &'static std::sync::Mutex<Vec<regex::Regex>> {
+    RE_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+fn regex_from_cache(i: usize) -> LuaResult<regex::Regex> {
+    regex_cache()
+        .lock()
+        .unwrap()
+        .get(i)
+        .cloned()
+        .ok_or_else(|| mlua::Error::external("ngx.re: 无效的预编译句柄"))
+}
+fn regex_to_cache(r: regex::Regex) -> usize {
+    let mut c = regex_cache().lock().unwrap();
+    c.push(r);
+    c.len() - 1
+}
+
 fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
     let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
     
@@ -2299,6 +2321,120 @@ impl LuaEngine {
         })?;
         req.set("get_headers", get_headers)?;
 
+        // ngx.req.set_header(name, value) —— 改写入站请求头（转发时随 ctx.req_headers 带给后端）。
+        //   value=nil 删除该头；value 为表则按序写多值（对齐 OpenResty）。name 归一化为小写。
+        // ngx.req.set_raw_header 保留原始名；clear_header 删除。
+        fn format_number(n: f64) -> String {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", n as i64)
+            } else {
+                n.to_string()
+            }
+        }
+
+        fn hdr_to_str(lua: &mlua::Lua, v: &LuaValue) -> Option<String> {
+            match v {
+                LuaValue::Nil => None,
+                LuaValue::String(s) => Some(String::from_utf8_lossy(&s.as_bytes()).into_owned()),
+                LuaValue::Integer(n) => Some(n.to_string()),
+                LuaValue::Number(n) => Some(format_number(*n)),
+                LuaValue::Boolean(b) => Some((if *b { "true" } else { "false" }).to_string()),
+                LuaValue::Table(t) => {
+                    // 表值：取其数组部分，逐项转字符串
+                    let mut out = String::new();
+                    for i in 1..=t.raw_len() {
+                        if let Ok(item) = t.raw_get::<LuaValue>(i) {
+                            if let Some(s) = hdr_to_str(lua, &item) {
+                                if !out.is_empty() {
+                                    out.push(',');
+                                }
+                                out.push_str(&s);
+                            }
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+
+        fn apply_header(
+            ctx: &mut crate::engine::RequestCtx,
+            name: &str,
+            value: Option<String>,
+            vals: Option<Vec<String>>,
+        ) {
+            ctx.req_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            if let Some(list) = vals {
+                for v in list {
+                    ctx.req_headers.push((name.to_string(), v));
+                }
+            } else if let Some(v) = value {
+                ctx.req_headers.push((name.to_string(), v));
+            }
+        }
+
+        let set_header = lua.create_function(move |lua, (name, value): (String, LuaValue)| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            let name = name.to_lowercase();
+            match &value {
+                LuaValue::Nil => apply_header(&mut ctx, &name, None, None),
+                LuaValue::Table(t) => {
+                    let mut list = Vec::new();
+                    for i in 1..=t.raw_len() {
+                        if let Ok(item) = t.raw_get::<LuaValue>(i) {
+                            if let Some(s) = hdr_to_str(lua, &item) {
+                                list.push(s);
+                            }
+                        }
+                    }
+                    apply_header(&mut ctx, &name, None, Some(list));
+                }
+                other => {
+                    if let Some(s) = hdr_to_str(lua, other) {
+                        apply_header(&mut ctx, &name, Some(s), None);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        req.set("set_header", set_header)?;
+
+        let set_raw_header = lua.create_function(move |lua, (name, value): (String, LuaValue)| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            match &value {
+                LuaValue::Nil => apply_header(&mut ctx, &name, None, None),
+                LuaValue::Table(t) => {
+                    let mut list = Vec::new();
+                    for i in 1..=t.raw_len() {
+                        if let Ok(item) = t.raw_get::<LuaValue>(i) {
+                            if let Some(s) = hdr_to_str(lua, &item) {
+                                list.push(s);
+                            }
+                        }
+                    }
+                    apply_header(&mut ctx, &name, None, Some(list));
+                }
+                other => {
+                    if let Some(s) = hdr_to_str(lua, other) {
+                        apply_header(&mut ctx, &name, Some(s), None);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        req.set("set_raw_header", set_raw_header)?;
+
+        let clear_header = lua.create_function(move |lua, name: String| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            ctx.req_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+            Ok(true)
+        })?;
+        req.set("clear_header", clear_header)?;
+
         // ngx.req.get_uri_args() —— 查询串解析为表
         let get_uri_args = lua.create_function(move |lua, ()| {
             let h = get_ctx(lua)?;
@@ -2438,11 +2574,64 @@ impl LuaEngine {
         fn build_regex(pattern: &str, flags: Option<String>) -> LuaResult<regex::Regex> {
             let mut builder = regex::RegexBuilder::new(pattern);
             if let Some(f) = flags {
+                // 对齐 PCRE/OpenResty 常用标志：i 忽略大小写、s 单行(. 匹配换行)、m 多行(^$ 逐行)
                 if f.contains('i') {
                     builder.case_insensitive(true);
                 }
+                if f.contains('s') {
+                    builder.dot_matches_new_line(true);
+                }
+                if f.contains('m') {
+                    builder.multi_line(true);
+                }
             }
             builder.build().map_err(mlua::Error::external)
+        }
+
+        // 把一次 captures 结果转成 OpenResty 的 cap 表：cap[0]=整体、cap[N]=第 N 组、cap.name=命名组
+        fn caps_to_table(lua: &mlua::Lua, re: &regex::Regex, caps: &regex::Captures) -> LuaResult<LuaTable> {
+            let t = lua.create_table()?;
+            for i in 0..caps.len() {
+                if let Some(m) = caps.get(i) {
+                    t.raw_set(i as i64, m.as_str())?;
+                }
+            }
+            for (i, name) in re.capture_names().enumerate() {
+                if i == 0 {
+                    continue;
+                }
+                if let Some(nm) = name {
+                    if let Some(m) = caps.get(i) {
+                        t.raw_set(nm, m.as_str())?;
+                    }
+                }
+            }
+            Ok(t)
+        }
+
+        // 解析正则入参：字符串 pattern（配合 options 标志）或 opt() 预编译句柄
+        enum ReArg {
+            Pattern(String),
+            Cached(usize),
+        }
+        fn parse_re_arg(v: &LuaValue) -> ReArg {
+            match v {
+                LuaValue::String(s) => ReArg::Pattern(String::from_utf8_lossy(&s.as_bytes()).into_owned()),
+                LuaValue::Table(t) => {
+                    if let Ok(idx) = t.raw_get::<i64>("__lon_re") {
+                        ReArg::Cached(idx as usize)
+                    } else {
+                        ReArg::Pattern(String::new())
+                    }
+                }
+                _ => ReArg::Pattern(String::new()),
+            }
+        }
+        fn build_from_arg(arg: ReArg, options: Option<String>) -> LuaResult<regex::Regex> {
+            match arg {
+                ReArg::Cached(i) => regex_from_cache(i),
+                ReArg::Pattern(p) => build_regex(&p, options),
+            }
         }
 
         // ngx.re.match(s, pattern, flags?) -> {cap1, cap2, ...} | nil
@@ -2470,6 +2659,114 @@ impl LuaEngine {
             }
         })?;
         re.set("find", re_find)?;
+
+        // ngx.re.opt(regex, options?) -> 预编译句柄（表 {__lon_re=idx}），可回传给其它 ngx.re.*
+        let re_opt = lua.create_function(move |lua, (pattern, options): (String, Option<String>)| {
+            let built = build_regex(&pattern, options)?;
+            let idx = regex_to_cache(built);
+            let t = lua.create_table()?;
+            t.raw_set("__lon_re", idx as i64)?;
+            Ok(LuaValue::Table(t))
+        })?;
+        re.set("opt", re_opt)?;
+
+        // ngx.re.gmatch(subject, regex, options?) -> iterator；每次调用返回一个 cap 表，耗尽返回 nil
+        let re_gmatch = lua.create_function(move |lua, (subject, regex_arg, options): (String, LuaValue, Option<String>)| {
+            let built = build_from_arg(parse_re_arg(&regex_arg), options)?;
+            let state = std::sync::Arc::new(std::sync::Mutex::new((built, subject, 0usize)));
+            let it = lua.create_function(move |lua, ()| {
+                let mut st = state.lock().unwrap();
+                let (re, subj, pos) = &mut *st;
+                let tail = &subj[*pos..];
+                match re.captures(tail) {
+                    Some(caps) => {
+                        let m = caps.get(0).unwrap();
+                        let adv = m.end();
+                        *pos += adv;
+                        if adv == 0 {
+                            // 零宽匹配：前进一格避免在同一位置死循环
+                            *pos = (*pos + 1).min(subj.len());
+                        }
+                        let t = caps_to_table(lua, re, &caps)?;
+                        drop(st);
+                        Ok(LuaValue::Table(t))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?;
+            Ok(LuaValue::Function(it))
+        })?;
+        re.set("gmatch", re_gmatch)?;
+
+        // sub/gsub 共用：all=false 只替换首个；replace 可为字符串或回调函数
+        fn repl_to_str(v: &LuaValue) -> String {
+            match v {
+                LuaValue::String(s) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => {
+                    if n.fract() == 0.0 && n.abs() < 1e15 {
+                        format!("{}", *n as i64)
+                    } else {
+                        n.to_string()
+                    }
+                }
+                LuaValue::Nil => String::new(),
+                _ => String::new(),
+            }
+        }
+        fn do_sub(
+            lua: &mlua::Lua,
+            subject: &str,
+            regex_arg: &LuaValue,
+            replace: &LuaValue,
+            options: Option<String>,
+            all: bool,
+        ) -> LuaResult<(String, i64)> {
+            let re = build_from_arg(parse_re_arg(regex_arg), options)?;
+            match replace {
+                LuaValue::Function(f) => {
+                    let mut out = String::new();
+                    let mut last = 0usize;
+                    let mut count: i64 = 0;
+                    for caps in re.captures_iter(subject) {
+                        let m = caps.get(0).unwrap();
+                        out.push_str(&subject[last..m.start()]);
+                        let t = caps_to_table(lua, &re, &caps)?;
+                        let r: LuaValue = f.call(t)?;
+                        out.push_str(&repl_to_str(&r));
+                        last = m.end();
+                        count += 1;
+                        if !all {
+                            break;
+                        }
+                    }
+                    out.push_str(&subject[last..]);
+                    Ok((out, count))
+                }
+                other => {
+                    let rep = repl_to_str(other);
+                    let n = re.find_iter(subject).count();
+                    let limit = if all { usize::MAX } else { 1 };
+                    let new = re.replacen(subject, limit, rep.as_str()).into_owned();
+                    let cnt = if all { n as i64 } else { if n > 0 { 1 } else { 0 } };
+                    Ok((new, cnt))
+                }
+            }
+        }
+
+        // ngx.re.sub(subject, regex, replace, options?) -> new_subject, n
+        let re_sub = lua.create_function(move |lua, (subject, regex_arg, replace, options): (String, LuaValue, LuaValue, Option<String>)| {
+            let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, false)?;
+            Ok((s, n))
+        })?;
+        re.set("sub", re_sub)?;
+
+        // ngx.re.gsub(subject, regex, replace, options?) -> new_subject, n
+        let re_gsub = lua.create_function(move |lua, (subject, regex_arg, replace, options): (String, LuaValue, LuaValue, Option<String>)| {
+            let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, true)?;
+            Ok((s, n))
+        })?;
+        re.set("gsub", re_gsub)?;
         ngx.set("re", re)?;
 
         // ngx.shared.DICT —— lua_shared_dict 声明的共享区
@@ -3935,5 +4232,75 @@ mod tests {
         // 写回 ctx：$uri 改写落 rewritten_path，$status 落 status
         assert_eq!(c.rewritten_path.as_deref(), Some("/new"));
         assert_eq!(c.status, 201);
+    }
+
+    // ngx.re.gmatch/sub/gsub + 回调替换 + opt 预编译句柄
+    #[tokio::test]
+    async fn ngx_re_gmatch_sub_gsub_opt() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let shared = Arc::new(Mutex::new(RequestCtx::default()));
+        let code: Arc<str> = r#"
+            local it = ngx.re.gmatch("a1b2c3", "([a-z])([0-9])")
+            local acc = ""
+            while true do
+                local m = it()
+                if not m then break end
+                acc = acc .. m[1] .. m[2] .. ","
+            end
+            ngx.say('gmatch=' .. acc)
+            local s1, n1 = ngx.re.sub("hello world foo", "[a-z]+", "X")
+            ngx.say('sub=' .. s1 .. '/' .. n1)
+            local s2, n2 = ngx.re.gsub("a-b-c", "-", "_")
+            ngx.say('gsub=' .. s2 .. '/' .. n2)
+            local s3, n3 = ngx.re.gsub("x1y2", "[0-9]", function(m) return "[" .. m[0] .. "]" end)
+            ngx.say('cb=' .. s3 .. '/' .. n3)
+            local h = ngx.re.opt("[a-z]+")
+            local s4, n4 = ngx.re.gsub("abc1def", h, "*")
+            ngx.say('opt=' .. s4 .. '/' .. n4)
+        "#
+        .into();
+        engine
+            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("ngx.re content phase 执行失败");
+        let body = String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[])).to_string();
+        assert!(body.contains("gmatch=a1,b2,c3,"), "{body}");
+        assert!(body.contains("sub=X world foo/1"), "{body}");
+        assert!(body.contains("gsub=a_b_c/2"), "{body}");
+        assert!(body.contains("cb=x[1]y[2]/2"), "{body}");
+        assert!(body.contains("opt=*1*/2"), "{body}");
+    }
+
+    // ngx.req.set_header / set_raw_header / clear_header 改写入站头（转发时带给后端）
+    #[tokio::test]
+    async fn ngx_req_set_and_clear_header() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let mut ctx = RequestCtx::default();
+        ctx.req_headers.push(("user-agent".into(), "curl/8".into()));
+        ctx.req_headers.push(("x-del".into(), "bye".into()));
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            ngx.req.set_header("X-Foo", "bar")
+            ngx.req.set_header("x-multi", {"a", "b"})
+            ngx.req.set_header("X-Del", nil)
+            ngx.req.clear_header("user-agent")
+            ngx.req.set_raw_header("X-Raw-Name", "kept")
+        "#
+        .into();
+        engine
+            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("ngx.req header phase 执行失败");
+        let c = shared.lock().unwrap();
+        let find = |k: &str| c.req_headers.iter().filter(|(n, _)| n == k).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        assert_eq!(find("x-foo"), vec!["bar"], "set_header 归一化小写名");
+        assert_eq!(find("x-multi"), vec!["a", "b"], "表值按序写多值");
+        assert!(find("x-del").is_empty(), "value=nil 应删除该头");
+        assert!(find("user-agent").is_empty(), "clear_header 删除");
+        assert_eq!(find("X-Raw-Name"), vec!["kept"], "set_raw_header 保留原始名");
     }
 }

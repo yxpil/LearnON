@@ -169,7 +169,9 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 ## Lua API (aligned with ngx.*)
 
 - Response: `ngx.say / print / status (read-write) / exit / header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
-- Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])`
+- Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / set_header(name, value | array | nil) / set_raw_header / clear_header / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])` —
+  `set_header`/`clear_header` mutate the live inbound request headers, so a rewrite/access-phase change
+  is carried all the way to the proxied backend.
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep(secs) (async coroutine, seconds unit aligned with OpenResty)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
   receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
@@ -183,7 +185,11 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   `tools/sock_ext_e2e.py` / `tools/sock_tls_e2e.py` against real TCP and TLS backends.
 - UDP: `ngx.socket.udp()` → `setpeername / send / receive(max) / settimeout / close` — connected-UDP
   datagram I/O on the same scheduler yield path; verified by `tools/sock_udp_e2e.py`.
-- Regex: `ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)` (flags support `i`)
+- Regex: `ngx.re.match(s, pat, flags?) / find / gmatch(s, pat, flags?)→iterator / sub(s, pat, repl, flags?) /
+  gsub(s, pat, repl, flags?) / opt(pat, flags?)→reusable compiled handle` — flags support `i s m`
+  (ignorecase / dotall / multiline); `sub`/`gsub` accept a replacement string (`$0`/`$1`/`${name}`
+  expansion) or a callback function and return `new_subject, count`; `gmatch` returns a capture object with
+  `[0]` whole match, `[N]` groups and named groups; `opt`'s handle avoids recompiling on the hot path.
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
 - Background timers: `ngx.timer.at(delay_sec, cb, ...) / ngx.timer.every(interval_sec, cb, ...) / running_count() / pending_count()`
