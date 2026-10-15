@@ -472,7 +472,7 @@ pub fn interpolate_vars(template: &str, ctx: &RequestCtx) -> String {
     if out.contains("$http_") {
         out = expand_http_vars(&out, ctx);
     }
-    // `map` 派生变量：内置/http 变量已展开，剩余 `$dest` 用 map 表按名替换
+    // `map` / `geo` 派生变量：内置/http 变量已展开，剩余 `$dest` 用派生表按名替换
     // （长名优先，避免 `$a` 把 `$abc` 的前缀吞掉）。
     let dests = crate::engine::mapped_dests_sorted();
     if !dests.is_empty() {

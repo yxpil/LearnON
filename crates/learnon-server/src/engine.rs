@@ -178,10 +178,12 @@ pub fn install_maps(defs: Vec<MapDef>) {
     *map_store().write().unwrap() = defs;
 }
 
-/// 已安装 map 的目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
+/// 已安装的 map + geo 目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
 pub fn mapped_dests_sorted() -> Vec<String> {
     let mut v: Vec<String> = map_store().read().unwrap().iter().map(|d| d.dest.clone()).collect();
+    v.extend(geo_store().read().unwrap().iter().map(|d| d.dest.clone()));
     v.sort_by(|a, b| b.len().cmp(&a.len()));
+    v.dedup();
     v
 }
 
@@ -236,8 +238,8 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
     }
 }
 
-/// 解析变量 `$name`：若为 map 目标则按 map 求值（源可能是内置变量或另一个 map，
-/// 递归解析，`depth` 防环）；否则走内置变量表。`None` 表示未定义。
+/// 解析变量 `$name`：优先内置 map 目标，其次 geo 目标，最后内置变量表。
+/// map/geo 的源变量可再次经本函数递归解析（`depth` 防环）。`None` 表示未定义。
 pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     if depth > 8 {
         return None;
@@ -251,6 +253,9 @@ pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
             .or_else(|| resolve_var(ctx, &def.source, depth + 1))
             .unwrap_or_default();
         return Some(match_map(&def, &src));
+    }
+    if let Some(g) = resolve_geo(ctx, name, depth) {
+        return Some(g);
     }
     builtin_var(ctx, name)
 }
@@ -329,6 +334,84 @@ fn expand_map_result(result: &str, re: &regex::Regex, caps: &regex::Captures) ->
 /// 便捷入口：顶层变量解析（depth=0）。
 pub fn resolve_variable(ctx: &RequestCtx, name: &str) -> Option<String> {
     resolve_var(ctx, name, 0)
+}
+
+// ---------- nginx `geo` 派生变量（按客户端 IP 最长前缀匹配） ----------
+
+/// 一条 geo 网络规则：`ip/prefix`（v4 前缀≤32、v6≤128；省略 `/` 时 v4=/32、v6=/128）。
+#[derive(Debug, Clone)]
+pub struct GeoRule {
+    pub ip: std::net::IpAddr,
+    pub prefix: u8,
+    pub result: String,
+}
+
+/// 顶层 `geo [$source] $dest { ... }`：`$dest` 由源变量里的 IP 做最长前缀匹配得出。
+/// 缺省源为 `$remote_addr`。构建时规则按前缀长度降序排列，首个命中即最具体匹配。
+#[derive(Debug, Clone)]
+pub struct GeoDef {
+    pub dest: String,
+    pub source: String,
+    pub default: Option<String>,
+    pub rules: Vec<GeoRule>,
+}
+
+static GEOS: std::sync::OnceLock<std::sync::RwLock<Vec<GeoDef>>> = std::sync::OnceLock::new();
+
+fn geo_store() -> &'static std::sync::RwLock<Vec<GeoDef>> {
+    GEOS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// 由 Router::build 在每次构建路由表时原子替换（与 map 一样热重载安全）。
+pub fn install_geos(defs: Vec<GeoDef>) {
+    *geo_store().write().unwrap() = defs;
+}
+
+/// `target` 是否落在 `rule` 的网络内。族不同直接判否（v4 目标只匹配 v4 规则，反之亦然）。
+pub fn geo_rule_matches(target: &std::net::IpAddr, rule: &GeoRule) -> bool {
+    match (target, &rule.ip) {
+        (std::net::IpAddr::V4(t), std::net::IpAddr::V4(r)) => {
+            let (tv, rv) = (u32::from(*t), u32::from(*r));
+            let p = rule.prefix.min(32);
+            let mask = if p == 0 { 0 } else { !0u32 << (32 - p) };
+            (tv & mask) == (rv & mask)
+        }
+        (std::net::IpAddr::V6(t), std::net::IpAddr::V6(r)) => {
+            let (tv, rv) = (u128::from(*t), u128::from(*r));
+            let p = rule.prefix.min(128);
+            let mask = if p == 0 { 0u128 } else { !0u128 << (128 - p) };
+            (tv & mask) == (rv & mask)
+        }
+        _ => false,
+    }
+}
+
+/// 纯匹配：给定已解析的源 IP，按（已排序的）规则返回首个命中的结果，否则 default。
+pub fn match_geo(def: &GeoDef, ip: &std::net::IpAddr) -> String {
+    for r in &def.rules {
+        if geo_rule_matches(ip, r) {
+            return r.result.clone();
+        }
+    }
+    def.default.clone().unwrap_or_default()
+}
+
+/// 解析变量 `$name`（geo 版）：若 name 是某个 geo 的目标，则读源变量、解析成 IP、
+/// 最长前缀匹配；否则返回 None（交由 map / 内置变量处理）。
+fn resolve_geo(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let def = {
+        let store = geo_store().read().unwrap();
+        store.iter().find(|d| d.dest == name).cloned()
+    };
+    let def = def?;
+    let src_raw = builtin_var(ctx, &def.source)
+        .or_else(|| resolve_var(ctx, &def.source, depth + 1))
+        .unwrap_or_default();
+    let ip = src_raw.trim().parse::<std::net::IpAddr>().ok()?;
+    Some(match_geo(&def, &ip))
 }
 
 // ---------- rewrite / return ----------
@@ -682,11 +765,79 @@ mod tests {
         ctx.scheme = "https".into();
         ctx.remote_addr = "203.0.113.9".into();
         ctx.req_headers.push(("x-client".to_string(), "android-13".to_string()));
-        // 内置变量走 builtin_var（未安装任何 map 时 resolve_variable 等价于 builtin_var）
+        // 内置变量走 builtin_var（未安装任何 map/geo 时 resolve_variable 等价于 builtin_var）
         assert_eq!(resolve_variable(&ctx, "scheme").as_deref(), Some("https"));
         assert_eq!(resolve_variable(&ctx, "remote_addr").as_deref(), Some("203.0.113.9"));
         assert_eq!(resolve_variable(&ctx, "http_x_client").as_deref(), Some("android-13"));
         // 未定义变量返回 None
         assert_eq!(resolve_variable(&ctx, "no_such_var"), None);
+    }
+
+    #[test]
+    fn geo_exact_host_and_network_match() {
+        let def = GeoDef {
+            dest: "country".into(),
+            source: "remote_addr".into(),
+            default: Some("ZZ".into()),
+            rules: vec![
+                GeoRule { ip: "127.0.0.1".parse().unwrap(), prefix: 32, result: "local".into() },
+                GeoRule { ip: "10.1.0.0".parse().unwrap(), prefix: 16, result: "private".into() },
+            ],
+        };
+        assert_eq!(match_geo(&def, &"127.0.0.1".parse().unwrap()), "local");
+        assert_eq!(match_geo(&def, &"10.1.99.7".parse().unwrap()), "private");
+        assert_eq!(match_geo(&def, &"8.8.8.8".parse().unwrap()), "ZZ");
+        // /32 主机不匹配到 127.0.0.2
+        assert_eq!(match_geo(&def, &"127.0.0.2".parse().unwrap()), "ZZ");
+    }
+
+    #[test]
+    fn geo_longest_prefix_wins() {
+        // 声明顺序刻意「宽在前」，排序后应最具体优先
+        let mut rules = vec![
+            GeoRule { ip: "10.0.0.0".parse().unwrap(), prefix: 8, result: "wide".into() },
+            GeoRule { ip: "10.1.0.0".parse().unwrap(), prefix: 16, result: "mid".into() },
+            GeoRule { ip: "10.1.2.0".parse().unwrap(), prefix: 24, result: "narrow".into() },
+        ];
+        rules.sort_by(|a, b| b.prefix.cmp(&a.prefix));
+        let def = GeoDef {
+            dest: "d".into(),
+            source: "remote_addr".into(),
+            default: None,
+            rules,
+        };
+        assert_eq!(match_geo(&def, &"10.1.2.5".parse().unwrap()), "narrow");
+        assert_eq!(match_geo(&def, &"10.1.9.5".parse().unwrap()), "mid");
+        assert_eq!(match_geo(&def, &"10.9.9.9".parse().unwrap()), "wide");
+    }
+
+    #[test]
+    fn geo_ipv6_and_cross_family_never_match() {
+        let def = GeoDef {
+            dest: "d".into(),
+            source: "s".into(),
+            default: Some("none".into()),
+            rules: vec![
+                GeoRule { ip: "2001:db8::".parse().unwrap(), prefix: 32, result: "doc".into() },
+                GeoRule { ip: "::1".parse().unwrap(), prefix: 128, result: "loopback".into() },
+            ],
+        };
+        assert_eq!(match_geo(&def, &"2001:db8:abcd::1".parse().unwrap()), "doc");
+        assert_eq!(match_geo(&def, &"::1".parse().unwrap()), "loopback");
+        // IPv4 目标绝不匹配 IPv6 规则
+        assert_eq!(match_geo(&def, &"8.8.8.8".parse().unwrap()), "none");
+    }
+
+    #[test]
+    fn geo_prefix_zero_matches_all_of_family() {
+        let def = GeoDef {
+            dest: "d".into(),
+            source: "s".into(),
+            default: Some("other".into()),
+            rules: vec![GeoRule { ip: "0.0.0.0".parse().unwrap(), prefix: 0, result: "any-v4".into() }],
+        };
+        assert_eq!(match_geo(&def, &"1.2.3.4".parse().unwrap()), "any-v4");
+        // v6 不匹配 v4 的 /0
+        assert_eq!(match_geo(&def, &"::1".parse().unwrap()), "other");
     }
 }

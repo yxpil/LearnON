@@ -73,6 +73,7 @@ all gateway logic is hand-written.
 | `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name`, TLS policy in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
+| `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -269,6 +270,17 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   the proxied `proxy_set_header` path against a header-echo backend) + unit tests `match_map_*`,
   `parse_maps_all_forms`, and `quoted_token_can_start_a_statement` (parser now accepts a quoted
   directive name, which `map`'s `""` / quoted patterns require).
+- Derived variables — the nginx `geo` directive. Top-level `geo [$source] $dest { … }` matches the
+  source variable's IP against a table of CIDR networks and returns the **longest-prefix**
+  (most-specific) hit's value, else `default`. Both IPv4 and IPv6 are supported (a v4 target never
+  matches a v6 rule); a bare address is `/32` / `/128`. The source may be omitted (`geo $dest`
+  defaults to `$remote_addr`) or be any IP-valued variable (`$http_x_forwarded_for`, `$arg_ip`, …).
+  Rules are pre-sorted by prefix length at config-parse time. Because it shares `engine::resolve_variable`
+  with `map`, a geo `$dest` resolves identically in `ngx.var.<dest>` and in config strings like
+  `proxy_set_header … $dest;`. Verified by `tools/geo_e2e.py` (11 checks: host `/32`, wide `/8`, a
+  more-specific `/16` beating it via longest-prefix, a second network, `default`, and the omitted-source
+  `$remote_addr` form — each through Lua and the proxied `proxy_set_header` path against a header-echo
+  backend) + unit tests `geo_*` and `parse_geos_*`.
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

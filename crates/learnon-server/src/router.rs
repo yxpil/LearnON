@@ -26,7 +26,7 @@ use std::sync::Arc;
 use learnon_config::{Config, Directive};
 
 use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
-use crate::engine::{HandlerSpec, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule};
+use crate::engine::{HandlerSpec, GeoDef, GeoRule, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule};
 use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
 use crate::proxy_tls::TlsPolicy;
@@ -521,6 +521,68 @@ impl Router {
         Ok(defs)
     }
 
+    /// 解析顶层 `geo [$source] $dest { ... }` 块为 GeoDef 列表。
+    /// 分支语法：`default <val>;`、`<ip>/<prefix> <val>;`、`<ip> <val>;`。
+    /// 规则按前缀长度降序排列，令最长前缀（最具体）优先命中（对齐 ngx_geo）。
+    fn parse_geos(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<GeoDef>, AppError> {
+        let mut defs = Vec::new();
+        for d in config.root.block.iter().filter(|d| d.name == "geo") {
+            let (source_raw, dest_raw) = match d.args.len() {
+                1 => ("$remote_addr".to_string(), d.args[0].clone()),
+                2 => (d.args[0].clone(), d.args[1].clone()),
+                _ => {
+                    return Err(AppError::Other(format!(
+                        "geo 需要 1 或 2 个变量参数（第 {} 行）",
+                        d.line
+                    )))
+                }
+            };
+            let source = source_raw.trim_start_matches('$').to_string();
+            let dest = dest_raw.trim_start_matches('$').to_string();
+            if dest.is_empty() || source.is_empty() {
+                return Err(AppError::Other(format!("geo 目标/源变量为空（第 {} 行）", d.line)));
+            }
+            let mut default: Option<String> = None;
+            let mut rules: Vec<GeoRule> = Vec::new();
+            for c in &d.block {
+                let result = c.args.first().cloned().unwrap_or_default();
+                if c.name == "default" {
+                    default = Some(result);
+                    continue;
+                }
+                // 解析 `<ip>[/<prefix>]`
+                let (addr_str, prefix_str) = match c.name.split_once('/') {
+                    Some((a, p)) => (a, Some(p)),
+                    None => (c.name.as_str(), None),
+                };
+                let ip: std::net::IpAddr = addr_str.parse().map_err(|_| {
+                    AppError::Other(format!("geo {dest} 非法 IP '{addr_str}'（第 {} 行）", c.line))
+                })?;
+                let width: u8 = if ip.is_ipv4() { 32 } else { 128 };
+                let prefix: u8 = match prefix_str {
+                    Some(p) => p.parse().map_err(|_| {
+                        AppError::Other(format!("geo {dest} 非法前缀 '{p}'（第 {} 行）", c.line))
+                    })?,
+                    None => width,
+                };
+                if prefix > width {
+                    return Err(AppError::Other(format!(
+                        "geo {dest} 前缀 /{prefix} 超出 {width} 位上限（第 {} 行）",
+                        c.line
+                    )));
+                }
+                rules.push(GeoRule { ip, prefix, result });
+            }
+            // 最长前缀优先；前缀相同保持声明顺序（稳定排序）
+            rules.sort_by(|a, b| b.prefix.cmp(&a.prefix));
+            if default.is_none() && rules.is_empty() {
+                warnings.push(format!("geo {source} → {dest}（第 {} 行）没有任何规则，目标恒为空串", d.line));
+            }
+            defs.push(GeoDef { dest, source, default, rules });
+        }
+        Ok(defs)
+    }
+
     fn build_with_listeners(
         config: &Config,
         base_dir: &PathBuf,
@@ -550,6 +612,10 @@ impl Router {
         // 顶层 `map` 指令：解析后原子替换全局 map 表（build 与 rebuild 都经过这里，热重载安全）
         let maps = Self::parse_maps(config, &mut warnings)?;
         crate::engine::install_maps(maps);
+
+        // 顶层 `geo` 指令：同理，按 IP 最长前缀匹配的派生变量表
+        let geos = Self::parse_geos(config, &mut warnings)?;
+        crate::engine::install_geos(geos);
 
         let limits_declared: Vec<String> = config
             .root
@@ -1472,6 +1538,43 @@ mod tests {
             server { listen 127.0.0.1:18198; location / { return 200 z; } }
         "#;
         assert!(Router::build(&cfg(conf), &PathBuf::from(".")).is_err());
+    }
+
+    #[test]
+    fn parse_geos_sorts_longest_prefix_first() {
+        let conf = r#"
+            geo $client_net {
+                default      external;
+                10.0.0.0/8   wide;
+                10.1.0.0/16  mid;
+                127.0.0.1    loopback;
+                2001:db8::/32 doc;
+            }
+            server { listen 127.0.0.1:18197; location / { return 200 g; } }
+        "#;
+        let mut warns = Vec::new();
+        let defs = Router::parse_geos(&cfg(conf), &mut warns).unwrap();
+        assert_eq!(defs.len(), 1);
+        let g = &defs[0];
+        // 单参数形式：源默认 remote_addr，目标 $client_net
+        assert_eq!(g.source, "remote_addr");
+        assert_eq!(g.dest, "client_net");
+        assert_eq!(g.default.as_deref(), Some("external"));
+        // 无斜杠主机 → 满位前缀（v4/32, v6/128 保持声明值）
+        assert_eq!(g.rules.len(), 4);
+        // 按前缀降序：/32(127.0.0.1) 与 /32(2001:db8) 先于 /16 先于 /8
+        let prefixes: Vec<u8> = g.rules.iter().map(|r| r.prefix).collect();
+        assert_eq!(prefixes, vec![32, 32, 16, 8]);
+        assert!(g.rules.iter().any(|r| r.ip.to_string() == "127.0.0.1" && r.result == "loopback"));
+        assert!(g.rules.iter().any(|r| r.ip.to_string() == "2001:db8::"));
+    }
+
+    #[test]
+    fn parse_geos_rejects_bad_ip_and_prefix() {
+        let bad_ip = "geo $g { default x; not-an-ip v; } server{listen 18196;}";
+        assert!(Router::parse_geos(&cfg(bad_ip), &mut Vec::new()).is_err());
+        let bad_prefix = "geo $g { default x; 10.0.0.0/33 v; } server{listen 18196;}";
+        assert!(Router::parse_geos(&cfg(bad_prefix), &mut Vec::new()).is_err());
     }
 
     const TWO_HOSTS: &str = r#"
