@@ -32,6 +32,7 @@ mod metrics;
 mod proxy;
 mod proxy_cache;
 mod proxy_tls;
+mod realip;
 mod router;
 mod server;
 mod settings;

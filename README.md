@@ -76,6 +76,7 @@ all gateway logic is hand-written.
 | `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
 | `split_clients <key> $dst { … }` weighted-derived variables | MurmurHash2 over an interpolated key template, `%` buckets (fractional allowed) + `*` catch-all, same shared resolver | `engine.rs`, `router.rs` |
 | `sub_filter <m> <r>;` response rewrite | literal + `~`/`~*` regex match, `&` back-reference in the replacement, `sub_filter_once`/`sub_filter_types`, applied on buffered proxy/cache/static/Lua bodies | `engine.rs`, `server.rs`, `router.rs` |
+| `set_real_ip_from` + `real_ip_header`/`real_ip_recursive` | realip module: trust the client IP from a header only when the direct peer is in a trusted CIDR, XFF chain right-most (off) / recursive-trusted-skip (on); overrides `$remote_addr` before geo/limit/auth | `realip.rs`, `router.rs`, `server.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -310,6 +311,20 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   regex + `&` back-reference, `application/json` left alone under the default `text/html` gate, the
   `content_by_lua` path, a static file fully rewritten, and the same file's `Range` slice kept
   un-rewritten) + unit tests `sub_filter_*` and `parse_sub_filter_directives`.
+- Real client IP — the nginx `ngx_http_realip_module` (`realip.rs`). Behind a CDN or load balancer the
+  socket peer is the proxy, not the visitor; `set_real_ip_from <ip>|<cidr>` (repeatable) lists the
+  **trusted proxy** ranges, `real_ip_header <name>` (default `X-Real-IP`; e.g. `X-Forwarded-For`, or
+  Cloudflare's `CF-Connecting-IP`) names the header to trust, and `real_ip_recursive on|off` (default
+  `off`) decides how a comma-separated chain is reduced: off takes the right-most address, on scans
+  right-to-left and returns the first address that is *not* itself trusted. The rewrite is applied only
+  when the **direct peer** is trusted (so a client cannot forge the header) and it overwrites
+  `ctx.remote_addr` **before** every downstream consumer, so `$remote_addr`, `$binary_remote_addr`,
+  `geo`, `limit_req`/`limit_conn`, `allow`/`deny` and `access_log` all key off the real client. Verified
+  by `tools/real_ip_e2e.py` (12 checks across four server blocks that turn the always-`127.0.0.1` test
+  peer into trusted vs untrusted cases: X-Real-IP rewrite, the anti-forgery no-rewrite on an untrusted
+  peer, the same `X-Forwarded-For` value yielding the right-most proxy address under `recursive off` vs
+  the true client under `recursive on`, and a `geo $net` derived variable tracking the rewritten IP
+  through each case) + pure unit tests in `realip.rs` and router tests `parse_real_ip_directives_into_server`.
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

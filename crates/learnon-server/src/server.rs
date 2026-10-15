@@ -832,6 +832,17 @@ async fn handle_request(
         upstream_header_time: 0.0,
     };
 
+    // ---- realip：直连对端为可信代理时，用 real_ip_header 里的地址覆盖 $remote_addr ----
+    // 必须早于 limit_conn / limit_req / geo / auth，令这些环节都基于真实客户端 IP。
+    if server.real_ip.enabled() {
+        if let Some(peer) = meta.peer {
+            if let Some(real) = server.real_ip.apply(peer.ip(), &ctx.req_headers) {
+                log_debug!("realip：{} → {}（源自 ${}", peer, real, server.real_ip.header);
+                ctx.remote_addr = real;
+            }
+        }
+    }
+
     // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
     let mut conn_guards = Vec::new();
     for rule in &server.limit_conn {

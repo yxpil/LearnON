@@ -169,6 +169,8 @@ pub struct Server {
     pub access_rules: Vec<crate::access::AccessRule>,
     pub auth_basic_realm: Option<String>,
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `real_ip_header` / `set_real_ip_from` / `real_ip_recursive`（server 级，对标 nginx http/server）
+    pub real_ip: crate::realip::RealIpConf,
 }
 
 /// 一个真实监听端点
@@ -226,6 +228,7 @@ struct ServerTemplate {
     access_rules: Vec<crate::access::AccessRule>,
     auth_basic_realm: Option<String>,
     auth_basic_user_file: Option<PathBuf>,
+    real_ip: crate::realip::RealIpConf,
     ssl_cert: Option<PathBuf>,
     ssl_key: Option<PathBuf>,
     protocols: TlsProtocols,
@@ -732,7 +735,8 @@ impl Router {
                    "body_filter_by_lua", "body_filter_by_lua_file",
                    "log_by_lua", "log_by_lua_file",
                    "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
-                   "allow", "deny", "auth_basic", "auth_basic_user_file"],
+                   "allow", "deny", "auth_basic", "auth_basic_user_file",
+                   "set_real_ip_from", "real_ip_header", "real_ip_recursive"],
                 "server",
                 &mut warnings,
             );
@@ -819,6 +823,7 @@ impl Router {
                     access_rules: tmpl.access_rules.clone(),
                     auth_basic_realm: tmpl.auth_basic_realm.clone(),
                     auth_basic_user_file: tmpl.auth_basic_user_file.clone(),
+                    real_ip: tmpl.real_ip.clone(),
                 };
                 let list = groups.entry(addr).or_default();
                 if flags.default_server {
@@ -934,6 +939,7 @@ impl Router {
             access_rules: Vec::new(),
             auth_basic_realm: None,
             auth_basic_user_file: None,
+            real_ip: crate::realip::RealIpConf::default(),
             ssl_cert: None,
             ssl_key: None,
             protocols: TlsProtocols::default(),
@@ -1077,6 +1083,40 @@ impl Router {
         tmpl.access_rules = a_rules;
         tmpl.auth_basic_realm = a_realm;
         tmpl.auth_basic_user_file = a_file;
+
+        // realip 模块：set_real_ip_from（可重复）/ real_ip_header / real_ip_recursive
+        {
+            let mut ri = crate::realip::RealIpConf::default();
+            for h in d.block.iter().filter(|x| x.name == "real_ip_header").take(1) {
+                if let Some(v) = h.arg(0) {
+                    ri.header = crate::realip::normalize_header_name(v);
+                }
+            }
+            for c in d.block.iter().filter(|x| x.name == "set_real_ip_from") {
+                for a in &c.args {
+                    match crate::realip::parse_trusted_net(a) {
+                        Some(n) => ri.trusted.push(n),
+                        None => warnings.push(format!(
+                            "第 {} 行 set_real_ip_from 无法识别的地址/网段 '{a}'（已忽略）",
+                            c.line
+                        )),
+                    }
+                }
+            }
+            for r in d.block.iter().filter(|x| x.name == "real_ip_recursive").take(1) {
+                match r.arg(0) {
+                    Some("on") => ri.recursive = true,
+                    Some("off") => ri.recursive = false,
+                    other => warnings.push(format!(
+                        "第 {} 行 real_ip_recursive 只接受 on/off（收到 {:?}），保持 {}",
+                        r.line,
+                        other,
+                        if ri.recursive { "on" } else { "off" }
+                    )),
+                }
+            }
+            tmpl.real_ip = ri;
+        }
 
         for loc in d.block.iter().filter(|x| x.name == "location") {
             tmpl.locations
@@ -1741,8 +1781,46 @@ mod tests {
             &sf.filters[0].pattern,
             crate::engine::SubPattern::Literal(s) if s == "foo"
         ));
-        assert!(matches!(&sf.filters[1].pattern, crate::engine::SubPattern::Regex(_)));
+        assert!(matches!(
+            &sf.filters[1].pattern,
+            crate::engine::SubPattern::Regex(_)
+        ));
         assert_eq!(sf.filters[1].replacement, "hi");
+    }
+
+    #[test]
+    fn parse_real_ip_directives_into_server() {
+        let conf = r#"
+            server {
+                listen 127.0.0.1:18196;
+                real_ip_header X-Forwarded-For;
+                set_real_ip_from 127.0.0.0/8;
+                set_real_ip_from 10.0.0.1;
+                real_ip_recursive on;
+                location / { return 200 ok; }
+            }
+        "#;
+        let r = build(conf);
+        let srv = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()].servers[0];
+        assert_eq!(srv.real_ip.header, "x-forwarded-for", "real_ip_header 规范化为小写");
+        assert!(srv.real_ip.recursive, "real_ip_recursive on");
+        assert_eq!(srv.real_ip.trusted.len(), 2, "两条 set_real_ip_from 累加");
+        assert_eq!(srv.real_ip.trusted[0].prefix, 8);
+        assert_eq!(srv.real_ip.trusted[1].prefix, 32, "裸地址按满前缀");
+        assert!(srv.real_ip.enabled());
+    }
+
+    #[test]
+    fn real_ip_off_by_default_and_bad_net_warns() {
+        let conf = r#"
+            server { listen 127.0.0.1:18197; set_real_ip_from not-an-ip; location / { return 200 ok; } }
+        "#;
+        let r = build(conf);
+        let srv = &r.groups[&"127.0.0.1:18197".parse::<std::net::SocketAddr>().unwrap()].servers[0];
+        assert!(!srv.real_ip.enabled(), "非法网段被忽略 → 模块关闭");
+        assert!(!srv.real_ip.recursive, "默认 recursive off");
+        assert_eq!(srv.real_ip.header, "x-real-ip", "默认头部 x-real-ip");
+        assert!(r.warnings.iter().any(|w| w.contains("set_real_ip_from")));
     }
 
     #[test]
