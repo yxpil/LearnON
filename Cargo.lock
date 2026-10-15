@@ -685,6 +685,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "regex",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "socket2",

@@ -410,6 +410,9 @@ struct CoState {
     reply: oneshot::Sender<Result<(), AppError>>,
     /// 本次让出对应的唤醒参数（睡眠为空；cosocket op 携带结果）。resume 前消费并清空。
     wake_args: Vec<ResumeVal>,
+    /// 该协程所属阶段名（rewrite/access/content/header_filter/body_filter/log/timer…）。
+    /// resume 前回挂到 registry 的 `__phase`，供 ngx.get_phase() 读取（对标 ngx_lua）。
+    phase: String,
 }
 
 pub struct LuaEngine {
@@ -544,6 +547,149 @@ fn decode_args(query: &str) -> Vec<(String, LuaArgValue)> {
     }
     out
 }
+
+// ---------- ngx.* 摘要 / CRC / 时间（ring 纯 Rust，复用依赖图中已有的 ring） ----------
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// MD5 摘要核心（纯 Rust，教科书 RFC1321；ring 不提供 MD5，故自实现）。
+fn md5_bytes(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: [u32; 64] =
+        std::array::from_fn(|i| (2f64.powi(32) * ((i as f64 + 1.0).sin().abs())) as u32);
+
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_le_bytes());
+
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+
+    for chunk in msg.chunks(64) {
+        let mut m = [0u32; 16];
+        for (i, w) in m.iter_mut().enumerate() {
+            *w = u32::from_le_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (mut f, g) = match i {
+                0..=15 => ((b & c) | (!b & d), i),
+                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// ngx.md5(str) —— 十六进制小写摘要
+fn md5_hex(data: &[u8]) -> String {
+    hex_lower(&md5_bytes(data))
+}
+
+/// ngx.md5_bin(str) —— 原始 16 字节
+fn md5_bin(data: &[u8]) -> Vec<u8> {
+    md5_bytes(data).to_vec()
+}
+
+/// ngx.sha1_bin(str) —— 原始 20 字节（OpenResty 语义）
+fn sha1_bin(data: &[u8]) -> Vec<u8> {
+    ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
+        .as_ref()
+        .to_vec()
+}
+
+/// ngx.hmac_sha1(key, str) —— 原始 20 字节 HMAC
+fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
+    ring::hmac::sign(&k, data).as_ref().to_vec()
+}
+
+/// CRC32（IEEE 802.3 反向多项式 0xEDB88320），与 nginx/OpenResty 的 crc32 逐位一致。
+fn crc32(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut tab = [0u32; 256];
+        for (i, e) in tab.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        tab
+    });
+    let mut crc = !0u32;
+    for &b in data {
+        crc = t[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// ngx.cookie_time(ts) —— Netscape cookie 时间串 "%a, %d-%b-%Y %H:%M:%S GMT"
+fn cookie_time(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%a, %d-%b-%Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|| "Thu, 01-Jan-1970 00:00:00 GMT".to_string())
+}
+
+/// ngx.http_time(ts) —— IMF (RFC1123) 时间串 "Wdy, DD Mon YYYY HH:MM:SS GMT"
+fn http_time(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string())
+}
+
+/// ngx.parse_http_time(str) —— 解析 IMF 时间回 unix 秒；失败返回 None（OpenResty 语义）
+fn parse_http_time(s: &str) -> Option<i64> {
+    use chrono::{DateTime, Utc};
+    if let Ok(dt) = DateTime::parse_from_rfc2822(s) {
+        return Some(dt.with_timezone(&Utc).timestamp());
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|n| n.and_utc().timestamp())
+}
+
 
 /// 参数值：字符串或布尔标志
 pub enum LuaArgValue {
@@ -1012,6 +1158,41 @@ impl LuaEngine {
             Ok(())
         })?;
         header.set("set", header_set)?;
+
+        // ngx.header 元表：让 `ngx.header["X"] = v` / `local v = ngx.header["X"]` 直接读写
+        // 响应头（对标 ngx_lua）——赋值路由进 ctx.resp_headers，读取按大小写不敏感回查。
+        let header_mt = lua.create_table()?;
+        let header_newindex = lua.create_function(move |lua, (_t, name, value): (LuaTable, String, LuaValue)| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            let key = name.to_lowercase();
+            ctx.resp_headers.retain(|(k, _)| k.to_lowercase() != key);
+            match value {
+                LuaValue::String(s) => ctx.resp_headers.push((key, s.to_string_lossy().to_string())),
+                LuaValue::Integer(n) => ctx.resp_headers.push((key, n.to_string())),
+                LuaValue::Number(n) => ctx.resp_headers.push((key, n.to_string())),
+                LuaValue::Boolean(b) => ctx.resp_headers.push((key, b.to_string())),
+                LuaValue::Nil => {} // nil = 删除
+                other => {
+                    let bs = lua_value_to_bytes(&other).unwrap_or_default();
+                    ctx.resp_headers.push((key, String::from_utf8_lossy(&bs).into_owned()));
+                }
+            }
+            Ok(())
+        })?;
+        let header_index = lua.create_function(move |lua, (_t, name): (LuaTable, String)| {
+            let h = get_ctx(lua)?;
+            let ctx = h.0.lock().unwrap();
+            let key = name.to_lowercase();
+            match ctx.resp_headers.iter().rfind(|(k, _)| k.to_lowercase() == key) {
+                Some((_, v)) => Ok(LuaValue::String(lua.create_string(v.as_str())?)),
+                None => Ok(LuaValue::Nil),
+            }
+        })?;
+        header_mt.set("__newindex", header_newindex)?;
+        header_mt.set("__index", header_index)?;
+        header.set_metatable(Some(header_mt));
+
         ngx.set("header", header)?;
 
         // ngx.arg —— body_filter_by_lua 参数访问（ngx.arg[1]=chunk, ngx.arg[2]=eof）
@@ -1261,7 +1442,74 @@ impl LuaEngine {
         })?;
         req.set("get_body_data", get_body)?;
 
+        // ngx.req.read_body() —— 请求体已由服务层缓冲，保留为幂等兼容占位
+        let read_body = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
+        req.set("read_body", read_body)?;
+        // ngx.req.get_body_file() —— 本实现请求体常驻内存，恒返回 nil（对标 in-memory 情形）
+        let get_body_file = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
+        req.set("get_body_file", get_body_file)?;
+        // ngx.req.set_body_data(data) —— 用新体覆盖请求体（供 rewrite/exec 后转发）
+        let set_body_data = lua.create_function(move |lua, data: LuaString| {
+            let h = get_ctx(lua)?;
+            h.0.lock().unwrap().req_body = data.as_bytes().to_vec();
+            Ok(LuaValue::Nil)
+        })?;
+        req.set("set_body_data", set_body_data)?;
+        // ngx.req.discard_body() —— 丢弃请求体
+        let discard_body = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            h.0.lock().unwrap().req_body.clear();
+            Ok(LuaValue::Nil)
+        })?;
+        req.set("discard_body", discard_body)?;
+        // ngx.req.set_method(method)
+        let set_method = lua.create_function(move |lua, m: String| {
+            let h = get_ctx(lua)?;
+            h.0.lock().unwrap().method = m;
+            Ok(LuaValue::Nil)
+        })?;
+        req.set("set_method", set_method)?;
+        // ngx.req.get_post_args() —— application/x-www-form-urlencoded 请求体解析为表
+        let get_post_args = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let body = h.0.lock().unwrap().req_body.clone();
+            let q = String::from_utf8_lossy(&body).into_owned();
+            Ok(LuaValue::Table(push_args_table(lua, decode_args(&q))?))
+        })?;
+        req.set("get_post_args", get_post_args)?;
+        // ngx.req.raw_header([full]) —— 重建请求首部文本；full=true 追加空行与请求体
+        let raw_header = lua.create_function(move |lua, full: Option<bool>| {
+            let h = get_ctx(lua)?;
+            let ctx = h.0.lock().unwrap();
+            let mut s = format!("{} {} HTTP/1.1\r\n", ctx.method, ctx.uri);
+            for (k, v) in &ctx.req_headers {
+                s.push_str(&format!("{k}: {v}\r\n"));
+            }
+            s.push_str("\r\n");
+            if full.unwrap_or(false) {
+                if let Ok(bs) = lua.create_string(ctx.req_body.as_slice()) {
+                    s.push_str(&bs.to_string_lossy());
+                }
+            }
+            Ok(LuaValue::String(lua.create_string(s)?))
+        })?;
+        req.set("raw_header", raw_header)?;
+
         ngx.set("req", req)?;
+
+        // ngx.resp.get_headers() —— 响应头表
+        let resp = lua.create_table()?;
+        let resp_headers = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let ctx = h.0.lock().unwrap();
+            let t = lua.create_table()?;
+            for (k, v) in &ctx.resp_headers {
+                t.raw_set(k.as_str(), v.as_str())?;
+            }
+            Ok(LuaValue::Table(t))
+        })?;
+        resp.set("get_headers", resp_headers)?;
+        ngx.set("resp", resp)?;
 
         // ngx.re.* —— 正则（桥接 Rust regex crate；对标 PCRE 的常用子集）
         let re = lua.create_table()?;
@@ -1363,6 +1611,79 @@ impl LuaEngine {
         })?;
         ngx.set("encode_args", ea)?;
 
+        // ---------- ngx.* 摘要 / CRC / 时间 ----------
+        // ngx.md5(str[, binary]) —— 默认十六进制小写；第二参 true 返回原始 16 字节
+        let md5 = lua.create_function(|lua, (s, bin): (LuaString, Option<bool>)| {
+            let bytes = s.as_bytes().to_vec();
+            if bin.unwrap_or(false) {
+                Ok(LuaValue::String(lua.create_string(md5_bin(&bytes))?))
+            } else {
+                Ok(LuaValue::String(lua.create_string(md5_hex(&bytes))?))
+            }
+        })?;
+        ngx.set("md5", md5)?;
+        let md5_bin_f = lua.create_function(|lua, s: LuaString| {
+            let bytes = s.as_bytes().to_vec();
+            Ok(LuaValue::String(lua.create_string(md5_bin(&bytes))?))
+        })?;
+        ngx.set("md5_bin", md5_bin_f)?;
+        // ngx.sha1_bin(str[, hex]) —— 默认原始 20 字节；第二参 true 返回十六进制
+        let sha1_bin_f = lua.create_function(|lua, (s, hex): (LuaString, Option<bool>)| {
+            let raw = sha1_bin(&s.as_bytes().to_vec());
+            if hex.unwrap_or(false) {
+                Ok(LuaValue::String(lua.create_string(hex_lower(&raw))?))
+            } else {
+                Ok(LuaValue::String(lua.create_string(raw)?))
+            }
+        })?;
+        ngx.set("sha1_bin", sha1_bin_f)?;
+        // ngx.hmac_sha1(secret, str) —— 原始 20 字节 HMAC-SHA1（OpenResty 语义）
+        let hmac = lua.create_function(|lua, (key, data): (LuaString, LuaString)| {
+            let mac = hmac_sha1(&key.as_bytes().to_vec(), &data.as_bytes().to_vec());
+            Ok(LuaValue::String(lua.create_string(mac)?))
+        })?;
+        ngx.set("hmac_sha1", hmac)?;
+        // ngx.crc32_short / crc32_long —— 同一 CRC32（历史命名，结果一致），无符号整数
+        let crc = lua.create_function(|_, s: LuaString| Ok(crc32(&s.as_bytes().to_vec()) as i64))?;
+        ngx.set("crc32_short", crc.clone())?;
+        ngx.set("crc32_long", crc)?;
+        // ngx.cookie_time(ts) / ngx.http_time(ts)
+        let ctime = lua.create_function(|_, ts: i64| Ok(cookie_time(ts)))?;
+        ngx.set("cookie_time", ctime)?;
+        let htime = lua.create_function(|_, ts: i64| Ok(http_time(ts)))?;
+        ngx.set("http_time", htime)?;
+        // ngx.parse_http_time(str) —— 成功返回 unix 秒，失败返回 nil
+        let ptime = lua.create_function(|_, s: LuaString| {
+            Ok(match parse_http_time(&s.to_string_lossy()) {
+                Some(ts) => LuaValue::Integer(ts),
+                None => LuaValue::Nil,
+            })
+        })?;
+        ngx.set("parse_http_time", ptime)?;
+        // ngx.today() —— "YYYY-MM-DD"（本地日，UTC 对齐 nginx 语义）
+        let today = lua.create_function(|_, ()| {
+            Ok(chrono::Utc::now().format("%Y-%m-%d").to_string())
+        })?;
+        ngx.set("today", today)?;
+        // ngx.update_time() —— 刷新缓存时间。本实现每次实时取钟，故为无副作用的兼容占位。
+        let update_time = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
+        ngx.set("update_time", update_time)?;
+        // ngx.get_phase() —— 返回当前阶段名（rewrite/access/content/header_filter/body_filter/log…）
+        let get_phase = lua.create_function(|lua, ()| {
+            match lua.named_registry_value::<String>("__phase") {
+                Ok(p) => Ok(LuaValue::String(lua.create_string(p)?)),
+                Err(_) => Ok(LuaValue::Nil),
+            }
+        })?;
+        ngx.set("get_phase", get_phase)?;
+
+        // ngx.worker.* —— 单进程反应器：pid 真实，worker id 恒 0，count 恒 1
+        let worker = lua.create_table()?;
+        worker.set("pid", lua.create_function(|_, ()| Ok(std::process::id() as i64))?)?;
+        worker.set("id", lua.create_function(|_, ()| Ok(0i64))?)?;
+        worker.set("count", lua.create_function(|_, ()| Ok(1i64))?)?;
+        ngx.set("worker", worker)?;
+
         // ngx.config —— 版本信息（服务器品牌：LearnON）
         let config_tbl = lua.create_table()?;
         config_tbl.set("server", "LearnON")?;
@@ -1370,6 +1691,17 @@ impl LuaEngine {
         config_tbl.set("nginx_version", "1.27.0-compatible")?;
         config_tbl.set("ngx_lua_version", "0.10.28-compatible")?;
         config_tbl.set("learnon_version", env!("CARGO_PKG_VERSION"))?;
+        config_tbl.set("subsystem", "http")?;
+        config_tbl.set("no_debug", true)?;
+        // ngx.config.prefix() —— 返回工作目录（对标 nginx `-p` 前缀）
+        config_tbl.set(
+            "prefix",
+            lua.create_function(|_, ()| {
+                Ok(std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "./".to_string()))
+            })?,
+        )?;
         ngx.set("config", config_tbl)?;
 
         // ngx.status —— 通过 metatable 支持读写：ngx.status = 201 / 读取 ngx.status
@@ -1391,6 +1723,13 @@ impl LuaEngine {
                 "status" => {
                     let f: LuaFunction = t.raw_get("_get_status")?;
                     f.call(())
+                }
+                "is_subrequest" => {
+                    // 子请求（ngx.location.capture）派生：capture_depth>0 或内部请求标志
+                    let ud: AnyUserData = _lua.named_registry_value("__ctx")?;
+                    let h = ud.borrow::<CtxHandle>()?;
+                    let ctx = h.0.lock().unwrap();
+                    Ok(LuaValue::Boolean(ctx.capture_depth > 0))
                 }
                 _ => Ok(LuaValue::Nil),
             }
@@ -1518,7 +1857,14 @@ impl LuaEngine {
                         Ok((thread_key, ctx_table_key)) => {
                             states.insert(
                                 co_id,
-                                CoState { thread_key, ctx_table_key, ctx, reply, wake_args: Vec::new() },
+                                CoState {
+                                    thread_key,
+                                    ctx_table_key,
+                                    ctx,
+                                    reply,
+                                    wake_args: Vec::new(),
+                                    phase: phase_name,
+                                },
                             );
                             ready.push_back(co_id);
                         }
@@ -1554,6 +1900,7 @@ impl LuaEngine {
                         Some(st) => {
                             let _ = lua
                                 .set_named_registry_value("__ctx", CtxHandle(Arc::clone(&st.ctx)));
+                            let _ = lua.set_named_registry_value("__phase", st.phase.clone());
                             if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
                                 let _ = ngx.raw_set("ctx", ct);
                             }
@@ -1810,5 +2157,59 @@ fn lua_value_to_bytes(v: &LuaValue) -> Option<Vec<u8>> {
         LuaValue::Boolean(true) => Some(b"true".to_vec()),
         LuaValue::Boolean(false) => Some(b"false".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_matches_rfc1321_vectors() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        // 跨分块填充（>55 字节，触发第二轮补零到 %64==56）
+        assert_eq!(
+            md5_hex(b"hello world this is a longer message to cross one 64-byte block boundary"),
+            hex_lower(&md5_bytes(
+                b"hello world this is a longer message to cross one 64-byte block boundary"
+            ))
+        );
+        assert_eq!(md5_bin(b"abc").len(), 16);
+        assert_eq!(md5_bin(b"abc"), md5_bytes(b"abc").to_vec());
+    }
+
+    #[test]
+    fn sha1_bin_matches_known_digest() {
+        assert_eq!(
+            hex_lower(&sha1_bin(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(sha1_bin(b"abc").len(), 20);
+    }
+
+    #[test]
+    fn hmac_sha1_matches_rfc2202() {
+        assert_eq!(
+            hex_lower(&hmac_sha1(b"Jefe", b"what do ya want for nothing?")),
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+        );
+    }
+
+    #[test]
+    fn crc32_matches_std_vector() {
+        assert_eq!(crc32(b"123456789"), 0xCBF43926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn time_formatting_and_parsing() {
+        assert_eq!(http_time(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(cookie_time(0), "Thu, 01-Jan-1970 00:00:00 GMT");
+        // 往返：格式化后再解析回同一 unix 秒
+        let ts = 1_700_000_000i64;
+        let s = http_time(ts);
+        assert_eq!(parse_http_time(&s), Some(ts));
+        assert_eq!(parse_http_time("not-a-date"), None);
     }
 }

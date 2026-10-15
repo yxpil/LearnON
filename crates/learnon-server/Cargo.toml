@@ -45,6 +45,9 @@ thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+# ngx.md5/sha1/hmac_* 摘要与 HMAC：ring 已在依赖图中（rustls 传递依赖），此处提升为
+# 直接依赖以复用同一份纯 Rust 密码实现，非新增外部栈。
+ring = "0.17"
 # 反向代理 https/wss 后端的连接器实现 tower_service::Service<Uri>（hyper legacy
 # Connect 的公开逃生口）；已在依赖图中（hyper-util 传递依赖），非新增加密栈。
 tower-service = "0.3"

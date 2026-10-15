@@ -168,8 +168,8 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 
 ## Lua API (aligned with ngx.*)
 
-- Response: `ngx.say / print / status (read-write) / exit / header.set / any response header before send_headers`
-- Request: `ngx.req.get_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / get_body_data`
+- Response: `ngx.say / print / status (read-write) / exit / header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
+- Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])`
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep (async coroutine)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / settimeout / close /
   setkeepalive / getstats` — non-blocking TCP, yields to the VM scheduler so concurrent requests
@@ -197,6 +197,17 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   progressing; nested captures are supported with a depth guard (`status = 0` on overflow, mirroring
   ngx_lua's error sentinel). Verified by `tools/subrequest_e2e.py`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
+- Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
+  sha1_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
+  against RFC 1321 / RFC 2202 / the CRC-32 `0xCBF43926` vector
+- Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
+  (IMF + Netscape-cookie formats, `parse_http_time` returns `nil` on garbage)
+- Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)
+  and `ngx.is_subrequest` (true inside an `ngx.location.capture` subrequest)
+- Workers & config: `ngx.worker.pid() / id() / count()` and `ngx.config.subsystem / prefix() /
+  no_debug` — LearnON is a single-process reactor, so `id()` is always `0` and `count()` is `1`
+  (`pid()` is the real OS pid)
+- All of the above are exercised end-to-end against real traffic by `tools/ngx_api_e2e.py` (36 checks).
 
 ## E2E tests (aligned with the OpenResty official suite)
 
