@@ -170,7 +170,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 
 - Response: `ngx.say / print / status (read-write) / exit / header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
 - Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])`
-- Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep (async coroutine)`
+- Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep(secs) (async coroutine, seconds unit aligned with OpenResty)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
   receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
   tlshandshake(opts) / reconnect / close / getstats` — non-blocking TCP, every op yields to the VM
@@ -205,6 +205,18 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   the VM scheduler (like the cosocket ops) so the parent coroutine and other in-flight requests keep
   progressing; nested captures are supported with a depth guard (`status = 0` on overflow, mirroring
   ngx_lua's error sentinel). Verified by `tools/subrequest_e2e.py`.
+- Light threads: `ngx.thread.spawn(func, ...) / ngx.thread.wait(thread...) / ngx.thread.yield() /
+  ngx.thread.kill(thread)` — spawned threads are first-class coroutines on
+  the same VM scheduler (they share the parent request's `ngx.ctx` and interleave real `ngx.sleep` /
+  cosocket I/O, not OS threads). `wait` returns on whichever awaited thread finishes *first* (any
+  completion wakes the parked parent), forwarding that thread's return values on success
+  (`ok, ret…`) or `(false, err)` when the thread errors or is killed; `yield` gives other coroutines a
+  scheduling turn; killing a thread drops its in-flight sleep/socket op. The request terminating reaps
+  any still-running children (mirrors ngx_lua). Verified by `tools/thread_e2e.py` (24 checks, incl. a
+  wall-clock proof that 4 concurrent 0.4 s sleeps finish in ≪ 1.6 s and that two yielding threads
+  interleave `ABABAB`). `ngx.on_abort(handler)` additionally accepts and stores a per-request abort
+  callback (API-compatible); the disconnect-driven *invocation* hook is not yet wired to the server's
+  connection-liveness path and is on the roadmap.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte

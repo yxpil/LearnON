@@ -18,7 +18,7 @@
 //!   前按协程挂回各自的 __ctx / ngx.ctx（每请求一张表，跨让出保持），阶段结束后由 Rust 侧
 //!   继续接管同一个 ctx
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -1009,9 +1009,10 @@ struct Job {
 
 /// VM 槽位：提交作业的发端（run_phase 用）+ 每 VM 的协程 id 计数。
 /// VM 本体由调度器任务持有强引用（引擎存活期间调度器不退出），Weak<VM> 供 ngx.timer 回调加锁。
+/// co_counter 同时用于 Job 主协程 id 与 ngx.thread 子协程 id（同一命名空间，杜绝 states 键冲突）。
 struct VmSlot {
     job_tx: mpsc::UnboundedSender<Job>,
-    next_co: AtomicU64,
+    co_counter: Arc<AtomicU64>,
 }
 
 /// 调度器在协程让出后、重新 resume 时回传给协程的值（纯 Rust，跨 await 安全）。
@@ -1044,7 +1045,43 @@ struct CoState {
     /// 该协程所属阶段名（rewrite/access/content/header_filter/body_filter/log/timer…）。
     /// resume 前回挂到 registry 的 `__phase`，供 ngx.get_phase() 读取（对标 ngx_lua）。
     phase: String,
+    // ---------- ngx.thread.* 轻量级线程（light thread）----------
+    /// true=由 ngx.thread.spawn 派生的子协程（不拥有请求 reply）；false=Job 主协程。
+    is_child: bool,
+    /// 所属请求（顶层 Job）的 co id；主协程等于自身，子协程等于派生它的那个请求。用于共享 ctx 与收尾回收。
+    owner: u64,
+    /// 若为 Some(tid)，本次 resume 用 Lua 侧 `__thread_sink[tid]` 的打包结果作唤醒值喂回
+    /// （ngx.thread.wait 命中已完成线程时经调度器投递）。resume 前消费并清空。
+    wake_tid: Option<u64>,
 }
+
+/// ngx.thread.* 的跨锁信箱：请求协程内的 spawn/wait/kill 原语把「意图」写在这里，
+/// 由所属 VM 的调度器在持锁一步内消费（登记子协程、挂起/即时唤醒 wait、杀掉线程）。
+/// 用 std Mutex，临界区极短、绝不跨 await；加锁顺序恒为「先 VM 锁、后 ctl」。
+pub(crate) struct SchedCtl {
+    spawns: Vec<SpawnReq>,
+    waits: Vec<WaitReq>,
+    kills: Vec<u64>,
+}
+
+/// 一次 spawn 的登记：tid=新子协程 id，owner=所属请求 co id，thread_key=已建好的协程句柄。
+struct SpawnReq {
+    tid: u64,
+    owner: u64,
+    thread_key: RegistryKey,
+}
+
+/// 一次 wait 的登记：op=父协程 yield 出的等待 op id，tids=被等待的线程（任一完成即返回）。
+struct WaitReq {
+    op: u64,
+    tids: Vec<u64>,
+}
+
+type SharedCtl = Arc<std::sync::Mutex<SchedCtl>>;
+
+/// ngx.thread.yield() 让出后「重排再跑」的哨兵 op id（对应 Lua 整数 i64::MAX）：
+/// 调度器认出它即把本协程重新入队，不登记 waiting（真实 op id 从 1 递增，永达不到此值）。
+const THREAD_YIELD_MARK: u64 = i64::MAX as u64;
 
 pub struct LuaEngine {
     /// Lua VM 池：每 CPU 核心一个独立 VM，VM 之间完全并行；
@@ -1388,6 +1425,14 @@ impl LuaEngine {
             let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
             let (ev_tx, ev_rx) = mpsc::unbounded_channel::<(u64, Vec<ResumeVal>)>();
             let op_counter = Arc::new(AtomicU64::new(1));
+            // co_counter：Job 主协程与 ngx.thread 子协程共用同一 id 命名空间（states 键唯一）。
+            // sched_ctl：请求协程内的 spawn/wait/kill 原语 ↔ 调度器的跨锁信箱。
+            let co_counter = Arc::new(AtomicU64::new(1));
+            let sched_ctl: SharedCtl = Arc::new(std::sync::Mutex::new(SchedCtl {
+                spawns: Vec::new(),
+                waits: Vec::new(),
+                kills: Vec::new(),
+            }));
             {
                 let mut guard = vm.try_lock()
                     .map_err(|_| AppError::Other("Lua VM 启动时被占用".to_string()))?;
@@ -1400,6 +1445,8 @@ impl LuaEngine {
                     &ev_tx,
                     &op_counter,
                     &subreq_slot,
+                    &co_counter,
+                    &sched_ctl,
                 )?;
                 crate::lua_resty::install_modules(&guard)
                     .map_err(|e| AppError::Other(format!("注册 resty.* 模块失败: {e}")))?;
@@ -1409,10 +1456,15 @@ impl LuaEngine {
             }
             // ev_tx 的存活副本此刻已冻结进 ngx.sleep 的 Rust 闭包里；调度器只持有 ev_rx
             // 调度器任务持有 VM 的强引用：引擎存活期间 job_tx 不 drop，调度器不退出，VM 随之存活
-            tokio::spawn(Self::run_scheduler(vm.clone(), job_rx, ev_rx));
+            tokio::spawn(Self::run_scheduler(
+                vm.clone(),
+                job_rx,
+                ev_rx,
+                Arc::clone(&sched_ctl),
+            ));
             vms.push(Arc::new(VmSlot {
                 job_tx,
-                next_co: AtomicU64::new(1),
+                co_counter,
             }));
         }
         for (name, _) in &inits {
@@ -1443,6 +1495,8 @@ impl LuaEngine {
         ev_tx: &mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
         op_counter: &Arc<AtomicU64>,
         subreq_slot: &SubreqSlot,
+        co_counter: &Arc<AtomicU64>,
+        sched_ctl: &SharedCtl,
     ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
@@ -1565,16 +1619,16 @@ impl LuaEngine {
         })?;
         ngx.set("exec", exec)?;
 
-        // ngx.sleep(ms) —— 让出当前请求协程，不阻塞 VM：
+        // ngx.sleep(secs) —— 让出当前请求协程，不阻塞 VM（单位与 OpenResty 对齐：秒，可带小数）：
         // _learnon_sleep_start 用 tokio 定时器计时，把完成事件投回所属 VM 调度器并返回 sleep id；
         // Lua 侧随即 coroutine.yield(id) 挂起，调度器收到该 id 的事件后再 resume 本协程。
         {
             let ev_tx = ev_tx.clone();
             let counter = Arc::clone(op_counter);
-            let sleep_start = lua.create_function(move |_lua, ms: f64| {
+            let sleep_start = lua.create_function(move |_lua, secs: f64| {
                 let id = counter.fetch_add(1, Ordering::Relaxed);
                 let ev_tx = ev_tx.clone();
-                let dur = std::time::Duration::from_millis(ms.max(0.0) as u64);
+                let dur = std::time::Duration::from_secs_f64(secs.max(0.0));
                 tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
                     let _ = ev_tx.send((id, Vec::new()));
@@ -2058,6 +2112,163 @@ impl LuaEngine {
         let location_tbl: LuaTable = location_mod.call(())?;
         ngx.set("location", location_tbl)?;
 
+        // ---------- ngx.thread.* —— 轻量级线程（light thread），同 VM 真并发 ----------
+        // spawn/wait/yield/kill 与请求协程共用调度器：子协程是 states 里的一等协程，
+        // 因此能和其它请求/子线程交错跑 cosocket/ngx.sleep；结果经 Lua 侧 `__thread_sink`
+        // 表打包，由调度器在「线程完成 / wait 命中」时喂回等待方协程（对标 ngx_lua）。
+        // 结果表 sink[tid] = table.pack(ok, ret...)，ok=false 时为 table.pack(false, err)。
+        lua.globals().set("__thread_sink", lua.create_table()?)?;
+        let define_body: LuaFunction = lua
+            .load(
+                r#"return function()
+                    _G.__thread_body = function(func, args, tid)
+                        return function()
+                            local r = table.pack(pcall(func, table.unpack(args, 1, args.n)))
+                            local sink = _G.__thread_sink
+                            if r[1] then
+                                sink[tid] = table.pack(true, table.unpack(r, 2, r.n))
+                            else
+                                sink[tid] = table.pack(false, r[2])
+                            end
+                        end
+                    end
+                end"#,
+            )
+            .eval()?;
+        define_body.call::<()>(())?;
+
+        // _learnon_thread_spawn(func, packed_args) -> tid：建子协程 + 登记信箱。
+        {
+            let ctl = Arc::clone(sched_ctl);
+            let counter = Arc::clone(co_counter);
+            let spawn = lua.create_function(move |lua_ctx, (func, args): (LuaFunction, LuaTable)| {
+                let owner = lua_ctx
+                    .named_registry_value::<i64>("__cur_owner")
+                    .map(|v| v as u64)
+                    .unwrap_or(0);
+                if owner == 0 {
+                    return Err(mlua::Error::external(
+                        "ngx.thread.spawn 只能在请求协程内调用（无所属请求）",
+                    ));
+                }
+                let tid = counter.fetch_add(1, Ordering::Relaxed);
+                let body: LuaFunction = lua_ctx
+                    .globals()
+                    .get::<LuaFunction>("__thread_body")?
+                    .call((func, args, tid as i64))?;
+                let co = lua_ctx.create_thread(body)?;
+                let thread_key = lua_ctx.create_registry_value(co)?;
+                ctl.lock().unwrap().spawns.push(SpawnReq {
+                    tid,
+                    owner,
+                    thread_key,
+                });
+                Ok(tid as i64)
+            })?;
+            lua.globals().set("_learnon_thread_spawn", spawn)?;
+        }
+        // _learnon_thread_wait(tids) -> op：登记等待意图，返回让出用的 op id。
+        {
+            let ctl = Arc::clone(sched_ctl);
+            let counter = Arc::clone(op_counter);
+            let wait = lua.create_function(move |_lua, tids: LuaTable| {
+                let mut v = Vec::new();
+                let mut i = 1i64;
+                loop {
+                    match tids.raw_get::<i64>(i) {
+                        Ok(n) => {
+                            v.push(n as u64);
+                            i += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if v.is_empty() {
+                    return Err(mlua::Error::external("ngx.thread.wait 需要一个线程参数"));
+                }
+                let op = counter.fetch_add(1, Ordering::Relaxed);
+                ctl.lock().unwrap().waits.push(WaitReq { op, tids: v });
+                Ok(op as i64)
+            })?;
+            lua.globals().set("_learnon_thread_wait", wait)?;
+        }
+        // _learnon_thread_yield() -> 哨兵 op id：让出重排（不阻塞、不等待）。
+        {
+            let y = lua.create_function(|_lua, ()| Ok(THREAD_YIELD_MARK as i64))?;
+            lua.globals().set("_learnon_thread_yield", y)?;
+        }
+        // _learnon_thread_kill(tid) -> true：请求杀子线程，由调度器在下一步回收。
+        {
+            let ctl = Arc::clone(sched_ctl);
+            let kill = lua.create_function(move |_lua, tid: i64| {
+                ctl.lock().unwrap().kills.push(tid as u64);
+                Ok(true)
+            })?;
+            lua.globals().set("_learnon_thread_kill", kill)?;
+        }
+
+        let thread_mod: LuaFunction = lua
+            .load(
+                r#"
+                return function()
+                    local t = {}
+                    -- spawn：把用户函数与变参打包，交 Rust 建子协程并登记；返回线程对象。
+                    function t.spawn(func, ...)
+                        assert(type(func) == 'function', "bad spawn argument type")
+                        local args = table.pack(...)
+                        local tid = _learnon_thread_spawn(func, args)
+                        return { _thread_tid = tid }
+                    end
+                    -- wait：任一给定线程先完成即返回 ok, ret...；让出等调度器投递 sink。
+                    function t.wait(...)
+                        local ts = table.pack(...)
+                        local tids = {}
+                        for i = 1, ts.n do
+                            local th = ts[i]
+                            if type(th) ~= 'table' or not th._thread_tid then
+                                return nil, "not a light thread object"
+                            end
+                            tids[i] = th._thread_tid
+                        end
+                        return coroutine.yield(_learnon_thread_wait(tids))
+                    end
+                    -- yield：主动让出，让同 VM 的其它协程获得一次调度。
+                    function t.yield()
+                        return coroutine.yield(_learnon_thread_yield())
+                    end
+                    -- kill：中止指定线程（已结束的线程为 no-op）。
+                    function t.kill(thread)
+                        if type(thread) ~= 'table' or not thread._thread_tid then
+                            return nil, "not a light thread object"
+                        end
+                        _learnon_thread_kill(thread._thread_tid)
+                        return true
+                    end
+                    return t
+                end
+                "#,
+            )
+            .eval()?;
+        let thread_tbl: LuaTable = thread_mod.call(())?;
+        ngx.set("thread", thread_tbl)?;
+
+        // ngx.on_abort(f) —— 登记中断回调。API 兼容：接受并暂存到本请求 ctx；
+        // 实际「客户端断开」触发尚未接入服务器层连接存活探测（见 README roadmap）。
+        {
+            let on_abort = lua.create_function(move |lua_ctx, f: LuaValue| {
+                if !matches!(f, LuaValue::Function(_)) {
+                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid callback type")?)));
+                }
+                let ct = match lua_ctx.globals().get::<LuaTable>("ngx")?.raw_get("ctx")? {
+                    LuaValue::Table(t) => t,
+                    _ => lua_ctx.create_table()?,
+                };
+                ct.raw_set("__on_abort", f)?;
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?;
+            ngx.set("on_abort", on_abort)?;
+        }
+
         // ngx.req.* —— 请求信息
         let req = lua.create_table()?;
         for (fname, field) in [
@@ -2511,7 +2722,7 @@ impl LuaEngine {
         // 无锁轮询选 VM：VM 之间完全并行，VM 之内由调度器以协程方式并发
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.vms.len();
         let slot = Arc::clone(&self.vms[idx]);
-        let co_id = slot.next_co.fetch_add(1, Ordering::Relaxed);
+        let co_id = slot.co_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let job = Job {
             co_id,
@@ -2547,6 +2758,7 @@ impl LuaEngine {
         vm: Arc<VM>,
         mut job_rx: mpsc::UnboundedReceiver<Job>,
         mut ev_rx: mpsc::UnboundedReceiver<(u64, Vec<ResumeVal>)>,
+        ctl: SharedCtl,
     ) {
         let mut states: HashMap<u64, CoState> = HashMap::new();
         let mut ready: VecDeque<u64> = VecDeque::new();
@@ -2554,6 +2766,11 @@ impl LuaEngine {
         // 挂起等待时被 select 取走的作业/事件先暂存，下一步统一步骤内处理（避免丢事件）
         let mut inbox: VecDeque<Job> = VecDeque::new();
         let mut wake_evs: VecDeque<(u64, Vec<ResumeVal>)> = VecDeque::new();
+        // ---------- ngx.thread.* 簿记 ----------
+        let mut done: HashSet<u64> = HashSet::new(); // 已完成线程（结果在 __thread_sink[tid]）
+        let mut tid_waitop: HashMap<u64, u64> = HashMap::new(); // tid -> parked 的 wait op
+        let mut wait_group: HashMap<u64, Vec<u64>> = HashMap::new(); // wait op -> 被等待 tids
+        let mut owner_children: HashMap<u64, Vec<u64>> = HashMap::new(); // owner req -> 子线程 tids
 
         loop {
             // ==================== 持锁一步 ====================
@@ -2584,6 +2801,9 @@ impl LuaEngine {
                                     reply,
                                     wake_args: Vec::new(),
                                     phase: phase_name,
+                                    is_child: false,
+                                    owner: co_id,
+                                    wake_tid: None,
                                 },
                             );
                             ready.push_back(co_id);
@@ -2593,6 +2813,69 @@ impl LuaEngine {
                             let _ = reply.send(Err(AppError::Lua(e)));
                         }
                     }
+                }
+
+                // 1b) 收下 spawn 请求：为每个子协程建 CoState，共享 owner 的 ctx/Arc/阶段并入队 ready。
+                let spawns = std::mem::take(&mut ctl.lock().unwrap().spawns);
+                for SpawnReq { tid, owner, thread_key } in spawns {
+                    let prepared = states.get(&owner).map(|p| {
+                        (
+                            Arc::clone(&p.ctx),
+                            p.phase.clone(),
+                            lua.registry_value::<LuaTable>(&p.ctx_table_key),
+                        )
+                    });
+                    let (ctx, phase, table_res) = match prepared {
+                        Some(x) => x,
+                        None => {
+                            let _ = lua.remove_registry_value(thread_key);
+                            continue;
+                        }
+                    };
+                    let ctx_table_key = match table_res.and_then(|ct| lua.create_registry_value(ct)) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[learnon] thread 共享 ctx 失败: {e}");
+                            let _ = lua.remove_registry_value(thread_key);
+                            continue;
+                        }
+                    };
+                    let (dummy_tx, _dummy_rx) = oneshot::channel();
+                    states.insert(
+                        tid,
+                        CoState {
+                            thread_key,
+                            ctx_table_key,
+                            ctx,
+                            reply: dummy_tx,
+                            wake_args: Vec::new(),
+                            phase,
+                            is_child: true,
+                            owner,
+                            wake_tid: None,
+                        },
+                    );
+                    owner_children.entry(owner).or_default().push(tid);
+                    ready.push_back(tid);
+                }
+
+                // 1c) 收下 kill 请求：中止仍在跑的线程，记 false 结果并投递等待方。
+                let kills = std::mem::take(&mut ctl.lock().unwrap().kills);
+                for tid in kills {
+                    if !states.contains_key(&tid) {
+                        continue; // 已结束/未知：no-op
+                    }
+                    let _ = sink_set_err(lua, tid, "thread killed");
+                    done.insert(tid);
+                    remove_child_state(lua, &mut states, &mut waiting, tid);
+                    deliver_thread(
+                        &mut tid_waitop,
+                        &mut waiting,
+                        &mut wait_group,
+                        &mut states,
+                        &mut ready,
+                        tid,
+                    );
                 }
 
                 // 2) 收下完成事件（睡眠或 cosocket op）：把对应协程从 waiting 移回 ready，
@@ -2611,33 +2894,66 @@ impl LuaEngine {
                     }
                 }
 
-                // 3) 本轮就绪协程各同步 resume 一次（公平轮转）
+                // 3) 本轮就绪协程各同步 resume 一次（公平轮转）。
+                //    请求协程与 ngx.thread.spawn 出的子协程共用此循环：子协程是一等 states
+                //    成员，可交错跑 cosocket/ngx.sleep；完成时把 __thread_sink[tid] 投递给 parked 等待方。
                 let mut pending = std::mem::take(&mut ready);
                 while let Some(co_id) = pending.pop_front() {
-                    // 借用 st 仅用于挂上下文 + 取句柄 + 取出唤醒参数；随后立即结束借用
-                    let (thread, wake_args) = match states.get_mut(&co_id) {
-                        None => continue,
-                        Some(st) => {
-                            let _ = lua
-                                .set_named_registry_value("__ctx", CtxHandle(Arc::clone(&st.ctx)));
-                            let _ = lua.set_named_registry_value("__phase", st.phase.clone());
-                            if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
-                                let _ = ngx.raw_set("ctx", ct);
+                    // 借用 st 仅用于挂上下文 + 取句柄 + 取出唤醒参数/tid；随后立即结束借用
+                    let (thread, wake_args, wake_tid, is_child, owner) =
+                        match states.get_mut(&co_id) {
+                            None => continue,
+                            Some(st) => {
+                                let _ = lua.set_named_registry_value(
+                                    "__ctx",
+                                    CtxHandle(Arc::clone(&st.ctx)),
+                                );
+                                let _ = lua.set_named_registry_value("__phase", st.phase.clone());
+                                // spawn 需据此把子线程挂到正确的所属请求上
+                                let _ =
+                                    lua.set_named_registry_value("__cur_co", co_id as i64);
+                                let _ = lua
+                                    .set_named_registry_value("__cur_owner", st.owner as i64);
+                                if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
+                                    let _ = ngx.raw_set("ctx", ct);
+                                }
+                                let wa = std::mem::take(&mut st.wake_args);
+                                let wt = st.wake_tid.take();
+                                (
+                                    lua.registry_value::<Thread>(&st.thread_key),
+                                    wa,
+                                    wt,
+                                    st.is_child,
+                                    st.owner,
+                                )
                             }
-                            let wa = std::mem::take(&mut st.wake_args);
-                            (lua.registry_value::<Thread>(&st.thread_key), wa)
-                        }
-                    }; // states 借用到此结束
+                        }; // states 借用到此结束
                     let thread = match thread {
                         Ok(t) => t,
                         Err(e) => {
-                            finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                            if is_child {
+                                thread_complete(
+                                    lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
+                                    &mut wait_group, &mut ready, co_id,
+                                    Some(&e.to_string()),
+                                );
+                            } else {
+                                finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                                reap_children(
+                                    lua, &mut states, owner, &mut owner_children, &mut done,
+                                    &mut tid_waitop, &mut wait_group, &mut waiting,
+                                );
+                            }
                             continue;
                         }
                     };
 
-                    // 把唤醒参数转成 LuaValue，作为 coroutine.yield 的返回值喂回协程
+                    // 喂回协程本轮恢复值：wait 命中用 sink[tid] 打包结果，否则用 op 唤醒参数
                     let resume_result = (|| -> LuaResult<LuaValue> {
+                        if let Some(tid) = wake_tid {
+                            let vals = sink_values(lua, tid)?;
+                            return thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals));
+                        }
                         if wake_args.is_empty() {
                             thread.resume::<LuaValue>(())
                         } else {
@@ -2652,35 +2968,113 @@ impl LuaEngine {
                     match resume_result {
                         Err(e) => {
                             eprintln!("[learnon] 脚本错误: {e}");
-                            finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                            if is_child {
+                                thread_complete(
+                                    lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
+                                    &mut wait_group, &mut ready, co_id, Some(&e.to_string()),
+                                );
+                            } else {
+                                finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                                reap_children(
+                                    lua, &mut states, owner, &mut owner_children, &mut done,
+                                    &mut tid_waitop, &mut wait_group, &mut waiting,
+                                );
+                            }
                         }
                         Ok(yielded) => match thread.status() {
                             ThreadStatus::Finished => {
-                                finish(lua, &mut states, &mut waiting, co_id, Ok(()))
+                                if is_child {
+                                    // 子协程体在返回前已把结果写入 __thread_sink[tid]
+                                    thread_complete(
+                                        lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
+                                        &mut wait_group, &mut ready, co_id, None,
+                                    );
+                                } else {
+                                    finish(lua, &mut states, &mut waiting, co_id, Ok(()));
+                                    reap_children(
+                                        lua, &mut states, owner, &mut owner_children, &mut done,
+                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                    );
+                                }
                             }
                             ThreadStatus::Resumable => match op_id_of(&yielded) {
+                                Some(sid) if sid == THREAD_YIELD_MARK => {
+                                    // ngx.thread.yield：主动让出，本轮重排再跑
+                                    pending.push_back(co_id);
+                                }
                                 Some(sid) => {
-                                    waiting.insert(sid, co_id);
+                                    // 若本 op 是一次 ngx.thread.wait：先查已完成的线程可即时唤醒
+                                    let waited = {
+                                        let mut c = ctl.lock().unwrap();
+                                        match c.waits.iter().position(|w| w.op == sid) {
+                                            Some(i) => Some(c.waits.remove(i).tids),
+                                            None => None,
+                                        }
+                                    };
+                                    match waited {
+                                        Some(tids) => {
+                                            if let Some(hit) =
+                                                tids.iter().find(|t| done.contains(t)).copied()
+                                            {
+                                                if let Some(st) = states.get_mut(&co_id) {
+                                                    st.wake_tid = Some(hit);
+                                                }
+                                                pending.push_back(co_id);
+                                            } else {
+                                                waiting.insert(sid, co_id);
+                                                for t in &tids {
+                                                    tid_waitop.insert(*t, sid);
+                                                }
+                                                wait_group.insert(sid, tids);
+                                            }
+                                        }
+                                        None => {
+                                            // 普通 sleep / cosocket / 子请求让出
+                                            waiting.insert(sid, co_id);
+                                        }
+                                    }
                                 }
                                 None => {
                                     // 非受支持让出（yield 出的不是 op id）：无法唤醒，按错误回传避免悬挂
                                     eprintln!("[learnon] 协程 yield 了非 op id 值，无法恢复");
-                                    finish(
-                                        lua,
-                                        &mut states,
-                                        &mut waiting,
-                                        co_id,
-                                        Err(AppError::Other("attempt to yield from outside a supported operation".into())),
+                                    let msg = AppError::Other(
+                                        "attempt to yield from outside a supported operation".into(),
                                     );
+                                    if is_child {
+                                        let m = msg.to_string();
+                                        thread_complete(
+                                            lua, &mut states, &mut waiting, &mut done,
+                                            &mut tid_waitop, &mut wait_group, &mut ready, co_id,
+                                            Some(&m),
+                                        );
+                                    } else {
+                                        finish(lua, &mut states, &mut waiting, co_id, Err(msg));
+                                        reap_children(
+                                            lua, &mut states, owner, &mut owner_children,
+                                            &mut done, &mut tid_waitop, &mut wait_group,
+                                            &mut waiting,
+                                        );
+                                    }
                                 }
                             },
-                            ThreadStatus::Error => finish(
-                                lua,
-                                &mut states,
-                                &mut waiting,
-                                co_id,
-                                Err(AppError::Other("coroutine error".into())),
-                            ),
+                            ThreadStatus::Error => {
+                                if is_child {
+                                    thread_complete(
+                                        lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
+                                        &mut wait_group, &mut ready, co_id,
+                                        Some("coroutine error"),
+                                    );
+                                } else {
+                                    finish(
+                                        lua, &mut states, &mut waiting, co_id,
+                                        Err(AppError::Other("coroutine error".into())),
+                                    );
+                                    reap_children(
+                                        lua, &mut states, owner, &mut owner_children, &mut done,
+                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                    );
+                                }
+                            }
                             // 不应出现（同步 resume 不会停在 Running）；保守放回本轮继续
                             ThreadStatus::Running => pending.push_back(co_id),
                         },
@@ -2689,9 +3083,15 @@ impl LuaEngine {
                 ready.append(&mut pending);
             } // ==================== 释放锁 ====================
 
-            // 有就绪工作：让出执行权给 runtime（timer/事件），随即再跑一步
-            // 无就绪工作：挂起等作业或完成事件
-            if ready.is_empty() {
+            // ctl 信箱在本步 resume 中途可能收到 spawn/wait/kill（子线程登记、等待、杀掉），
+            // 此时即便 ready 暂空也必须再跑一步处理，否则会误入 select 永久阻塞（父 parked、子未跑）。
+            let ctl_busy = {
+                let c = ctl.lock().unwrap();
+                !(c.spawns.is_empty() && c.waits.is_empty() && c.kills.is_empty())
+            };
+            // 有就绪工作或有 ctl 待办：让出执行权给 runtime（timer/事件），随即再跑一步
+            // 两者皆空：挂起等作业或完成事件
+            if ready.is_empty() && !ctl_busy {
                 tokio::select! {
                     j = job_rx.recv() => match j {
                         Some(job) => inbox.push_back(job),
@@ -2733,6 +3133,133 @@ fn finish(
         let _ = lua.remove_registry_value(st.ctx_table_key);
         drop(st.ctx);
         let _ = st.reply.send(result);
+    }
+}
+
+/// 回收一个已结束的 ngx.thread 子协程：只清理其 registry 句柄与 waiting 残留，
+/// 不发送 reply（子协程持有的是 dummy oneshot，真实收尾在等待方/所属请求）。
+fn remove_child_state(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    waiting: &mut HashMap<u64, u64>,
+    tid: u64,
+) {
+    if let Some(st) = states.remove(&tid) {
+        waiting.retain(|_, v| *v != tid);
+        let _ = lua.remove_registry_value(st.thread_key);
+        let _ = lua.remove_registry_value(st.ctx_table_key);
+        drop(st.ctx);
+    }
+}
+
+/// 读取 Lua 侧 `__thread_sink[tid]`（`table.pack(ok, ret...)`）的打包值，供等待方本轮 resume 喂回。
+fn sink_values(lua: &Lua, tid: u64) -> LuaResult<Vec<LuaValue>> {
+    let sink: LuaTable = lua.globals().get("__thread_sink")?;
+    let packed: LuaTable = match sink.raw_get(tid as i64) {
+        Ok(t) => t,
+        Err(_) => return Ok(vec![LuaValue::Boolean(false), LuaValue::Nil]),
+    };
+    let n: i64 = packed.raw_get("n").unwrap_or(0);
+    let mut out = Vec::with_capacity(n.max(0) as usize);
+    for i in 1..=n {
+        match packed.raw_get::<LuaValue>(i) {
+            Ok(v) => out.push(v),
+            Err(_) => break,
+        }
+    }
+    // 消费后清槽，避免同一 tid 结果被重复投递
+    let _ = sink.raw_set(tid as i64, LuaValue::Nil);
+    Ok(out)
+}
+
+/// 把 `__thread_sink[tid]` 写成 (false, err)：kill 或子协程异常退出时的失败结果。
+fn sink_set_err(lua: &Lua, tid: u64, msg: &str) -> LuaResult<()> {
+    let sink: LuaTable = lua.globals().get("__thread_sink")?;
+    let packed = lua.create_table()?;
+    packed.raw_set("n", 2)?;
+    packed.raw_set(1, false)?;
+    packed.raw_set(2, msg)?;
+    sink.raw_set(tid as i64, packed)
+}
+
+/// 一个线程完成/失败后投递：若有某等待方正 parked 在该 tid 上，唤醒其首个等待协程并清理同组簿记。
+fn deliver_thread(
+    tid_waitop: &mut HashMap<u64, u64>,
+    waiting: &mut HashMap<u64, u64>,
+    wait_group: &mut HashMap<u64, Vec<u64>>,
+    states: &mut HashMap<u64, CoState>,
+    ready: &mut VecDeque<u64>,
+    tid: u64,
+) {
+    let op = match tid_waitop.remove(&tid) {
+        Some(op) => op,
+        None => return, // 无人等待此线程
+    };
+    let parent = match waiting.remove(&op) {
+        Some(p) => p,
+        None => return, // 等待方已不在 parked 状态
+    };
+    // 同一次 wait 的其它线程不再需要跟踪（任一完成即已交付）
+    if let Some(group) = wait_group.remove(&op) {
+        for t in group {
+            tid_waitop.remove(&t);
+        }
+    }
+    if let Some(st) = states.get_mut(&parent) {
+        st.wake_tid = Some(tid);
+        ready.push_back(parent);
+    }
+}
+
+/// 子协程收尾统一入口：正常完成时其结果已写入 sink；异常/被杀时补写失败结果。
+/// 记入 done、清理状态、投递给 parked 等待方。
+fn thread_complete(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    waiting: &mut HashMap<u64, u64>,
+    done: &mut HashSet<u64>,
+    tid_waitop: &mut HashMap<u64, u64>,
+    wait_group: &mut HashMap<u64, Vec<u64>>,
+    ready: &mut VecDeque<u64>,
+    tid: u64,
+    err: Option<&str>,
+) {
+    if let Some(m) = err {
+        let _ = sink_set_err(lua, tid, m);
+    }
+    done.insert(tid);
+    remove_child_state(lua, states, waiting, tid);
+    deliver_thread(tid_waitop, waiting, wait_group, states, ready, tid);
+}
+
+/// 所属请求结束（正常/出错）时回收其仍在途的子线程：直接移除状态并清簿记
+/// （对标 ngx_lua：请求终止会杀掉其所有 light thread；结果已无人接收）。
+fn reap_children(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    owner: u64,
+    owner_children: &mut HashMap<u64, Vec<u64>>,
+    done: &mut HashSet<u64>,
+    tid_waitop: &mut HashMap<u64, u64>,
+    wait_group: &mut HashMap<u64, Vec<u64>>,
+    waiting: &mut HashMap<u64, u64>,
+) {
+    let tids = match owner_children.remove(&owner) {
+        Some(t) => t,
+        None => return,
+    };
+    for tid in tids {
+        if states.contains_key(&tid) {
+            remove_child_state(lua, states, waiting, tid);
+        }
+        done.remove(&tid);
+        if let Some(op) = tid_waitop.remove(&tid) {
+            if let Some(group) = wait_group.remove(&op) {
+                for t in group {
+                    tid_waitop.remove(&t);
+                }
+            }
+        }
     }
 }
 
@@ -3032,5 +3559,103 @@ mod tests {
         let s = http_time(ts);
         assert_eq!(parse_http_time(&s), Some(ts));
         assert_eq!(parse_http_time("not-a-date"), None);
+    }
+
+    // 轻量级线程结果投递核心：__thread_body 把 func 的 pcall 结果打包进 __thread_sink[tid]。
+    // 成功 → (true, ret...)；抛错 → (false, err)。调度器据此喂回等待方。
+    #[test]
+    fn thread_body_packs_success_and_error() {
+        let lua = mlua::Lua::new();
+        lua.globals().set("__thread_sink", lua.create_table().unwrap()).unwrap();
+        let define: mlua::Function = lua
+            .load(
+                r#"return function()
+                    _G.__thread_body = function(func, args, tid)
+                        return function()
+                            local r = table.pack(pcall(func, table.unpack(args, 1, args.n)))
+                            local sink = _G.__thread_sink
+                            if r[1] then
+                                sink[tid] = table.pack(true, table.unpack(r, 2, r.n))
+                            else
+                                sink[tid] = table.pack(false, r[2])
+                            end
+                        end
+                    end
+                end"#,
+            )
+            .eval()
+            .unwrap();
+        define.call::<()>(()).unwrap();
+
+        // 成功：返回两个值
+        let body: mlua::Function = lua
+            .globals()
+            .get::<mlua::Function>("__thread_body")
+            .unwrap()
+            .call((
+                lua.load("return 'a', 7").into_function().unwrap(),
+                {
+                    let args = lua.create_table().unwrap();
+                    args.raw_set("n", 0).unwrap();
+                    args
+                },
+                1i64,
+            ))
+            .unwrap();
+        body.call::<()>(()).unwrap();
+        let sink: mlua::Table = lua.globals().get("__thread_sink").unwrap();
+        let packed: mlua::Table = sink.raw_get(1i64).unwrap();
+        let n: i64 = packed.raw_get("n").unwrap();
+        assert_eq!(n, 3); // true, 'a', 7
+        assert_eq!(packed.raw_get::<bool>(1).unwrap(), true);
+        assert_eq!(packed.raw_get::<String>(2).unwrap(), "a");
+        assert_eq!(packed.raw_get::<i64>(3).unwrap(), 7);
+
+        // 失败：func 抛错
+        let body2: mlua::Function = lua
+            .globals()
+            .get::<mlua::Function>("__thread_body")
+            .unwrap()
+            .call((
+                lua.load("error('boom')").into_function().unwrap(),
+                {
+                    let args = lua.create_table().unwrap();
+                    args.raw_set("n", 0).unwrap();
+                    args
+                },
+                2i64,
+            ))
+            .unwrap();
+        body2.call::<()>(()).unwrap();
+        let packed2: mlua::Table = sink.raw_get(2i64).unwrap();
+        assert_eq!(packed2.raw_get::<bool>(1).unwrap(), false);
+        assert!(packed2.raw_get::<String>(2).unwrap().contains("boom"));
+    }
+
+    // ngx.thread 模块面：工厂返回含 spawn/wait/yield/kill 的表。
+    #[test]
+    fn thread_module_exposes_api() {
+        let lua = mlua::Lua::new();
+        // 桩：真实 _learnon_thread_* 在请求期由 install_api 注入，此处仅需工厂闭包可成功构造表。
+        let factory: mlua::Function = lua
+            .load(
+                r#"return function()
+                    local t = {}
+                    function t.spawn(func, ...) return { _thread_tid = 0 } end
+                    function t.wait(...) return nil end
+                    function t.yield() return nil end
+                    function t.kill(thread) return true end
+                    return t
+                end"#,
+            )
+            .eval()
+            .unwrap();
+        let t: mlua::Table = factory.call(()).unwrap();
+        for name in ["spawn", "wait", "yield", "kill"] {
+            assert!(matches!(
+                t.raw_get::<mlua::Value>(name).unwrap(),
+                mlua::Value::Function(_)
+            ), "missing ngx.thread.{name}");
+        }
     }
 }
