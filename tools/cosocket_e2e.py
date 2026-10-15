@@ -163,9 +163,10 @@ def main():
         ok_all = all(e is None and o and o[0] == 200 and o[1].strip() == "ECHO:q" for o, e in zip(outs, errs))
         check("并发 %d 个 /echo_conc 全部 ECHO:q" % k, ok_all,
               f"errs={[e for e in errs if e][:3]} outs={[o for o in outs if o][:3]}")
-        # 若 cosocket 阻塞 VM：墙钟≈k*0.3；让出并发：≈0.3 + 开销。阈值给足余量。
+        # 若 cosocket 阻塞 VM：墙钟≈k*delay≈9.6s；让出并发：≈(k/vm)*0.3 + HTTP 开销（本约 0.6~1.9s）。
+        # 阈值取 2.5s：仍远低于串行的 9.6s，足以决定性证明非阻塞让出，同时容纳本机调度抖动。
         check("墙钟 %.2fs 证明 cosocket 让出并发（远小于 k*delay=%.1fs）" % (wall, k * ECHO_DELAY),
-              wall < 1.5, f"wall={wall:.3f}s k={k} vm={VM_COUNT}")
+              wall < 2.5, f"wall={wall:.3f}s k={k} vm={VM_COUNT}")
 
         # 6) 回归：并发下 ngx.sleep 仍与 cosocket 共存
         wall2, _, _ = hammer("/echo", 8)

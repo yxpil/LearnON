@@ -35,6 +35,7 @@ mod router;
 mod server;
 mod settings;
 mod shared_dict;
+mod sockpool;
 mod tls;
 mod upstream;
 

@@ -124,6 +124,10 @@ pub struct Cosocket {
     stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
     buf: Arc<tokio::sync::Mutex<Vec<u8>>>,
     timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// setsize 上限（字节）；0 表示不限制。超限时 receive 报错而非继续缓冲。
+    size_cap: Arc<std::sync::atomic::AtomicUsize>,
+    /// 当前连接的对端 (host, port)，供 setkeepalive 回池与 reconnect 复用。
+    peer: Arc<std::sync::Mutex<Option<(String, u16)>>>,
     op_counter: Arc<AtomicU64>,
     ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
 }
@@ -141,6 +145,8 @@ impl Cosocket {
             stream: Arc::new(tokio::sync::Mutex::new(None)),
             buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(5000)),
+            size_cap: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peer: Arc::new(std::sync::Mutex::new(None)),
             op_counter,
             ev_tx,
         }
@@ -162,9 +168,18 @@ async fn recv_into(
     s: &mut TcpStream,
     buf: &mut Vec<u8>,
     pat: &RecvPat,
+    cap: usize,
 ) -> Vec<ResumeVal> {
     use ResumeVal::*;
     let nil_closed = |left: Vec<u8>| vec![Nil, Str("closed".into()), Bytes(left)];
+    let exceeds = || vec![Nil, Str("exceeds the max allowed size".into())];
+    if cap > 0 {
+        if let RecvPat::Exact(n) = pat {
+            if *n > cap {
+                return exceeds();
+            }
+        }
+    }
     match pat {
         RecvPat::Line => loop {
             if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -178,7 +193,12 @@ async fn recv_into(
             let mut tmp = [0u8; 4096];
             match s.read(&mut tmp).await {
                 Ok(0) => return nil_closed(buf.clone()),
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    if cap > 0 && buf.len() + n > cap {
+                        return exceeds();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
                 Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
             }
         },
@@ -194,7 +214,12 @@ async fn recv_into(
                 let mut tmp = [0u8; 4096];
                 match s.read(&mut tmp).await {
                     Ok(0) => return nil_closed(buf.clone()),
-                    Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    Ok(k) => {
+                        if cap > 0 && buf.len() + k > cap {
+                            return exceeds();
+                        }
+                        buf.extend_from_slice(&tmp[..k]);
+                    }
                     Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
                 }
             }
@@ -203,28 +228,132 @@ async fn recv_into(
             let mut tmp = [0u8; 4096];
             match s.read(&mut tmp).await {
                 Ok(0) => return vec![Bytes(std::mem::take(buf))],
-                Ok(k) => tmp[..k].iter().for_each(|&b| buf.push(b)),
+                Ok(k) => {
+                    if cap > 0 && buf.len() + k > cap {
+                        return exceeds();
+                    }
+                    tmp[..k].iter().for_each(|&b| buf.push(b));
+                }
                 Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
             }
         },
     }
 }
 
+/// 在 buf 中查找子序列 needle，返回首个匹配下标。
+fn find_subslice(buf: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if buf.len() < needle.len() {
+        return None;
+    }
+    buf.windows(needle.len()).position(|w| w == needle)
+}
+
+/// receiveany(min, max)：读到至少 min 字节即返回（上限 max，默认 4096），返回可用数据。
+async fn recv_any_into(
+    s: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    min: usize,
+    max: usize,
+    cap: usize,
+) -> Vec<ResumeVal> {
+    use ResumeVal::*;
+    let max = if max == 0 { 4096 } else { max };
+    if cap > 0 && min > cap {
+        return vec![Nil, Str("exceeds the max allowed size".into())];
+    }
+    loop {
+        if buf.len() >= min {
+            let take = buf.len().min(max);
+            let data: Vec<u8> = buf.drain(..take).collect();
+            return vec![Bytes(data)];
+        }
+        let mut tmp = [0u8; 4096];
+        match s.read(&mut tmp).await {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return vec![Nil, Str("closed".into())];
+                }
+                let data: Vec<u8> = buf.drain(..).collect();
+                return vec![Bytes(data)];
+            }
+            Ok(n) => {
+                if cap > 0 && buf.len() + n > cap {
+                    return vec![Nil, Str("exceeds the max allowed size".into())];
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
+        }
+    }
+}
+
+/// receiveuntil(delim)：读到 delim 为止，返回 delim 之前的数据并消费 delim；found=true。
+/// EOF 且未找到 delim：返回已缓冲数据，found=false。
+async fn recv_until_into(s: &mut TcpStream, buf: &mut Vec<u8>, delim: &[u8]) -> Vec<ResumeVal> {
+    use ResumeVal::*;
+    if delim.is_empty() {
+        return vec![Bytes(Vec::new()), Bool(true)];
+    }
+    loop {
+        if let Some(pos) = find_subslice(buf, delim) {
+            let chunk: Vec<u8> = buf.drain(..pos).collect();
+            buf.drain(..delim.len()); // 消费分隔符本身
+            return vec![Bytes(chunk), Bool(true)];
+        }
+        let mut tmp = [0u8; 4096];
+        match s.read(&mut tmp).await {
+            Ok(0) => {
+                let rem: Vec<u8> = buf.drain(..).collect();
+                return vec![Bytes(rem), Bool(false)];
+            }
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) => return vec![Nil, Str(format!("recv error: {e}"))],
+        }
+    }
+}
+
 impl LuaUserData for Cosocket {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // _start_connect(host, port) -> op id；成功唤醒值 [1]，失败 [nil, err]
+        // 优先复用 keepalive 池里同 host:port 的未超时空闲连接（对标 OpenResty setkeepalive 复用）。
         methods.add_method("_start_connect", |lua, this, (host, port): (String, LuaValue)| {
             let port = to_u16(lua, &port)?;
             let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
             let ev = this.ev_tx.clone();
             let stream = Arc::clone(&this.stream);
+            let buf = Arc::clone(&this.buf);
+            let peer = Arc::clone(&this.peer);
             let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            let key = format!("{host}:{port}");
+            if let Some((s, leftover)) = crate::sockpool::take(&key) {
+                // 命中池：接管已连接流与其残留缓冲，记录 peer，无需握手。
+                let payload = vec![
+                    ResumeVal::Int(1),
+                    ResumeVal::Str("reused".into()),
+                ];
+                tokio::spawn(async move {
+                    *stream.lock().await = Some(s);
+                    *buf.lock().await = leftover;
+                    if let Ok(mut p) = peer.lock() {
+                        *p = Some((host, port));
+                    }
+                    let _ = ev.send((id, payload));
+                });
+                return Ok(id);
+            }
+            let host2 = host.clone();
             tokio::spawn(async move {
                 let payload = match tokio::time::timeout(dur, TcpStream::connect((host.as_str(), port))).await {
                     Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
                     Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("connect failed: {e}"))],
                     Ok(Ok(s)) => {
                         *stream.lock().await = Some(s);
+                        if let Ok(mut p) = peer.lock() {
+                            *p = Some((host2, port));
+                        }
                         vec![ResumeVal::Int(1)]
                     }
                 };
@@ -265,6 +394,7 @@ impl LuaUserData for Cosocket {
             let stream = Arc::clone(&this.stream);
             let buf = Arc::clone(&this.buf);
             let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            let cap = this.size_cap.load(Ordering::Relaxed);
             tokio::spawn(async move {
                 let mut sg = stream.lock().await;
                 let s = match sg.as_mut() {
@@ -275,7 +405,7 @@ impl LuaUserData for Cosocket {
                     Some(s) => s,
                 };
                 let mut bg = buf.lock().await;
-                let payload = match tokio::time::timeout(dur, recv_into(s, &mut bg, &pat)).await {
+                let payload = match tokio::time::timeout(dur, recv_into(s, &mut bg, &pat, cap)).await {
                     Ok(p) => p,
                     Err(_) => {
                         // 超时：把已缓冲部分作为 partial 回传
@@ -315,6 +445,204 @@ impl LuaUserData for Cosocket {
             this.timeout_ms.store(ms, Ordering::Relaxed);
             Ok(1u64)
         });
+
+        // _setsize(bytes) -> 1：设定接收缓冲上限，超限的 receive 报错而非无限缓冲。
+        methods.add_method("_setsize", |_lua, this, bytes: usize| {
+            this.size_cap.store(bytes, Ordering::Relaxed);
+            Ok(1u64)
+        });
+
+        // _start_receiveany(min, max?) -> op id；成功 [data]，失败 [nil, err, partial]
+        methods.add_method(
+            "_start_receiveany",
+            |lua, this, (min, max): (LuaValue, LuaValue)| {
+                let min = to_usize(lua, &min)?.max(1);
+                let max = to_usize_opt(lua, &max);
+                let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+                let ev = this.ev_tx.clone();
+                let stream = Arc::clone(&this.stream);
+                let buf = Arc::clone(&this.buf);
+                let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+                let cap = this.size_cap.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut sg = stream.lock().await;
+                    let s = match sg.as_mut() {
+                        None => {
+                            let _ =
+                                ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
+                            return;
+                        }
+                        Some(s) => s,
+                    };
+                    let mut bg = buf.lock().await;
+                    let payload =
+                        match tokio::time::timeout(dur, recv_any_into(s, &mut bg, min, max, cap))
+                            .await
+                        {
+                            Ok(p) => p,
+                            Err(_) => {
+                                let partial = bg.clone();
+                                vec![
+                                    ResumeVal::Nil,
+                                    ResumeVal::Str("timeout".into()),
+                                    ResumeVal::Bytes(partial),
+                                ]
+                            }
+                        };
+                    drop(bg);
+                    drop(sg);
+                    let _ = ev.send((id, payload));
+                });
+                Ok(id)
+            },
+        );
+
+        // _start_receive_until(delim) -> op id；成功 [data, found(bool)]，失败 [nil, err]
+        methods.add_method("_start_receive_until", |_lua, this, delim: LuaString| {
+            let needle = delim.as_bytes().to_vec();
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let stream = Arc::clone(&this.stream);
+            let buf = Arc::clone(&this.buf);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let mut sg = stream.lock().await;
+                let s = match sg.as_mut() {
+                    None => {
+                        let _ =
+                            ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
+                        return;
+                    }
+                    Some(s) => s,
+                };
+                let mut bg = buf.lock().await;
+                let payload = match tokio::time::timeout(dur, recv_until_into(s, &mut bg, &needle))
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let partial = bg.clone();
+                        vec![
+                            ResumeVal::Nil,
+                            ResumeVal::Str("timeout".into()),
+                            ResumeVal::Bytes(partial),
+                        ]
+                    }
+                };
+                drop(bg);
+                drop(sg);
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _start_shutdown(read?, write?) -> op id；成功 [1]，失败 [nil, err]
+        // 对标 OpenResty：这是会让出的 cosocket op。write 方向做真正的优雅写关闭（对端收到 EOF）。
+        methods.add_method(
+            "_start_shutdown",
+            |_lua, this, (rd, wr): (Option<bool>, Option<bool>)| {
+                let read = rd.unwrap_or(true);
+                let write = wr.unwrap_or(true);
+                let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+                let ev = this.ev_tx.clone();
+                let stream = Arc::clone(&this.stream);
+                // 仅读方向关闭：tokio 公开 API 无法在不拆流的前提下半关读，明确拒绝。
+                if !write && read {
+                    tokio::spawn(async move {
+                        let _ = ev.send((
+                            id,
+                            vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str("read-half shutdown unsupported".into()),
+                            ],
+                        ));
+                    });
+                    return Ok(id);
+                }
+                // both / write-only：优雅关闭写方向（flush + FIN）。
+                tokio::spawn(async move {
+                    let mut sg = stream.lock().await;
+                    let payload = match sg.as_mut() {
+                        None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
+                        Some(s) => match s.shutdown().await {
+                            Ok(()) => vec![ResumeVal::Int(1)],
+                            Err(e) => vec![ResumeVal::Nil, ResumeVal::Str(format!("shutdown: {e}"))],
+                        },
+                    };
+                    drop(sg);
+                    let _ = ev.send((id, payload));
+                });
+                Ok(id)
+            },
+        );
+
+        // _setkeepalive(timeout_sec?, pool_size?) -> ok, err（同步：把空闲连接回池）
+        methods.add_method(
+            "_setkeepalive",
+            |lua, this, (timeout, pool_size): (Option<f64>, Option<usize>)| {
+                let key = match this.peer.lock() {
+                    Ok(g) => match g.as_ref() {
+                        Some((h, p)) => format!("{h}:{p}"),
+                        None => {
+                            return Ok((
+                                LuaValue::Nil,
+                                LuaValue::String(lua.create_string("closed")?),
+                            ))
+                        }
+                    },
+                    Err(p) => p.into_inner().as_ref().map(|(h, p)| format!("{h}:{p}")).unwrap_or_default(),
+                };
+                if key.is_empty() {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("closed")?),
+                    ));
+                }
+                let idle_ms = ((timeout.unwrap_or(60.0) * 1000.0) as u64).max(1);
+                let s = match this.stream.try_lock() {
+                    Ok(mut g) => match g.take() {
+                        Some(s) => s,
+                        None => {
+                            return Ok((
+                                LuaValue::Nil,
+                                LuaValue::String(lua.create_string("closed")?),
+                            ))
+                        }
+                    },
+                    Err(_) => {
+                        return Ok((
+                            LuaValue::Nil,
+                            LuaValue::String(lua.create_string("busy: pending operation")?),
+                        ))
+                    }
+                };
+                let leftover = match this.buf.try_lock() {
+                    Ok(mut b) => std::mem::take(&mut *b),
+                    Err(_) => {
+                        // 无法取 buf：丢弃连接（随 s drop 关闭），报忙。
+                        return Ok((
+                            LuaValue::Nil,
+                            LuaValue::String(lua.create_string("busy: pending operation")?),
+                        ));
+                    }
+                };
+                if !leftover.is_empty() {
+                    // OpenResty 拒绝保有待读数据的连接；连接随 s drop 关闭。
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("pool supports not keeping pending read data")?),
+                    ));
+                }
+                crate::sockpool::put(
+                    key,
+                    s,
+                    Vec::new(),
+                    std::time::Duration::from_millis(idle_ms),
+                    pool_size.unwrap_or(0),
+                );
+                Ok((LuaValue::Integer(1), LuaValue::Nil))
+            },
+        );
     }
 }
 
@@ -333,6 +661,33 @@ fn to_u16(_lua: &Lua, v: &LuaValue) -> LuaResult<u16> {
         return Err(LuaError::runtime("port out of range"));
     }
     Ok(n as u16)
+}
+
+/// 把 Lua 侧的整数/数字/字符串值转成 usize（必需参数）。
+fn to_usize(_lua: &Lua, v: &LuaValue) -> LuaResult<usize> {
+    let n = match v {
+        LuaValue::Integer(i) => *i,
+        LuaValue::Number(f) => *f as i64,
+        LuaValue::String(s) => s
+            .to_string_lossy()
+            .parse::<i64>()
+            .map_err(|_| LuaError::runtime("invalid number"))?,
+        _ => return Err(LuaError::runtime("invalid number type")),
+    };
+    if n < 0 {
+        return Err(LuaError::runtime("negative size"));
+    }
+    Ok(n as usize)
+}
+
+/// 可选 usize 参数：nil/缺失视作 0（由调用方决定默认）。
+fn to_usize_opt(_lua: &Lua, v: &LuaValue) -> usize {
+    match v {
+        LuaValue::Integer(i) if *i > 0 => *i as usize,
+        LuaValue::Number(f) if *f >= 1.0 => *f as usize,
+        LuaValue::String(s) => s.to_string_lossy().parse::<usize>().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// 解析 receive pattern。
@@ -1267,6 +1622,7 @@ impl LuaEngine {
                     local mt = { __index = {} }
                     local M = mt.__index
                     function M:connect(host, port)
+                        self._host, self._port = host, port
                         local id = self._h:_start_connect(host, port)
                         return coroutine.yield(id)
                     end
@@ -1278,9 +1634,45 @@ impl LuaEngine {
                         local id = self._h:_start_receive(pattern)
                         return coroutine.yield(id)
                     end
+                    function M:receiveany(min, max)
+                        local id = self._h:_start_receiveany(min, max or 0)
+                        return coroutine.yield(id)
+                    end
+                    function M:receiveuntil(delim)
+                        local sock = self
+                        local done = false
+                        local function it()
+                            if done then return nil end
+                            local id = sock._h:_start_receive_until(delim)
+                            local data, found = coroutine.yield(id)
+                            if data == nil then
+                                done = true
+                                sock._h:_close()
+                                return nil, found
+                            end
+                            done = true
+                            sock._h:_close()
+                            if found then return data end
+                            return data, "closed"
+                        end
+                        return it
+                    end
                     function M:close() return self._h:_close() end
                     function M:settimeout(ms) return self._h:_settimeout(ms) end
-                    function M:setkeepalive(...) return 1 end
+                    function M:setsize(n) return self._h:_setsize(n) end
+                    function M:shutdown(read, write)
+                        local id = self._h:_start_shutdown(read, write)
+                        return coroutine.yield(id)
+                    end
+                    function M:setkeepalive(timeout, pool_size)
+                        return self._h:_setkeepalive(timeout, pool_size)
+                    end
+                    function M:reconnect()
+                        if not self._host then return nil, "no peer" end
+                        self:close()
+                        local ok, err = self:connect(self._host, self._port)
+                        return ok, err
+                    end
                     function M:getstats() return { bytes_received = 0, bytes_sent = 0 } end
                     socket_tbl.tcp = function()
                         return setmetatable({ _h = _learnon_sock_new() }, mt)

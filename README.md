@@ -171,9 +171,13 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Response: `ngx.say / print / status (read-write) / exit / header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
 - Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])`
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep (async coroutine)`
-- Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / settimeout / close /
-  setkeepalive / getstats` — non-blocking TCP, yields to the VM scheduler so concurrent requests
-  interleave on one VM (mirrors ngx_lua's cosocket yield-and-resume model)
+- Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
+  receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
+  reconnect / close / getstats` — non-blocking TCP, every op yields to the VM scheduler so concurrent
+  requests interleave on one VM (mirrors ngx_lua's cosocket yield-and-resume model). `setkeepalive`
+  returns the idle connection to a process-global pool keyed by `host:port`, and a later `connect`
+  to the same peer reuses it (skip the handshake, second return `"reused"`). Verified by
+  `tools/sock_ext_e2e.py` against real TCP backends.
 - Regex: `ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)` (flags support `i`)
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
@@ -426,9 +430,11 @@ Already done (previously listed as gaps, now implemented):
 
 Remaining tradeoffs / roadmap:
 
-- **Cosocket coverage**: `ngx.socket.tcp` runs `connect/send/receive(*l|*a|n)/settimeout/close` as
-  scheduler yield points (see the API section above), but not yet `receiveany`, the timed `*l` third
-  return variant, `connect` over SSL (`ssl:connect`), or `ngx.socket.udp`. `balancer_by_lua` and
+- **Cosocket coverage**: `ngx.socket.tcp` now runs the full OpenResty method surface as scheduler
+  yield points — `connect/send/receive(*l|*a|n)/receiveany/receiveuntil/shutdown/setsize/
+  settimeout/setkeepalive`(backed by a real process-global connection pool)`/reconnect/close`
+  (see the API section and `tools/sock_ext_e2e.py`). Still open: `connect` over SSL
+  (`sock:tlshandshake` / `ssl:connect`), `ngx.socket.udp`, and `balancer_by_lua`.
   `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open.
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).
