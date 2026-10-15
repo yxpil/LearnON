@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, Weak};
 use mlua::prelude::*;
 use mlua::{AnyUserData, RegistryKey, Thread, ThreadStatus, Variadic};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 
 use learnon_config::Config;
@@ -643,6 +643,132 @@ impl LuaUserData for Cosocket {
                 Ok((LuaValue::Integer(1), LuaValue::Nil))
             },
         );
+    }
+}
+
+/// UDP cosocket 句柄（对标 ngx.socket.udp）。数据报语义：setpeername 后 send/receive
+/// 走「已连接 UDP」（底层 send/recv 只与该对端收发）。同样经调度器让出，不持 VM 锁。
+pub struct UdpCosocket {
+    sock: Arc<tokio::sync::Mutex<Option<UdpSocket>>>,
+    timeout_ms: Arc<AtomicU64>,
+    op_counter: Arc<AtomicU64>,
+    ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
+}
+
+impl UdpCosocket {
+    fn new(ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>, op_counter: Arc<AtomicU64>) -> Self {
+        UdpCosocket {
+            sock: Arc::new(tokio::sync::Mutex::new(None)),
+            timeout_ms: Arc::new(AtomicU64::new(5000)),
+            op_counter,
+            ev_tx,
+        }
+    }
+}
+
+impl LuaUserData for UdpCosocket {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        // _start_setpeername(host, port) -> id；成功 [1]，失败 [nil, err]
+        methods.add_method(
+            "_start_setpeername",
+            |lua, this, (host, port): (String, LuaValue)| {
+                let port = to_u16(lua, &port)?;
+                let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+                let ev = this.ev_tx.clone();
+                let sock = Arc::clone(&this.sock);
+                let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+                tokio::spawn(async move {
+                    let payload = match tokio::time::timeout(dur, async {
+                        let s = UdpSocket::bind("0.0.0.0:0").await?;
+                        s.connect((host.as_str(), port)).await?;
+                        Ok::<_, std::io::Error>(s)
+                    })
+                    .await
+                    {
+                        Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("setpeername failed: {e}"))],
+                        Ok(Ok(s)) => {
+                            *sock.lock().await = Some(s);
+                            vec![ResumeVal::Int(1)]
+                        }
+                    };
+                    let _ = ev.send((id, payload));
+                });
+                Ok(id)
+            },
+        );
+
+        // _start_send(data) -> id；成功 [bytes]，失败 [nil, err]
+        methods.add_method("_start_send", |lua, this, data: LuaString| {
+            let _ = lua;
+            let bytes = data.as_bytes().to_vec();
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let sock = Arc::clone(&this.sock);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let mut g = sock.lock().await;
+                let payload = match g.as_mut() {
+                    None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
+                    Some(s) => match tokio::time::timeout(dur, s.send(&bytes)).await {
+                        Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))],
+                        Ok(Ok(n)) => vec![ResumeVal::Int(n as i64)],
+                    },
+                };
+                drop(g);
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _start_receive(max) -> id；成功 [data]，失败 [nil, err]（一次收一个数据报）
+        methods.add_method("_start_receive", |lua, this, max: LuaValue| {
+            let mut max = to_usize_opt(lua, &max);
+            if max == 0 {
+                max = 8192;
+            }
+            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+            let ev = this.ev_tx.clone();
+            let sock = Arc::clone(&this.sock);
+            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                let mut g = sock.lock().await;
+                let payload = match g.as_mut() {
+                    None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
+                    Some(s) => {
+                        let mut v = vec![0u8; max];
+                        match tokio::time::timeout(dur, s.recv(&mut v)).await {
+                            Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                            Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("recv error: {e}"))],
+                            Ok(Ok(n)) => vec![ResumeVal::Bytes(v[..n].to_vec())],
+                        }
+                    }
+                };
+                drop(g);
+                let _ = ev.send((id, payload));
+            });
+            Ok(id)
+        });
+
+        // _close() -> 1（同步）
+        methods.add_method("_close", |_lua, this, ()| {
+            if let Ok(mut g) = this.sock.try_lock() {
+                *g = None;
+            } else {
+                let sock = Arc::clone(&this.sock);
+                tokio::spawn(async move {
+                    *sock.lock().await = None;
+                });
+            }
+            Ok(1u64)
+        });
+
+        // _settimeout(ms) -> 1
+        methods.add_method("_settimeout", |_lua, this, ms: u64| {
+            this.timeout_ms.store(ms, Ordering::Relaxed);
+            Ok(1u64)
+        });
     }
 }
 
@@ -1615,6 +1741,15 @@ impl LuaEngine {
             })?;
             lua.globals().set("_learnon_sock_new", sock_new)?;
         }
+        {
+            let ev_tx = ev_tx.clone();
+            let op_counter = Arc::clone(op_counter);
+            let udp_new = lua.create_function(move |lua, ()| {
+                let us = UdpCosocket::new(ev_tx.clone(), Arc::clone(&op_counter));
+                Ok(lua.create_userdata(us)?)
+            })?;
+            lua.globals().set("_learnon_udp_new", udp_new)?;
+        }
         let cosocket_mod: LuaFunction = lua
             .load(
                 r#"
@@ -1676,6 +1811,25 @@ impl LuaEngine {
                     function M:getstats() return { bytes_received = 0, bytes_sent = 0 } end
                     socket_tbl.tcp = function()
                         return setmetatable({ _h = _learnon_sock_new() }, mt)
+                    end
+                    local umt = { __index = {} }
+                    local U = umt.__index
+                    function U:setpeername(host, port)
+                        local id = self._h:_start_setpeername(host, port)
+                        return coroutine.yield(id)
+                    end
+                    function U:send(data)
+                        local id = self._h:_start_send(data)
+                        return coroutine.yield(id)
+                    end
+                    function U:receive(max)
+                        local id = self._h:_start_receive(max or 0)
+                        return coroutine.yield(id)
+                    end
+                    function U:close() return self._h:_close() end
+                    function U:settimeout(ms) return self._h:_settimeout(ms) end
+                    socket_tbl.udp = function()
+                        return setmetatable({ _h = _learnon_udp_new() }, umt)
                     end
                     return true
                 end

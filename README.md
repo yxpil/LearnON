@@ -178,6 +178,8 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   returns the idle connection to a process-global pool keyed by `host:port`, and a later `connect`
   to the same peer reuses it (skip the handshake, second return `"reused"`). Verified by
   `tools/sock_ext_e2e.py` against real TCP backends.
+- UDP: `ngx.socket.udp()` → `setpeername / send / receive(max) / settimeout / close` — connected-UDP
+  datagram I/O on the same scheduler yield path; verified by `tools/sock_udp_e2e.py`.
 - Regex: `ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)` (flags support `i`)
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
@@ -433,8 +435,9 @@ Remaining tradeoffs / roadmap:
 - **Cosocket coverage**: `ngx.socket.tcp` now runs the full OpenResty method surface as scheduler
   yield points — `connect/send/receive(*l|*a|n)/receiveany/receiveuntil/shutdown/setsize/
   settimeout/setkeepalive`(backed by a real process-global connection pool)`/reconnect/close`
-  (see the API section and `tools/sock_ext_e2e.py`). Still open: `connect` over SSL
-  (`sock:tlshandshake` / `ssl:connect`), `ngx.socket.udp`, and `balancer_by_lua`.
+  (see the API section and `tools/sock_ext_e2e.py`). `ngx.socket.udp` (datagram I/O) is covered too
+  (`tools/sock_udp_e2e.py`). Still open: `connect` over SSL (`sock:tlshandshake` / `ssl:connect`)
+  and `balancer_by_lua`.
   `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open.
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).
