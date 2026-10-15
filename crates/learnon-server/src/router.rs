@@ -26,7 +26,10 @@ use std::sync::Arc;
 use learnon_config::{Config, Directive};
 
 use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
-use crate::engine::{HandlerSpec, GeoDef, GeoRule, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule};
+use crate::engine::{
+    HandlerSpec, GeoDef, GeoRule, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule,
+    SplitBucket, SplitDef,
+};
 use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
 use crate::proxy_tls::TlsPolicy;
@@ -583,6 +586,78 @@ impl Router {
         Ok(defs)
     }
 
+    /// 解析顶层 `split_clients <key> $dest { ... }` 块为 SplitDef 列表。
+    /// 分支语法：`<percent>% <result>;` 与 `* <result>;`（兜底桶）。
+    /// 权重按声明顺序累加落桶（对齐 ngx_split_clients）。
+    fn parse_splits(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<SplitDef>, AppError> {
+        let mut defs = Vec::new();
+        for d in config.root.block.iter().filter(|d| d.name == "split_clients") {
+            let key = d
+                .arg(0)
+                .ok_or_else(|| {
+                    AppError::Other(format!(
+                        "split_clients（第 {} 行）缺少键模板",
+                        d.line
+                    ))
+                })?
+                .to_string();
+            let dest_raw = d.arg(1).ok_or_else(|| {
+                AppError::Other(format!(
+                    "split_clients {key}（第 {} 行）缺少目标变量",
+                    d.line
+                ))
+            })?;
+            let dest = dest_raw.trim_start_matches('$').to_string();
+            if dest.is_empty() {
+                return Err(AppError::Other(format!(
+                    "split_clients 目标变量为空（第 {} 行）",
+                    d.line
+                )));
+            }
+            let mut buckets: Vec<SplitBucket> = Vec::new();
+            let mut star: Option<String> = None;
+            let mut sum: f64 = 0.0;
+            for c in &d.block {
+                let result = c.args.first().cloned().unwrap_or_default();
+                if c.name == "*" {
+                    star = Some(result);
+                    continue;
+                }
+                // c.name 形如 "0.5%" 或 "2%"
+                let pct_str = c.name.trim_end_matches('%');
+                let percent: f64 = pct_str.parse().map_err(|_| {
+                    AppError::Other(format!(
+                        "split_clients {dest} 非法权重 '{}'（第 {} 行）",
+                        c.name, c.line
+                    ))
+                })?;
+                if percent <= 0.0 {
+                    return Err(AppError::Other(format!(
+                        "split_clients {dest} 权重须为正数（第 {} 行）",
+                        c.line
+                    )));
+                }
+                sum += percent;
+                buckets.push(SplitBucket { percent, result });
+            }
+            if star.is_none() && buckets.is_empty() {
+                warnings.push(format!(
+                    "split_clients {key} → {dest}（第 {} 行）没有任何分桶，目标恒为空串",
+                    d.line
+                ));
+            }
+            if sum > 100.0001 {
+                warnings.push(format!(
+                    "split_clients {dest}（第 {} 行）权重合计 {:.3}% 超过 100%，超出部分永不命中",
+                    d.line,
+                    sum
+                ));
+            }
+            defs.push(SplitDef { dest, key, buckets, star });
+        }
+        Ok(defs)
+    }
+
     fn build_with_listeners(
         config: &Config,
         base_dir: &PathBuf,
@@ -616,6 +691,10 @@ impl Router {
         // 顶层 `geo` 指令：同理，按 IP 最长前缀匹配的派生变量表
         let geos = Self::parse_geos(config, &mut warnings)?;
         crate::engine::install_geos(geos);
+
+        // 顶层 `split_clients` 指令：按键模板哈希加权分流的派生变量表
+        let splits = Self::parse_splits(config, &mut warnings)?;
+        crate::engine::install_splits(splits);
 
         let limits_declared: Vec<String> = config
             .root
@@ -1575,6 +1654,36 @@ mod tests {
         assert!(Router::parse_geos(&cfg(bad_ip), &mut Vec::new()).is_err());
         let bad_prefix = "geo $g { default x; 10.0.0.0/33 v; } server{listen 18196;}";
         assert!(Router::parse_geos(&cfg(bad_prefix), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn parse_splits_buckets_star_and_error() {
+        let conf = r#"
+            split_clients "${remote_addr}${http_user_agent}" $variant {
+                0.5%         ".2g";
+                2%           "test";
+                *            "none";
+            }
+            server { listen 127.0.0.1:18195; location / { return 200 s; } }
+        "#;
+        let mut warns = Vec::new();
+        let defs = Router::parse_splits(&cfg(conf), &mut warns).unwrap();
+        assert_eq!(defs.len(), 1);
+        let d = &defs[0];
+        assert_eq!(d.dest, "variant");
+        // 键模板保留变量引用原样，运行时才插值
+        assert_eq!(d.key, "${remote_addr}${http_user_agent}");
+        assert_eq!(d.star.as_deref(), Some("none"));
+        assert_eq!(d.buckets.len(), 2);
+        assert!((d.buckets[0].percent - 0.5).abs() < 1e-9 && d.buckets[0].result == ".2g");
+        assert!((d.buckets[1].percent - 2.0).abs() < 1e-9 && d.buckets[1].result == "test");
+
+        // 非法权重（非数字）应报错
+        let bad = r#"
+            split_clients $host $v { abc% x; }
+            server { listen 127.0.0.1:18194; location / { return 200 y; } }
+        "#;
+        assert!(Router::parse_splits(&cfg(bad), &mut Vec::new()).is_err());
     }
 
     const TWO_HOSTS: &str = r#"

@@ -74,6 +74,7 @@ all gateway logic is hand-written.
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
 | `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
+| `split_clients <key> $dst { … }` weighted-derived variables | MurmurHash2 over an interpolated key template, `%` buckets (fractional allowed) + `*` catch-all, same shared resolver | `engine.rs`, `router.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -281,6 +282,19 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   more-specific `/16` beating it via longest-prefix, a second network, `default`, and the omitted-source
   `$remote_addr` form — each through Lua and the proxied `proxy_set_header` path against a header-echo
   backend) + unit tests `geo_*` and `parse_geos_*`.
+- Derived variables — the nginx `split_clients` directive. Top-level `split_clients <key> $dest { … }`
+  hashes an interpolated key template (e.g. `"${remote_addr}${http_user_agent}"`) with nginx's
+  MurmurHash2 and maps the value into weighted percentage buckets, with a `*` catch-all taking the
+  remaining share. Weights may be fractional (`0.5%`) and are accumulated in declaration order; the
+  chosen bucket is the first whose cumulative upper bound exceeds `hash % 10000`, giving two-decimal
+  resolution. The key template's variables are resolved through the same `engine::resolve_variable`
+  seam, so a split `$dest` is derived identically in `ngx.var.<dest>` and in config strings like
+  `proxy_set_header … $dest;`, and selection is stable for a given key across the whole fleet.
+  Verified by `tools/split_clients_e2e.py` (9 checks: per-key determinism, an independently-ported
+  MurmurHash2 reference confirming both the Lua-read and proxy-interpolation paths land the exact same
+  bucket for fixed keys, a 1200-request distribution giving ~25/25/25/25 and ~10%-with-`*`-catch-all
+  splits, and cross-path agreement) + unit tests `murmur_hash2_*`, `pick_split_bucket_*`,
+  `expand_split_key_*` and `parse_splits_*`.
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

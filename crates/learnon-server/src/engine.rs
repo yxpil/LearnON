@@ -178,10 +178,11 @@ pub fn install_maps(defs: Vec<MapDef>) {
     *map_store().write().unwrap() = defs;
 }
 
-/// 已安装的 map + geo 目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
+/// 已安装的 map + geo + split_clients 目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
 pub fn mapped_dests_sorted() -> Vec<String> {
     let mut v: Vec<String> = map_store().read().unwrap().iter().map(|d| d.dest.clone()).collect();
     v.extend(geo_store().read().unwrap().iter().map(|d| d.dest.clone()));
+    v.extend(split_store().read().unwrap().iter().map(|d| d.dest.clone()));
     v.sort_by(|a, b| b.len().cmp(&a.len()));
     v.dedup();
     v
@@ -256,6 +257,9 @@ pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     }
     if let Some(g) = resolve_geo(ctx, name, depth) {
         return Some(g);
+    }
+    if let Some(s) = resolve_split(ctx, name, depth) {
+        return Some(s);
     }
     builtin_var(ctx, name)
 }
@@ -412,6 +416,154 @@ fn resolve_geo(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
         .unwrap_or_default();
     let ip = src_raw.trim().parse::<std::net::IpAddr>().ok()?;
     Some(match_geo(&def, &ip))
+}
+
+// ---------- nginx `split_clients` 派生变量（按键模板哈希做加权分流） ----------
+
+/// 一个加权分桶：`percent` 为百分比权重（可含小数，如 0.5 表示 0.5%）。
+#[derive(Debug, Clone)]
+pub struct SplitBucket {
+    pub percent: f64,
+    pub result: String,
+}
+
+/// 顶层 `split_clients <key_template> $dest { ... }`：`$dest` 由 `<key_template>`
+/// 插值后经 MurmurHash2 取模落桶决定；`*` 桶承接剩余百分比。
+#[derive(Debug, Clone)]
+pub struct SplitDef {
+    pub dest: String,
+    /// 键模板，如 `"${remote_addr}${http_user_agent}"`（含变量引用，运行时插值）
+    pub key: String,
+    /// 显式百分比桶（按声明顺序累加）
+    pub buckets: Vec<SplitBucket>,
+    /// `*` 兜底桶结果；`None` 表示无兜底，落空返回空串
+    pub star: Option<String>,
+}
+
+static SPLITS: std::sync::OnceLock<std::sync::RwLock<Vec<SplitDef>>> =
+    std::sync::OnceLock::new();
+
+fn split_store() -> &'static std::sync::RwLock<Vec<SplitDef>> {
+    SPLITS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// 由 Router::build 在每次构建路由表时原子替换（与 map/geo 一样热重载安全）。
+pub fn install_splits(defs: Vec<SplitDef>) {
+    *split_store().write().unwrap() = defs;
+}
+
+/// nginx `ngx_murmur_hash2` 的等价实现（32 位，MurmurHash2，小端读入）。
+/// 纯函数，便于单测比对已知向量。
+pub fn murmur_hash2(data: &[u8]) -> u32 {
+    const M: u32 = 0x5bd1_e995;
+    let len = data.len();
+    let mut h: u32 = (len as u32) ^ 0x9dc0_3ac8;
+    let mut i = 0;
+    while i + 4 <= len {
+        let mut k = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        k = k.wrapping_mul(M);
+        k ^= k >> 24;
+        k = k.wrapping_mul(M);
+        h = h.wrapping_mul(M);
+        h ^= k;
+        i += 4;
+    }
+    match len - i {
+        3 => {
+            h ^= (data[i + 2] as u32) << 16;
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        2 => {
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        1 => {
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        _ => {}
+    }
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^= h >> 15;
+    h
+}
+
+/// 由键字符串得到落在 `[0, 10000)` 的桶坐标（百分数 × 100，支持两位小数权重）。
+pub fn split_id(key: &str) -> u32 {
+    murmur_hash2(key.as_bytes()) % 10000
+}
+
+/// 纯落桶：按声明顺序累加权重（换算到 id 单位），首个 `id < 累计上界` 命中；
+/// 都不中则返回 `*` 兜底，无兜底返回空串。与全局表解耦，便于单测。
+pub fn pick_split_bucket(def: &SplitDef, id: u32) -> String {
+    let mut sum: f64 = 0.0;
+    for b in &def.buckets {
+        sum += b.percent * 100.0;
+        if (id as f64) < sum {
+            return b.result.clone();
+        }
+    }
+    def.star.clone().unwrap_or_default()
+}
+
+/// 展开键模板里的变量引用：`${name}` 与 `$name` 两种形式；未定义变量按空串处理。
+fn expand_split_key(ctx: &RequestCtx, template: &str, depth: u8) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            let ch = template[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let rest = &template[i + 1..];
+        // ${name}
+        if let Some(after_brace) = rest.strip_prefix('{') {
+            if let Some(end) = after_brace.find('}') {
+                let name = &after_brace[..end];
+                let val = resolve_var(ctx, name, depth).unwrap_or_default();
+                out.push_str(&val);
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        // $name：变量名为 [A-Za-z0-9_] 序列
+        let name_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len > 0 {
+            let val = resolve_var(ctx, &rest[..name_len], depth).unwrap_or_default();
+            out.push_str(&val);
+            i += 1 + name_len;
+        } else {
+            out.push('$');
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 解析变量 `$name`（split_clients 版）：若 name 是某个 split 的目标，则插值键模板、
+/// 取哈希落桶；否则返回 None（交由内置变量处理）。
+fn resolve_split(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let def = {
+        let store = split_store().read().unwrap();
+        store.iter().find(|d| d.dest == name).cloned()
+    };
+    let def = def?;
+    let key = expand_split_key(ctx, &def.key, depth + 1);
+    let id = split_id(&key);
+    Some(pick_split_bucket(&def, id))
 }
 
 // ---------- rewrite / return ----------
@@ -809,6 +961,55 @@ mod tests {
         assert_eq!(match_geo(&def, &"10.1.2.5".parse().unwrap()), "narrow");
         assert_eq!(match_geo(&def, &"10.1.9.5".parse().unwrap()), "mid");
         assert_eq!(match_geo(&def, &"10.9.9.9".parse().unwrap()), "wide");
+    }
+
+    #[test]
+    fn murmur_hash2_is_deterministic_and_bounded() {
+        // 同输入同输出；split_id 落在 [0,10000)
+        let a = murmur_hash2(b"${remote_addr}127.0.0.1");
+        let b = murmur_hash2(b"${remote_addr}127.0.0.1");
+        assert_eq!(a, b);
+        assert_ne!(murmur_hash2(b"alpha"), murmur_hash2(b"beta"));
+        for k in ["", "x", "127.0.0.1Chrome", "a-long-key-that-spans-several-4-byte-blocks"] {
+            let id = split_id(k);
+            assert!(id < 10000, "split_id({k}) = {id} 越界");
+        }
+    }
+
+    #[test]
+    fn pick_split_bucket_accumulates_and_star_catches_rest() {
+        let def = SplitDef {
+            dest: "v".into(),
+            key: "${remote_addr}".into(),
+            buckets: vec![
+                SplitBucket { percent: 0.5, result: "a".into() },
+                SplitBucket { percent: 50.0, result: "b".into() },
+            ],
+            star: Some("rest".into()),
+        };
+        // 0.5% → id<50；50% → 累计到 5050；其余走 *
+        assert_eq!(pick_split_bucket(&def, 0), "a");
+        assert_eq!(pick_split_bucket(&def, 49), "a");
+        assert_eq!(pick_split_bucket(&def, 50), "b");
+        assert_eq!(pick_split_bucket(&def, 5049), "b");
+        assert_eq!(pick_split_bucket(&def, 5050), "rest");
+        assert_eq!(pick_split_bucket(&def, 9999), "rest");
+        // 无 * 时落空返回空串
+        let no_star = SplitDef { dest: "v".into(), key: String::new(), buckets: def.buckets.clone(), star: None };
+        assert_eq!(pick_split_bucket(&no_star, 6000), "");
+    }
+
+    #[test]
+    fn expand_split_key_resolves_builtin_vars() {
+        let mut ctx = RequestCtx::default();
+        ctx.remote_addr = "203.0.113.7".into();
+        ctx.req_headers.push(("user-agent".to_string(), "curl/8".to_string()));
+        // ${var} 与 $var 两种写法都插值；未定义变量按空串
+        assert_eq!(
+            expand_split_key(&ctx, "${remote_addr}${http_user_agent}", 0),
+            "203.0.113.7curl/8"
+        );
+        assert_eq!(expand_split_key(&ctx, "$remote_addr-$no_such", 0), "203.0.113.7-");
     }
 
     #[test]
