@@ -25,8 +25,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use mlua::prelude::*;
 use mlua::{AnyUserData, RegistryKey, Thread, ThreadStatus, Variadic};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::TlsConnector;
 use tokio::sync::{mpsc, oneshot};
 
 use learnon_config::Config;
@@ -114,6 +117,52 @@ impl LuaSource {
     }
 }
 
+/// cosocket 的统一流：明文 TCP，或 `sock:tlshandshake` 之后的 rustls 客户端 TLS-over-TCP。
+/// 与 `proxy_tls::ProxyStream` 同构，但不需要 hyper 的 `Connection`/`rt` 桥接。
+/// Tls 变体用 `Box` 保证 `Unpin`（`Pin::new(s.as_mut())` 要求内层 Unpin）。
+pub enum CosStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for CosStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            CosStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            CosStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for CosStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            CosStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            CosStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            CosStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            CosStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            CosStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            CosStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// TCP cosocket 句柄（对标 ngx.socket.tcp 的底层对象）。
 ///
 /// I/O 在 tokio 任务里执行，**不持 Lua VM 锁**：`_start_*` 立即 spawn 一个 op 任务并返回 op id，
@@ -121,7 +170,7 @@ impl LuaSource {
 /// resume 本协程（即 `coroutine.yield` 的返回值）。同一 socket 上的 op 由调用协程串行发起，
 /// `stream` 的 tokio 互斥锁只是与调度器/其它 VM 任务隔离的防护。
 pub struct Cosocket {
-    stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    stream: Arc<tokio::sync::Mutex<Option<CosStream>>>,
     buf: Arc<tokio::sync::Mutex<Vec<u8>>>,
     timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// setsize 上限（字节）；0 表示不限制。超限时 receive 报错而非继续缓冲。
@@ -165,7 +214,7 @@ fn op_timeout(dur_ms: u64) -> std::time::Duration {
 /// 从已缓冲字节 + 流的增量读中取出一个 receive 请求的数据；内部按 (Line/All/Exact) 处理，
 /// 读满/EOF/出错即返回。持有 buf 的 tokio 锁跨 await（Send 安全）。
 async fn recv_into(
-    s: &mut TcpStream,
+    s: &mut CosStream,
     buf: &mut Vec<u8>,
     pat: &RecvPat,
     cap: usize,
@@ -253,7 +302,7 @@ fn find_subslice(buf: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// receiveany(min, max)：读到至少 min 字节即返回（上限 max，默认 4096），返回可用数据。
 async fn recv_any_into(
-    s: &mut TcpStream,
+    s: &mut CosStream,
     buf: &mut Vec<u8>,
     min: usize,
     max: usize,
@@ -292,7 +341,7 @@ async fn recv_any_into(
 
 /// receiveuntil(delim)：读到 delim 为止，返回 delim 之前的数据并消费 delim；found=true。
 /// EOF 且未找到 delim：返回已缓冲数据，found=false。
-async fn recv_until_into(s: &mut TcpStream, buf: &mut Vec<u8>, delim: &[u8]) -> Vec<ResumeVal> {
+async fn recv_until_into(s: &mut CosStream, buf: &mut Vec<u8>, delim: &[u8]) -> Vec<ResumeVal> {
     use ResumeVal::*;
     if delim.is_empty() {
         return vec![Bytes(Vec::new()), Bool(true)];
@@ -335,7 +384,7 @@ impl LuaUserData for Cosocket {
                     ResumeVal::Str("reused".into()),
                 ];
                 tokio::spawn(async move {
-                    *stream.lock().await = Some(s);
+                    *stream.lock().await = Some(CosStream::Plain(s));
                     *buf.lock().await = leftover;
                     if let Ok(mut p) = peer.lock() {
                         *p = Some((host, port));
@@ -350,7 +399,7 @@ impl LuaUserData for Cosocket {
                     Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
                     Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("connect failed: {e}"))],
                     Ok(Ok(s)) => {
-                        *stream.lock().await = Some(s);
+                        *stream.lock().await = Some(CosStream::Plain(s));
                         if let Ok(mut p) = peer.lock() {
                             *p = Some((host2, port));
                         }
@@ -601,7 +650,13 @@ impl LuaUserData for Cosocket {
                 let idle_ms = ((timeout.unwrap_or(60.0) * 1000.0) as u64).max(1);
                 let s = match this.stream.try_lock() {
                     Ok(mut g) => match g.take() {
-                        Some(s) => s,
+                        Some(CosStream::Plain(s)) => s,
+                        Some(CosStream::Tls(_)) => {
+                            return Ok((
+                                LuaValue::Nil,
+                                LuaValue::String(lua.create_string("tls connections are not pooled")?),
+                            ))
+                        }
                         None => {
                             return Ok((
                                 LuaValue::Nil,
@@ -641,6 +696,101 @@ impl LuaUserData for Cosocket {
                     pool_size.unwrap_or(0),
                 );
                 Ok((LuaValue::Integer(1), LuaValue::Nil))
+            },
+        );
+
+        // _start_tlshandshake(sni?, verify?, ca_path?) -> id；成功 [1]，失败 [nil, err]
+        // 把当前明文 TCP 流升级为 rustls 客户端 TLS 流（对标 sock:tlshandshake）。默认不校验证书；
+        // verify=true 需给 ca 指向 PEM 根束（纯 Rust 离线，未链接系统根库）。
+        methods.add_method(
+            "_start_tlshandshake",
+            |_lua, this, (sni, verify, ca): (Option<String>, Option<bool>, Option<String>)| {
+                let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+                let ev = this.ev_tx.clone();
+                let stream = Arc::clone(&this.stream);
+                let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+                // 默认 SNI：取已记录的 peer 主机名。
+                let sni = sni.or_else(|| {
+                    this.peer.lock().ok().and_then(|p| p.as_ref().map(|(h, _)| h.clone()))
+                });
+                let verify = verify.unwrap_or(false);
+                let ca_present = ca.clone();
+                tokio::spawn(async move {
+                    let mut sg = stream.lock().await;
+                    let tcp = match sg.take() {
+                        Some(CosStream::Plain(t)) => t,
+                        Some(CosStream::Tls(_)) => {
+                            let _ = ev.send((
+                                id,
+                                vec![ResumeVal::Nil, ResumeVal::Str("already tls".into())],
+                            ));
+                            return;
+                        }
+                        None => {
+                            let _ = ev.send((
+                                id,
+                                vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
+                            ));
+                            return;
+                        }
+                    };
+                    let host = match sni.clone() {
+                        Some(h) => h,
+                        None => {
+                            let _ = ev.send((
+                                id,
+                                vec![ResumeVal::Nil, ResumeVal::Str("no server name for SNI".into())],
+                            ));
+                            return;
+                        }
+                    };
+                    let cfg_res = if verify {
+                        match ca_present.as_deref() {
+                            Some(path) => crate::proxy_tls::verify_client_config(path)
+                                .map_err(|e| e),
+                            None => Err("verify=true 需要 ca 证书束路径".to_string()),
+                        }
+                    } else {
+                        Ok(crate::proxy_tls::insecure_client_config())
+                    };
+                    let cfg = match cfg_res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str(e)]));
+                            return;
+                        }
+                    };
+                    let name = match ServerName::try_from(host.clone()) {
+                        Ok(n) => n.to_owned(),
+                        Err(e) => {
+                            let _ = ev.send((
+                                id,
+                                vec![
+                                    ResumeVal::Nil,
+                                    ResumeVal::Str(format!("非法 SNI 主机名 {host}: {e}")),
+                                ],
+                            ));
+                            return;
+                        }
+                    };
+                    let connector = TlsConnector::from(cfg);
+                    let fut = async {
+                        let s = connector.connect(name, tcp).await?;
+                        Ok::<_, std::io::Error>(s)
+                    };
+                    let payload = match tokio::time::timeout(dur, fut).await {
+                        Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                        Ok(Err(e)) => {
+                            vec![ResumeVal::Nil, ResumeVal::Str(format!("tls handshake failed: {e}"))]
+                        }
+                        Ok(Ok(tls)) => {
+                            *sg = Some(CosStream::Tls(Box::new(tls)));
+                            vec![ResumeVal::Int(1)]
+                        }
+                    };
+                    let _ = ev.send((id, payload));
+                });
+                Ok(id)
             },
         );
     }
@@ -1801,6 +1951,11 @@ impl LuaEngine {
                     end
                     function M:setkeepalive(timeout, pool_size)
                         return self._h:_setkeepalive(timeout, pool_size)
+                    end
+                    function M:tlshandshake(opts)
+                        opts = opts or {}
+                        local id = self._h:_start_tlshandshake(opts.server_name, opts.verify, opts.ca)
+                        return coroutine.yield(id)
                     end
                     function M:reconnect()
                         if not self._host then return nil, "no peer" end

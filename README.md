@@ -173,11 +173,14 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep (async coroutine)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
   receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
-  reconnect / close / getstats` — non-blocking TCP, every op yields to the VM scheduler so concurrent
-  requests interleave on one VM (mirrors ngx_lua's cosocket yield-and-resume model). `setkeepalive`
+  tlshandshake(opts) / reconnect / close / getstats` — non-blocking TCP, every op yields to the VM
+  scheduler so concurrent requests
+  interleave on one VM (mirrors ngx_lua's cosocket yield-and-resume model). `setkeepalive`
   returns the idle connection to a process-global pool keyed by `host:port`, and a later `connect`
-  to the same peer reuses it (skip the handshake, second return `"reused"`). Verified by
-  `tools/sock_ext_e2e.py` against real TCP backends.
+  to the same peer reuses it (skip the handshake, second return `"reused"`). `tlshandshake` upgrades
+  the stream to a rustls client TLS connection (`CosStream::Plain`→`CosStream::Tls`), after which
+  every receive variant runs over the encrypted stream. Verified by
+  `tools/sock_ext_e2e.py` / `tools/sock_tls_e2e.py` against real TCP and TLS backends.
 - UDP: `ngx.socket.udp()` → `setpeername / send / receive(max) / settimeout / close` — connected-UDP
   datagram I/O on the same scheduler yield path; verified by `tools/sock_udp_e2e.py`.
 - Regex: `ngx.re.match(s, pat, flags?) / ngx.re.find(s, pat, flags?)` (flags support `i`)
@@ -436,8 +439,9 @@ Remaining tradeoffs / roadmap:
   yield points — `connect/send/receive(*l|*a|n)/receiveany/receiveuntil/shutdown/setsize/
   settimeout/setkeepalive`(backed by a real process-global connection pool)`/reconnect/close`
   (see the API section and `tools/sock_ext_e2e.py`). `ngx.socket.udp` (datagram I/O) is covered too
-  (`tools/sock_udp_e2e.py`). Still open: `connect` over SSL (`sock:tlshandshake` / `ssl:connect`)
-  and `balancer_by_lua`.
+  (`tools/sock_udp_e2e.py`), as is `sock:tlshandshake` — the stream upgrades to a rustls client TLS
+  connection and all receive variants run over it (`tools/sock_tls_e2e.py`). Still open:
+  `balancer_by_lua`.
   `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open.
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).

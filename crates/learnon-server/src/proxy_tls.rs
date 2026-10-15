@@ -242,6 +242,40 @@ impl ServerCertVerifier for AcceptAll {
     }
 }
 
+/// 供 cosocket 的 `sock:tlshandshake` 复用：**不校验证书**（AcceptAll）的客户端配置，
+/// 不钉 ALPN（区别于代理用途——cosocket 可能是裸协议/私有协议）。自签后端可用。
+pub fn insecure_client_config() -> Arc<ClientConfig> {
+    let provider = Arc::new(default_provider());
+    let cfg = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        .expect("支持的 TLS 版本")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAll))
+        .with_no_client_auth();
+    Arc::new(cfg)
+}
+
+/// 供 `sock:tlshandshake({verify=true, ca=<path>})`：从 PEM CA 束构建校验型客户端配置（无 ALPN）。
+pub fn verify_client_config(ca_pem_path: &str) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(default_provider());
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        .map_err(|e| format!("TLS 协议版本配置失败: {e}"))?;
+    let mut store = RootCertStore::empty();
+    let data = std::fs::read(ca_pem_path)
+        .map_err(|e| format!("读取 CA PEM {ca_pem_path} 失败: {e}"))?;
+    let mut cur = data.as_slice();
+    for c in rustls_pemfile::certs(&mut cur) {
+        let c = c.map_err(|e| format!("解析 CA PEM 失败: {e}"))?;
+        store.add_parsable_certificates([c]);
+    }
+    if store.is_empty() {
+        return Err("verify=true 需要有效 ca 证书束（本构建为纯 Rust 离线，未链接系统根证书库）".to_string());
+    }
+    let cfg = builder.with_root_certificates(store).with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
 /// hyper legacy 客户端连接器：按 URI scheme 选择明文 TCP 或 rustls-over-TCP。
 /// `Clone` 以便连接池复用；`Service<Uri>` 是 hyper `Connect` 的公开实现口。
 #[derive(Clone)]
