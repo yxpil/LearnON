@@ -472,6 +472,18 @@ pub fn interpolate_vars(template: &str, ctx: &RequestCtx) -> String {
     if out.contains("$http_") {
         out = expand_http_vars(&out, ctx);
     }
+    // `map` 派生变量：内置/http 变量已展开，剩余 `$dest` 用 map 表按名替换
+    // （长名优先，避免 `$a` 把 `$abc` 的前缀吞掉）。
+    let dests = crate::engine::mapped_dests_sorted();
+    if !dests.is_empty() {
+        for dest in dests {
+            let token = format!("${dest}");
+            if out.contains(&token) {
+                let val = crate::engine::resolve_variable(ctx, &dest).unwrap_or_default();
+                out = out.replace(&token, &val);
+            }
+        }
+    }
     out
 }
 

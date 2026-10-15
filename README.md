@@ -72,6 +72,7 @@ all gateway logic is hand-written.
 | `proxy_cache` response caching | in-memory named zones, `proxy_cache_valid`/key/methods/min_uses, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
 | `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name`, TLS policy in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
+| `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -256,6 +257,18 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
   checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
   `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`.
+- Derived variables — the nginx `map` directive. Top-level `map <source> <dest> { … }` blocks build a
+  process-wide table (installed on every `Router::build`/hot-reload). Reads funnel through a single
+  `engine::resolve_variable` so a `$dest` resolves identically in **both** `ngx.var.<dest>` (Lua) and
+  config-string interpolation (`proxy_set_header … $dest;`). Cases follow nginx precedence: all exact
+  matches first (incl. the `""` empty-string branch), then `~regex` / `~*case-insensitive regex` in
+  order, then `default`. Regex results may reference capture groups (`$1…$9`, `${name}`). Sources may
+  be request headers (`$http_*`), built-ins (`$scheme`, `$host`, …) or another mapped variable
+  (cycle-guarded). Verified by `tools/map_e2e.py` (15 checks across the exact / `~*` / capture /
+  empty-string / default / built-in-source / undefined→nil cases, each exercised through Lua *and*
+  the proxied `proxy_set_header` path against a header-echo backend) + unit tests `match_map_*`,
+  `parse_maps_all_forms`, and `quoted_token_can_start_a_statement` (parser now accepts a quoted
+  directive name, which `map`'s `""` / quoted patterns require).
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

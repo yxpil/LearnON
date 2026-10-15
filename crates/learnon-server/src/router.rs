@@ -26,7 +26,7 @@ use std::sync::Arc;
 use learnon_config::{Config, Directive};
 
 use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
-use crate::engine::{HandlerSpec, Phase, ReturnAction, RewriteFlag, RewriteRule};
+use crate::engine::{HandlerSpec, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule};
 use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
 use crate::proxy_tls::TlsPolicy;
@@ -473,6 +473,54 @@ impl Router {
         Self::build_with_listeners(config, base_dir, Some(listeners.to_vec()))
     }
 
+    /// 解析顶层 `map $source $dest { ... }` 块为 MapDef 列表。
+    /// 分支语法：`default <val>;`、`<literal> <val>;`、`~<regex> <val>;`、`~*<regex> <val>;`。
+    fn parse_maps(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<MapDef>, AppError> {
+        let mut defs = Vec::new();
+        for d in config.root.block.iter().filter(|d| d.name == "map") {
+            let source = d.arg(0).ok_or_else(|| {
+                AppError::Other(format!("map（第 {} 行）缺少源变量", d.line))
+            })?;
+            let dest = d
+                .arg(1)
+                .ok_or_else(|| AppError::Other(format!("map {source}（第 {} 行）缺少目标变量", d.line)))?;
+            let source = source.trim_start_matches('$').to_string();
+            let dest = dest.trim_start_matches('$').to_string();
+            if dest.is_empty() || source.is_empty() {
+                return Err(AppError::Other(format!("map 需要源与目标两个变量（第 {} 行）", d.line)));
+            }
+            let mut default: Option<String> = None;
+            let mut cases: Vec<MapCase> = Vec::new();
+            for c in &d.block {
+                let result = c.args.first().cloned().unwrap_or_default();
+                if c.name == "default" {
+                    default = Some(result);
+                    continue;
+                }
+                if let Some(pat) = c.name.strip_prefix("~*") {
+                    let re = regex::RegexBuilder::new(pat)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| AppError::Other(format!("map {dest} 正则错误 {pat}: {e}")))?;
+                    cases.push(MapCase { literal: None, regex: Some(re), result });
+                } else if let Some(pat) = c.name.strip_prefix('~') {
+                    let re = regex::Regex::new(pat)
+                        .map_err(|e| AppError::Other(format!("map {dest} 正则错误 {pat}: {e}")))?;
+                    cases.push(MapCase { literal: None, regex: Some(re), result });
+                } else {
+                    // 精确串匹配（含 `=` 前缀的显式精确写法与空串 `""`）
+                    let lit = c.name.strip_prefix('=').unwrap_or(&c.name).to_string();
+                    cases.push(MapCase { literal: Some(lit), regex: None, result });
+                }
+            }
+            if !default.is_some() && cases.is_empty() {
+                warnings.push(format!("map {source} → {dest}（第 {} 行）没有任何分支，目标恒为空串", d.line));
+            }
+            defs.push(MapDef { dest, source, default, cases });
+        }
+        Ok(defs)
+    }
+
     fn build_with_listeners(
         config: &Config,
         base_dir: &PathBuf,
@@ -498,6 +546,10 @@ impl Router {
         // 配置里 listen 首次出现的顺序（HashMap 遍历顺序不定，监听顺序必须可复现）
         let mut order: Vec<SocketAddr> = Vec::new();
         let mut plain_conflicts: Vec<SocketAddr> = Vec::new();
+
+        // 顶层 `map` 指令：解析后原子替换全局 map 表（build 与 rebuild 都经过这里，热重载安全）
+        let maps = Self::parse_maps(config, &mut warnings)?;
+        crate::engine::install_maps(maps);
 
         let limits_declared: Vec<String> = config
             .root
@@ -1384,6 +1436,42 @@ mod tests {
 
     fn build(s: &str) -> Router {
         Router::build(&cfg(s), &PathBuf::from(".")).unwrap()
+    }
+
+    #[test]
+    fn parse_maps_all_forms() {
+        let conf = r#"
+            map $http_x_src $dst {
+                default      fallback;
+                exact1       hit1;
+                ""           empty_hit;
+                ~^/reg       reg_hit;
+                ~*CI$        ci_hit;
+            }
+            server { listen 127.0.0.1:18199; location / { return 200 x; } }
+        "#;
+        let mut warns = Vec::new();
+        let defs = Router::parse_maps(&cfg(conf), &mut warns).unwrap();
+        assert_eq!(defs.len(), 1);
+        let d = &defs[0];
+        assert_eq!(d.source, "http_x_src");
+        assert_eq!(d.dest, "dst");
+        assert_eq!(d.default.as_deref(), Some("fallback"));
+        // 精确（含空串）+ 正则 + 大小写不敏感正则共 4 个分支
+        assert_eq!(d.cases.len(), 4);
+        assert!(d.cases.iter().any(|c| c.literal.as_deref() == Some("exact1")));
+        assert!(d.cases.iter().any(|c| c.literal.as_deref() == Some("")));
+        assert!(d.cases.iter().any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "^/reg")));
+        assert!(d.cases.iter().any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "CI$")));
+    }
+
+    #[test]
+    fn build_with_maps_rejects_bad_regex() {
+        let conf = r#"
+            map $host $x { default y; ~[  bad; }
+            server { listen 127.0.0.1:18198; location / { return 200 z; } }
+        "#;
+        assert!(Router::build(&cfg(conf), &PathBuf::from(".")).is_err());
     }
 
     const TWO_HOSTS: &str = r#"

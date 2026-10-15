@@ -144,6 +144,193 @@ impl RequestCtx {
     }
 }
 
+// ---------- nginx `map` 派生变量 ----------
+
+/// 一个 `map` 分支。`literal=Some(s)` 为精确串匹配（含 `""` 空串）；
+/// `literal=None` 时用预编译 `regex` 匹配源变量值。
+#[derive(Debug, Clone)]
+pub struct MapCase {
+    pub literal: Option<String>,
+    pub regex: Option<regex::Regex>,
+    pub result: String,
+}
+
+/// 顶层 `map $source $dest { ... }`：`$dest` 的值由 `$source` 逐分支匹配得出。
+#[derive(Debug, Clone)]
+pub struct MapDef {
+    /// 目标变量名（不含 `$`）
+    pub dest: String,
+    /// 源变量名（不含 `$`）
+    pub source: String,
+    /// 无分支命中时的默认值；`None` 表示默认空串
+    pub default: Option<String>,
+    pub cases: Vec<MapCase>,
+}
+
+static MAPS: std::sync::OnceLock<std::sync::RwLock<Vec<MapDef>>> = std::sync::OnceLock::new();
+
+fn map_store() -> &'static std::sync::RwLock<Vec<MapDef>> {
+    MAPS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// 由 Router::build 在每次（含热重载）构建路由表时调用，原子替换整张 map 表。
+pub fn install_maps(defs: Vec<MapDef>) {
+    *map_store().write().unwrap() = defs;
+}
+
+/// 已安装 map 的目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
+pub fn mapped_dests_sorted() -> Vec<String> {
+    let mut v: Vec<String> = map_store().read().unwrap().iter().map(|d| d.dest.clone()).collect();
+    v.sort_by(|a, b| b.len().cmp(&a.len()));
+    v
+}
+
+/// 内置 nginx 变量读取（`$uri` / `$http_*` / `$sent_http_*` / `$status` 等）。
+/// 这是 ngx.var 与 map 源解析共享的唯一事实源。
+pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
+    if let Some(hdr) = name.strip_prefix("http_") {
+        let want = hdr.replace('_', "-");
+        return ctx
+            .req_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+            .map(|(_, v)| v.clone());
+    }
+    if let Some(hdr) = name.strip_prefix("sent_http_") {
+        let want = hdr.replace('_', "-");
+        return ctx
+            .resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+            .map(|(_, v)| v.clone());
+    }
+    match name {
+        "remote_addr" => Some(ctx.remote_addr.clone()),
+        "remote_port" => Some(ctx.remote_port.to_string()),
+        "server_port" => Some(ctx.server_port.to_string()),
+        "scheme" => Some(ctx.scheme.clone()),
+        "request_method" | "method" => Some(ctx.method.clone()),
+        "request_uri" => Some(ctx.uri.clone()),
+        "uri" => Some(ctx.effective_path().to_string()),
+        "args" | "query_string" => Some(ctx.query.clone()),
+        "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
+        "host" => ctx.host.clone(),
+        "status" => Some(ctx.status.to_string()),
+        "body_bytes_sent" => Some(ctx.body.as_ref().map(|b| b.len()).unwrap_or(0).to_string()),
+        "content_type" => ctx
+            .req_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone()),
+        "request_length" => Some(
+            (ctx.uri.len()
+                + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
+                .to_string(),
+        ),
+        "upstream_addr" => Some(ctx.upstream_addr.clone()),
+        "upstream_status" => Some(ctx.upstream_status.to_string()),
+        "upstream_header_time" | "upstream_response_time" => {
+            Some(format!("{:.3}", ctx.upstream_header_time))
+        }
+        _ => None,
+    }
+}
+
+/// 解析变量 `$name`：若为 map 目标则按 map 求值（源可能是内置变量或另一个 map，
+/// 递归解析，`depth` 防环）；否则走内置变量表。`None` 表示未定义。
+pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let def = {
+        let store = map_store().read().unwrap();
+        store.iter().find(|d| d.dest == name).cloned()
+    };
+    if let Some(def) = def {
+        let src = builtin_var(ctx, &def.source)
+            .or_else(|| resolve_var(ctx, &def.source, depth + 1))
+            .unwrap_or_default();
+        return Some(match_map(&def, &src));
+    }
+    builtin_var(ctx, name)
+}
+
+/// 纯匹配：给定已解析的源值，按 nginx 语义返回目标值（先全部精确匹配，再按序试正则，
+/// 最后 default）。与全局 map 表解耦，便于单测。
+pub fn match_map(def: &MapDef, src: &str) -> String {
+    for c in &def.cases {
+        if let Some(lit) = &c.literal {
+            if lit == src {
+                return c.result.clone();
+            }
+        }
+    }
+    for c in &def.cases {
+        if c.literal.is_none() {
+            if let Some(re) = &c.regex {
+                if let Some(caps) = re.captures(src) {
+                    // 结果里的 $0..$9 / ${name} 引用捕获组（对齐 ngx map）
+                    return expand_map_result(&c.result, re, &caps);
+                }
+            }
+        }
+    }
+    def.default.clone().unwrap_or_default()
+}
+
+/// 把 map 结果串里的 `$0`..`$9`、`${name}` 替换为对应捕获组；未命中的组替换为空串。
+/// `$$` 不是 nginx 语法，这里不特殊处理。
+fn expand_map_result(result: &str, re: &regex::Regex, caps: &regex::Captures) -> String {
+    if !result.contains('$') {
+        return result.to_string();
+    }
+    let bytes = result.as_bytes();
+    let mut out = String::with_capacity(result.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            let ch = result[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let rest = &result[i + 1..];
+        // ${name}
+        if let Some(after_brace) = rest.strip_prefix('{') {
+            if let Some(end) = after_brace.find('}') {
+                let name = &after_brace[..end];
+                let val = re
+                    .capture_names()
+                    .zip(caps.iter())
+                    .find(|(n, _)| n.as_deref() == Some(name))
+                    .and_then(|(_, m)| m)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                out.push_str(&val);
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        // $0..$9
+        let digit_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len > 0 {
+            let idx: usize = rest[..digit_len].parse().unwrap_or(0);
+            let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
+            out.push_str(&val);
+            i += 1 + digit_len;
+        } else {
+            out.push('$');
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 便捷入口：顶层变量解析（depth=0）。
+pub fn resolve_variable(ctx: &RequestCtx, name: &str) -> Option<String> {
+    resolve_var(ctx, name, 0)
+}
+
 // ---------- rewrite / return ----------
 
 #[derive(Debug, Clone)]
@@ -407,4 +594,99 @@ pub fn spec_from_directive(d: &Directive) -> Option<HandlerSpec> {
         name: name.to_string(),
         args: d.args[1..].to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn re(pat: &str) -> regex::Regex {
+        regex::Regex::new(pat).unwrap()
+    }
+    fn re_ci(pat: &str) -> regex::Regex {
+        regex::RegexBuilder::new(pat).case_insensitive(true).build().unwrap()
+    }
+    fn lit(pattern: &str, result: &str) -> MapCase {
+        MapCase { literal: Some(pattern.to_string()), regex: None, result: result.to_string() }
+    }
+    fn rx(pattern: regex::Regex, result: &str) -> MapCase {
+        MapCase { literal: None, regex: Some(pattern), result: result.to_string() }
+    }
+
+    #[test]
+    fn match_map_exact_then_default() {
+        let def = MapDef {
+            dest: "kind".into(),
+            source: "x".into(),
+            default: Some("other".into()),
+            cases: vec![lit("mobile", "phone"), lit("desktop", "pc")],
+        };
+        assert_eq!(match_map(&def, "mobile"), "phone");
+        assert_eq!(match_map(&def, "desktop"), "pc");
+        assert_eq!(match_map(&def, "tablet"), "other");
+        // 空串精确匹配（nginx `''` 分支）
+        let def2 = MapDef {
+            dest: "conn".into(),
+            source: "upgrade".into(),
+            default: Some("upgrade".into()),
+            cases: vec![lit("", "close")],
+        };
+        assert_eq!(match_map(&def2, ""), "close");
+        assert_eq!(match_map(&def2, "websocket"), "upgrade");
+    }
+
+    #[test]
+    fn match_map_regex_ci_and_case_sensitive() {
+        let def = MapDef {
+            dest: "t".into(),
+            source: "s".into(),
+            default: None,
+            cases: vec![rx(re_ci("^bot$"), "crawler"), rx(re("^admin"), "staff")],
+        };
+        assert_eq!(match_map(&def, "BOT"), "crawler");
+        assert_eq!(match_map(&def, "admin-x"), "staff");
+        // 区分大小写的正则：ADMIN 不匹配 ^admin
+        assert_eq!(match_map(&def, "ADMIN"), "");
+    }
+
+    #[test]
+    fn match_map_exact_beats_regex_regardless_of_order() {
+        // 即便正则在前，nginx 语义仍先取精确匹配
+        let def = MapDef {
+            dest: "d".into(),
+            source: "s".into(),
+            default: Some("def".into()),
+            cases: vec![rx(re("^foo"), "regex-hit"), lit("foobar", "exact-hit")],
+        };
+        assert_eq!(match_map(&def, "foobar"), "exact-hit");
+        assert_eq!(match_map(&def, "foozzz"), "regex-hit");
+    }
+
+    #[test]
+    fn match_map_capture_references_in_result() {
+        let def = MapDef {
+            dest: "d".into(),
+            source: "s".into(),
+            default: None,
+            cases: vec![rx(re("^/api/([a-z]+)/(\\d+)$"), "$2@$1"),
+                        rx(re("^(?<verb>[A-Z]+)"), "verb-${verb}")],
+        };
+        assert_eq!(match_map(&def, "/api/users/42"), "42@users");
+        assert_eq!(match_map(&def, "GET"), "verb-GET");
+        assert_eq!(match_map(&def, "nope"), "");
+    }
+
+    #[test]
+    fn resolve_variable_reads_builtin_vars() {
+        let mut ctx = RequestCtx::default();
+        ctx.scheme = "https".into();
+        ctx.remote_addr = "203.0.113.9".into();
+        ctx.req_headers.push(("x-client".to_string(), "android-13".to_string()));
+        // 内置变量走 builtin_var（未安装任何 map 时 resolve_variable 等价于 builtin_var）
+        assert_eq!(resolve_variable(&ctx, "scheme").as_deref(), Some("https"));
+        assert_eq!(resolve_variable(&ctx, "remote_addr").as_deref(), Some("203.0.113.9"));
+        assert_eq!(resolve_variable(&ctx, "http_x_client").as_deref(), Some("android-13"));
+        // 未定义变量返回 None
+        assert_eq!(resolve_variable(&ctx, "no_such_var"), None);
+    }
 }

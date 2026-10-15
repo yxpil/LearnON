@@ -359,7 +359,7 @@ impl Parser {
                     // 空指令（分号前无内容），跳过
                     self.pos += 1;
                 }
-                Token::Word(name) => {
+                Token::Word(name) | Token::Quoted(name) => {
                     self.pos += 1;
                     let mut args = Vec::new();
                     let block;
@@ -403,12 +403,6 @@ impl Parser {
                     return Err(ConfigError::Parse {
                         line,
                         message: "unexpected '{{' at statement start".into(),
-                    });
-                }
-                Token::Quoted(_) => {
-                    return Err(ConfigError::Parse {
-                        line,
-                        message: "unexpected quoted string at statement start".into(),
                     });
                 }
             }
@@ -470,6 +464,20 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exact2"));
+    }
+
+    #[test]
+    fn quoted_token_can_start_a_statement() {
+        // nginx `map` 允许用引号串作匹配分支的模式（含空串 `""`）；解析器须把它当作指令名
+        let cfg = Config::parse("map $http_a $b { default x; \"\" close; }").unwrap();
+        let m = cfg.root.block.iter().find(|d| d.name == "map").unwrap();
+        assert_eq!(m.arg(0), Some("$http_a"));
+        assert_eq!(m.arg(1), Some("$b"));
+        let names: Vec<&str> = m.block.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["default", ""]);
+        // 空模式的结果参数
+        let empty = m.block.iter().find(|d| d.name == "").unwrap();
+        assert_eq!(empty.arg(0), Some("close"));
     }
 
     #[test]

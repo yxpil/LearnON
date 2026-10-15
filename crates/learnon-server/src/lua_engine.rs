@@ -3066,58 +3066,13 @@ impl LuaEngine {
 
         // ngx.var —— nginx 变量的 Lua 只读访问（OpenResty ngx.var 表）。全部以字符串返回，
         // 未定义的变量返回 nil（对齐 ngx_lua）。$uri / $args / $status 可写。
+        // 读取统一走 engine::resolve_variable：内置变量表 + 由 `map` 指令派生的自定义变量。
         let var = lua.create_table()?;
         let var_mt = lua.create_table()?;
         let var_index = lua.create_function(move |lua, (_t, name): (LuaTable, String)| {
             let h = get_ctx(lua)?;
             let ctx = h.0.lock().unwrap();
-            // 统一算出 owned 的 Option<String>，最后一次性转成 Lua 值（字符串或 nil）
-            let val: Option<String> = if let Some(hdr) = name.strip_prefix("http_") {
-                let want = hdr.replace('_', "-");
-                ctx.req_headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&want))
-                    .map(|(_, v)| v.clone())
-            } else if let Some(hdr) = name.strip_prefix("sent_http_") {
-                let want = hdr.replace('_', "-");
-                ctx.resp_headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&want))
-                    .map(|(_, v)| v.clone())
-            } else {
-                match name.as_str() {
-                    "remote_addr" => Some(ctx.remote_addr.clone()),
-                    "remote_port" => Some(ctx.remote_port.to_string()),
-                    "server_port" => Some(ctx.server_port.to_string()),
-                    "scheme" => Some(ctx.scheme.clone()),
-                    "request_method" => Some(ctx.method.clone()),
-                    "request_uri" => Some(ctx.uri.clone()),
-                    "uri" => Some(ctx.effective_path().to_string()),
-                    "args" | "query_string" => Some(ctx.query.clone()),
-                    "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
-                    "host" => ctx.host.clone(),
-                    "status" => Some(ctx.status.to_string()),
-                    "body_bytes_sent" => Some(ctx.body.as_ref().map(|b| b.len()).unwrap_or(0).to_string()),
-                    "content_type" => ctx
-                        .req_headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, v)| v.clone()),
-                    "request_length" => Some(
-                        (ctx.uri.len()
-                            + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
-                            .to_string(),
-                    ),
-                    // 上游指标（代理转发后由 forward 记录；未经代理时 addr 为空、status 为 0）
-                    "upstream_addr" => Some(ctx.upstream_addr.clone()),
-                    "upstream_status" => Some(ctx.upstream_status.to_string()),
-                    // 后端响应头到达耗时；本实现对齐 header_time（响应体流式返回，不再单独测总时长）
-                    "upstream_header_time" | "upstream_response_time" => {
-                        Some(format!("{:.3}", ctx.upstream_header_time))
-                    }
-                    _ => None,
-                }
-            };
+            let val: Option<String> = crate::engine::resolve_variable(&ctx, &name);
             Ok(match val {
                 Some(v) => LuaValue::String(lua.create_string(v)?),
                 None => LuaValue::Nil,
