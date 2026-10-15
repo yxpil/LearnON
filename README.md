@@ -195,8 +195,16 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Background timers: `ngx.timer.at(delay_sec, cb, ...) / ngx.timer.every(interval_sec, cb, ...) / running_count() / pending_count()`
   — seconds unit, `premature` as the callback's first argument, user varargs forwarded verbatim,
   failures return `(nil, err)`, `return false` stops the interval (semantics aligned with official t/106/152/107)
-- Response filters: `header_filter_by_lua*` (mutate response headers / clear Content-Length before
-  sending), `body_filter_by_lua*` (rewrite the response body via `ngx.arg[1]` chunk, `ngx.arg[2]` eof)
+- Response filters: `header_filter_by_lua*` (mutate response headers / status before sending),
+  `body_filter_by_lua*` (rewrite the response body via `ngx.arg[1]` chunk, `ngx.arg[2]` eof) — these now
+  run on **both** the `content_by_lua`/static path **and** the `proxy_pass` return path: a proxied response
+  is buffered, its status/headers/body loaded into the request context, the filters applied, then a
+  buffered response is emitted (matching nginx, where response filters cover upstream responses; the cost
+  is disabling streaming for that location, like `proxy_buffering off` vs filters). Verified by
+  `tools/proxy_filter_e2e.py` (10 checks: `body_filter_by_lua` uppercases a proxied backend body while
+  upstream `X-Backend` is preserved and Content-Length recomputed; `header_filter_by_lua` sets `ngx.status`
+  203 and rewrites `content-type`; both filters compose) + unit tests
+  `body_filter_lua_transforms_chunk` / `header_filter_lua_sets_status_and_headers`.
 - Log phase: `log_by_lua` / `log_by_lua_file` (runs after the response is formed, reads the final
   `ngx.status` incl. 5xx and request info; its `ngx.say` writes go to a throwaway copy so they can't
   alter the already-built response — verified by `tools/log_by_lua_e2e.py`)

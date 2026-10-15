@@ -1205,9 +1205,61 @@ async fn process(
             .await
         {
             Ok(upstream_resp) => {
-                // 未启用缓存：保持既有流式转发路径
+                // 未启用缓存：若声明了 header_filter_by_lua/body_filter_by_lua，则缓冲代理响应并
+                // 运行过滤器（对齐 nginx：响应过滤器对代理响应同样生效，代价是关闭流式）；
+                // 否则保持既有流式转发路径。
                 if lookup.is_none() {
-                    return convert_upstream_response(upstream_resp, loc, server);
+                    let hf = loc
+                        .lua_phases
+                        .iter()
+                        .find(|(p, n, _)| *p == Phase::Content && n.starts_with("header_filter_by_lua"));
+                    let bf = loc
+                        .lua_phases
+                        .iter()
+                        .find(|(p, n, _)| *p == Phase::Content && n.starts_with("body_filter_by_lua"));
+                    if hf.is_none() && bf.is_none() {
+                        return convert_upstream_response(upstream_resp, loc, server);
+                    }
+                    // 过滤器需要整体缓冲：收集状态/头/体灌入 ctx 供 Lua 读写
+                    let (parts, ibody) = upstream_resp.into_parts();
+                    ctx.status = parts.status.as_u16();
+                    ctx.resp_headers = Vec::new();
+                    for (k, v) in parts.headers.iter() {
+                        if is_hop_by_hop(k.as_str()) {
+                            continue;
+                        }
+                        ctx.resp_headers
+                            .push((k.as_str().to_string(), v.to_str().unwrap_or("").to_string()));
+                    }
+                    let collected = match ibody.collect().await {
+                        Ok(c) => c.to_bytes(),
+                        Err(e) => {
+                            log_error!("代理响应体收集失败: {e}");
+                            return error_response(ctx, server, Some(loc), 502).await;
+                        }
+                    };
+                    ctx.body = Some(collected.to_vec());
+                    // HEADER FILTER：可改写 ngx.status / ngx.header.*（写回 ctx.status / resp_headers）
+                    if let Some((_, name, src)) = hf {
+                        if run_lua(state, ctx, name, src).await {
+                            log_error!("header_filter_by_lua(代理) 执行失败");
+                        }
+                    }
+                    // BODY FILTER：ngx.arg[1]=响应体块、ngx.arg[2]=eof
+                    if let Some((_, name, src)) = bf {
+                        ctx.filter_chunk = ctx.body.clone();
+                        ctx.filter_eof = true;
+                        if run_lua(state, ctx, name, src).await {
+                            log_error!("body_filter_by_lua(代理) 执行失败");
+                            ctx.status = 500;
+                            ctx.body = None;
+                        } else if let Some(nc) = ctx.filter_chunk.take() {
+                            ctx.body = Some(nc);
+                        }
+                    }
+                    let body_bytes = bytes::Bytes::from(ctx.body.take().unwrap_or_default());
+                    let hdrs = ctx.resp_headers.clone();
+                    return build_buffered_response(ctx.status, &hdrs, body_bytes, loc, server, "", false);
                 }
                 let (zone, key, _, _, count) = lookup.unwrap();
                 let status = upstream_resp.status().as_u16();

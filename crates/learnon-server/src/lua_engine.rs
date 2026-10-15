@@ -4303,4 +4303,56 @@ mod tests {
         assert!(find("user-agent").is_empty(), "clear_header 删除");
         assert_eq!(find("X-Raw-Name"), vec!["kept"], "set_raw_header 保留原始名");
     }
+
+    // body_filter_by_lua 原语：ngx.arg[1] 读改响应体块、ngx.arg[2] 读 eof —— 代理路径过滤器复用之
+    #[tokio::test]
+    async fn body_filter_lua_transforms_chunk() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let mut ctx = RequestCtx::default();
+        ctx.filter_chunk = Some(b"hello world".to_vec());
+        ctx.filter_eof = true;
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            local c = ngx.arg[1]
+            local eof = ngx.arg[2]
+            if eof then
+                ngx.arg[1] = c:upper() .. '!'
+            end
+        "#
+        .into();
+        engine
+            .run_phase("body_filter_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("body_filter phase 执行失败");
+        let c = shared.lock().unwrap();
+        assert_eq!(c.filter_chunk.as_deref(), Some(b"HELLO WORLD!".as_slice()));
+    }
+
+    // header_filter_by_lua 原语：ngx.status 写回 ctx.status、ngx.header.* 写回 resp_headers（含 nil 删除）
+    #[tokio::test]
+    async fn header_filter_lua_sets_status_and_headers() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let mut ctx = RequestCtx::default();
+        ctx.status = 200;
+        ctx.resp_headers.push(("content-type".into(), "text/plain".into()));
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            ngx.status = 203
+            ngx.header["X-Filtered"] = "yes"
+            ngx.header["content-type"] = nil
+        "#
+        .into();
+        engine
+            .run_phase("header_filter_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("header_filter phase 执行失败");
+        let c = shared.lock().unwrap();
+        assert_eq!(c.status, 203);
+        assert!(c.resp_headers.iter().any(|(k, v)| k == "x-filtered" && v == "yes"), "{:?}", c.resp_headers);
+        assert!(!c.resp_headers.iter().any(|(k, _)| k == "content-type"), "{:?}", c.resp_headers);
+    }
 }
