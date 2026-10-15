@@ -22,15 +22,16 @@ use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, HOST, CONNECTION, UPGRADE};
 use hyper::{Request, Response};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use tokio::net::TcpStream;
+use http::Uri;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower_service::Service as _;
 
 use crate::engine::RequestCtx;
+use crate::proxy_tls::{ProxyConnector, ProxyStream, TlsPolicy};
 use crate::upstream::{KeepaliveOpts, UpstreamGuard, UpstreamPool};
 use crate::{log_warn, log_info};
 
@@ -38,7 +39,7 @@ use crate::{log_warn, log_info};
 /// 二者共用同一套连接池客户端（`Client` 的请求体类型是编译期固定的）。
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type ProxyReqBody = BoxBody<Bytes, BoxError>;
-type HyperClient = Client<HttpConnector, ProxyReqBody>;
+type HyperClient = Client<ProxyConnector, ProxyReqBody>;
 
 fn full_boxed(b: Bytes) -> ProxyReqBody {
     Full::new(b)
@@ -72,12 +73,14 @@ pub struct ProxyOpts<'a> {
     pub timeouts: ProxyTimeouts,
     /// `proxy_next_upstream` 的取值列表
     pub next_upstream: &'a [String],
+    /// `proxy_ssl_*` 解析出的 https/wss 后端 TLS 策略
+    pub tls: &'a TlsPolicy,
 }
 
-/// 每个监听进程一个共享连接池客户端；连接池按 (connect 超时, keepalive 参数) 分组
+/// 每个监听进程一个共享连接池客户端；连接池按 (connect 超时, keepalive 参数, TLS 策略指纹) 分组
 pub struct ProxyEngine {
     pool: Arc<UpstreamPool>,
-    clients: Mutex<HashMap<(u64, u64, u64), HyperClient>>,
+    clients: Mutex<HashMap<(u64, u64, u64, u64), HyperClient>>,
     /// 异步 DNS 解析器（配置了 `resolver` 时非空）；转发/Upgrade 前用它把域名换成 IP。
     resolver: Option<Arc<crate::dns::DnsResolver>>,
 }
@@ -118,22 +121,29 @@ impl ProxyEngine {
         Ok(crate::dns::authority_with_port(ip, port))
     }
 
-    /// 同一 (connect 超时 + keepalive 配置) 复用同一个客户端（= 同一套连接池），
-    /// 避免每个 location/upstream 各建一套池；keepalive 不同的上游则分到各自的池。
-    fn client(&self, connect: Duration, ka: KeepaliveOpts) -> HyperClient {
+    /// 同一 (connect 超时 + keepalive 配置 + TLS 策略指纹) 复用同一个客户端（= 同一套连接池）。
+    /// `is_https` 决定是否构建 rustls 客户端配置（http 目标走 0 指纹、共享明文池）。
+    fn client(
+        &self,
+        connect: Duration,
+        ka: KeepaliveOpts,
+        tls: &TlsPolicy,
+        is_https: bool,
+    ) -> Result<HyperClient, String> {
         // 缓存键：用 u64 哨兵值编码 Option（usize::MAX / u64::MAX 表示"未设，走默认"）。
+        // 第四位是 TLS 策略指纹，防止某 location 的 `proxy_ssl_verify off` 复用到别的 location。
         let key = (
             connect.as_millis() as u64,
             ka.max_idle.unwrap_or(usize::MAX) as u64,
             ka.idle_timeout.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX),
+            if is_https { tls.fingerprint() } else { 0 },
         );
         let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = map.get(&key) {
-            return c.clone();
+            return Ok(c.clone());
         }
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(connect));
-        connector.set_nodelay(true);
+        let tls_cfg = if is_https { Some(tls.build_client_config()?) } else { None };
+        let connector = ProxyConnector::new(connect, tls_cfg, tls);
         let mut builder = Client::builder(TokioExecutor::new());
         builder.timer(TokioTimer::new());
         if let Some(n) = ka.max_idle {
@@ -144,7 +154,7 @@ impl ProxyEngine {
         }
         let client = builder.build(connector);
         map.insert(key, client.clone());
-        client
+        Ok(client)
     }
 
     /// 执行反代。`target` 是 proxy_pass 的值（http:// 后面的部分），
@@ -157,14 +167,13 @@ impl ProxyEngine {
         opts: &ProxyOpts<'_>,
         mut body: ProxyBody,
     ) -> Result<Response<Incoming>, String> {
-        if target.starts_with("https://") {
-            return Err(
-                "proxy_pass 暂不支持 https 后端（需要可信根证书库，当前离线依赖里没有）".to_string(),
-            );
-        }
-        // 解析目标：http://host[:port][/path]
+        let is_https = target.starts_with("https://");
+        // 解析目标：http(s)://host[:port][/path]
         // 带路径时替换 location 前缀（对标 nginx proxy_pass 的 URI 语义）
-        let rest = target.trim_start_matches("http://");
+        let rest = target
+            .strip_prefix("https://")
+            .or_else(|| target.strip_prefix("http://"))
+            .unwrap_or(target);
         let (host_part, uri_part) = match rest.split_once('/') {
             Some((h, p)) => (h.to_string(), Some(format!("/{p}"))),
             None => (rest.to_string(), None),
@@ -294,9 +303,16 @@ impl ProxyEngine {
                 }
                 log_warn!("upstream {host_part} 换节点重试: {backend}");
             }
-            let connect_host = self.connect_target(&backend).await?;
+            // https 后端保留主机名（SNI/证书校验需要 DNS 名），不做 resolver→IP 改写；
+            // http 后端若配了 resolver 则把域名换成 IP 以跳过阻塞式 getaddrinfo。
+            let connect_host = if is_https {
+                backend.clone()
+            } else {
+                self.connect_target(&backend).await?
+            };
+            let scheme = if is_https { "https" } else { "http" };
             let uri = format!(
-                "http://{connect_host}{}{query}",
+                "{scheme}://{connect_host}{}{query}",
                 encode_path(&out_path),
             );
             // 每次尝试重建请求体：缓冲体可回放（clone Bytes），流式体只能取用一次
@@ -314,7 +330,7 @@ impl ProxyEngine {
                 .map_err(|e| e.to_string())?;
             *req.headers_mut() = headers.clone();
 
-            let client = self.client(opts.timeouts.connect, keepalive);
+            let client = self.client(opts.timeouts.connect, keepalive, opts.tls, is_https)?;
             // 整体作为"连接+发送+等响应头"一次等待；read 超时单独判定以便区分错误类型
             match tokio::time::timeout(opts.timeouts.read, client.request(req)).await {
                 Ok(Ok(r)) => {
@@ -480,9 +496,9 @@ pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     has_upgrade_conn && has_upgrade_header
 }
 
-/// 升级隧道的交付物：已与后端完成 101 握手的 TCP 流
+/// 升级隧道的交付物：已与后端完成 101 握手的流（明文 TCP 或 wss/https 后端上的 TLS 流）
 pub struct UpgradeTunnel {
-    pub stream: TcpStream,
+    pub stream: ProxyStream,
     /// 后端 101 响应的头（原样转发给客户端，含 Sec-WebSocket-Accept）
     pub headers: Vec<(String, String)>,
     /// 后端在 101 头之后立即发出的字节（WS 帧可能已到达），交给隧道先行读出
@@ -500,10 +516,13 @@ impl ProxyEngine {
         target: &str,
         opts: &ProxyOpts<'_>,
     ) -> Result<UpgradeTunnel, String> {
-        if target.starts_with("https://") {
-            return Err("upgrade 暂不支持 https 后端".to_string());
-        }
-        let rest = target.trim_start_matches("http://");
+        // ws://、http:// 走明文；wss://、https:// 走 rustls-over-TCP（复用代理连接器）
+        let is_tls = target.starts_with("https://") || target.starts_with("wss://");
+        let rest = target
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("wss://")
+            .trim_start_matches("ws://");
         let (host_part, _uri_part) = match rest.split_once('/') {
             Some((h, p)) => (h.to_string(), Some(format!("/{p}"))),
             None => (rest.to_string(), None),
@@ -524,31 +543,39 @@ impl ProxyEngine {
         };
         let (host, port) = match backend_addr.split_once(':') {
             Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("非法端口: {p}"))?),
-            None => (backend_addr.clone(), 80),
+            None => (backend_addr.clone(), if is_tls { 443 } else { 80 }),
         };
-        // 有 resolver 且是域名时先异步解析成 IP 再连（HOST 头仍用原始名）
-        let connect_host = match &self.resolver {
-            Some(r) if host.parse::<std::net::IpAddr>().is_err() => {
-                let addrs = r.resolve(&host).await?;
-                let ip = addrs
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("DNS 无可用地址: {host}"))?;
-                match ip {
-                    std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                    std::net::IpAddr::V4(v4) => v4.to_string(),
+        // 明文：有 resolver 且是域名时先异步解析成 IP 再连（HOST 头仍用原始名）；
+        // TLS：保留主机名（rustls 需要 DNS 名作 SNI/证书校验），不做 resolver→IP 改写。
+        let connect_host = if is_tls {
+            host.clone()
+        } else {
+            match &self.resolver {
+                Some(r) if host.parse::<std::net::IpAddr>().is_err() => {
+                    let addrs = r.resolve(&host).await?;
+                    let ip = addrs
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| format!("DNS 无可用地址: {host}"))?;
+                    match ip {
+                        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                        std::net::IpAddr::V4(v4) => v4.to_string(),
+                    }
                 }
+                _ => host.clone(),
             }
-            _ => host.clone(),
         };
 
-        let mut backend_stream = tokio::time::timeout(
-            opts.timeouts.connect,
-            TcpStream::connect((connect_host.as_str(), port)),
-        )
-        .await
-        .map_err(|_| format!("连接后端超时: {backend_addr}"))?
-        .map_err(|e| format!("连接后端失败 {backend_addr}: {e}"))?;
+        let tls_cfg = if is_tls { Some(opts.tls.build_client_config()?) } else { None };
+        let mut connector = ProxyConnector::new(opts.timeouts.connect, tls_cfg, opts.tls);
+        let scheme = if is_tls { "https" } else { "http" };
+        let dst: Uri = format!("{scheme}://{connect_host}:{port}")
+            .parse()
+            .map_err(|e| format!("非法后端地址 {connect_host}:{port}: {e}"))?;
+        let mut backend_stream = connector
+            .call(dst)
+            .await
+            .map_err(|e| format!("连接后端失败 {backend_addr}: {e}"))?;
         if let Some(g) = &guard_holder {
             g.note_success();
         }
@@ -742,9 +769,10 @@ mod tests {
         let pool = Arc::new(UpstreamPool::default());
         let e = ProxyEngine::new(pool);
         let k = KeepaliveOpts::default();
-        let a = e.client(Duration::from_secs(3), k);
-        let b = e.client(Duration::from_secs(3), k);
-        let c = e.client(Duration::from_secs(7), k);
+        let tls = TlsPolicy::default();
+        let a = e.client(Duration::from_secs(3), k, &tls, false);
+        let b = e.client(Duration::from_secs(3), k, &tls, false);
+        let c = e.client(Duration::from_secs(7), k, &tls, false);
         let _ = (&a, &b, &c);
         let n = e.clients.lock().unwrap().len();
         assert_eq!(n, 2, "两个不同的 connect 超时应有两个客户端池");
@@ -755,13 +783,14 @@ mod tests {
         // 相同 connect 超时但不同 keepalive 配置应各自独立成套池；同配置复用同一套。
         let pool = Arc::new(UpstreamPool::default());
         let e = ProxyEngine::new(pool);
+        let tls = TlsPolicy::default();
         let base = KeepaliveOpts::default();
         let capped = KeepaliveOpts { max_idle: Some(8), idle_timeout: None };
         let timed = KeepaliveOpts { max_idle: None, idle_timeout: Some(Duration::from_secs(5)) };
-        let _ = e.client(Duration::from_secs(3), base);
-        let _ = e.client(Duration::from_secs(3), base); // 同键 → 命中缓存，不新增
-        let _ = e.client(Duration::from_secs(3), capped);
-        let _ = e.client(Duration::from_secs(3), timed);
+        let _ = e.client(Duration::from_secs(3), base, &tls, false);
+        let _ = e.client(Duration::from_secs(3), base, &tls, false); // 同键 → 命中缓存，不新增
+        let _ = e.client(Duration::from_secs(3), capped, &tls, false);
+        let _ = e.client(Duration::from_secs(3), timed, &tls, false);
         assert_eq!(
             e.clients.lock().unwrap().len(),
             3,
@@ -769,11 +798,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tls_policy_splits_pools_even_with_same_timeouts() {
+        // 相同 connect/keepalive 但不同 TLS 策略：必须分池，否则某 location 的
+        // `proxy_ssl_verify off` 会污染另一 location 的连接器（安全隐患）。
+        // 用 verify off 的两种变体，保证都能成功构建（verify on 无 CA 会直接报错不入池）。
+        let pool = Arc::new(UpstreamPool::default());
+        let e = ProxyEngine::new(pool);
+        let k = KeepaliveOpts::default();
+        let a = TlsPolicy {
+            verify: false,
+            server_name: Some("a.example".to_string()),
+            ..Default::default()
+        };
+        let b = TlsPolicy {
+            verify: false,
+            server_name: Some("b.example".to_string()),
+            ..Default::default()
+        };
+        let _ = e.client(Duration::from_secs(3), k, &a, true);
+        let _ = e.client(Duration::from_secs(3), k, &b, true);
+        // 同策略再来一次 → 命中缓存，不新增
+        let _ = e.client(Duration::from_secs(3), k, &a, true);
+        // http 目标忽略 TLS 指纹（第四键恒 0），与上面两个 https 池都不同键
+        let _ = e.client(Duration::from_secs(3), k, &a, false);
+        assert_eq!(e.clients.lock().unwrap().len(), 3);
+    }
+
     #[tokio::test]
-    async fn https_backend_fails_with_clear_message() {
+    async fn https_backend_needs_trusted_cert_when_verify_on() {
         let pool = Arc::new(UpstreamPool::default());
         let e = ProxyEngine::new(pool);
         let c = ctx();
+        // 纯 Rust 离线构建未链接系统根库：verify on 且无 CA 束应给出明确错误，
+        // 而非静默连上或裸 TLS 失败。
+        let tls = TlsPolicy {
+            verify: true,
+            ..Default::default()
+        };
         let opts = ProxyOpts {
             set_headers: &[],
             timeouts: ProxyTimeouts {
@@ -781,11 +843,27 @@ mod tests {
                 read: Duration::from_secs(1),
             },
             next_upstream: &[],
+            tls: &tls,
         };
         let err = e
             .forward(&c, "https://example.com", "/api", &opts, ProxyBody::Buffered(None))
             .await
             .unwrap_err();
-        assert!(err.contains("https"), "{err}");
+        assert!(err.contains("proxy_ssl_trusted_certificate"), "{err}");
+    }
+
+    #[test]
+    fn tls_policy_build_client_config() {
+        // verify off：AcceptAll danger verifier，可直接构建
+        let off = TlsPolicy {
+            verify: false,
+            ..Default::default()
+        };
+        assert!(off.build_client_config().is_ok());
+        // verify on 且无 trusted cert：明确报错（离线未链接系统根库）
+        let on = TlsPolicy::default();
+        assert!(on.build_client_config().unwrap_err().contains("proxy_ssl_trusted_certificate"));
+        // 不同策略的指纹必须不同，避免连接池串味
+        assert_ne!(off.fingerprint(), on.fingerprint());
     }
 }

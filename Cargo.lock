@@ -692,6 +692,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]

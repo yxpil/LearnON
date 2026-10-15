@@ -70,6 +70,7 @@ all gateway logic is hand-written.
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
 | `proxy_cache` response caching | in-memory named zones, `proxy_cache_valid`/key/methods/min_uses, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
+| `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name`, TLS policy in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
@@ -236,7 +237,24 @@ Already done (previously listed as gaps, now implemented):
 - **WebSocket / Upgrade tunnel**: `proxy_pass` auto-detects Upgrade requests and, after completing the
   101 handshake with the backend, hands off to hyper's upgrade mechanism for a bidirectional pipe
   (`server.rs::handle_upgrade` + `ProxyEngine::upgrade`); WS-frame bytes that race ahead of the
-  backend's 101 are not lost (prefix buffer). `wss` (https backends) is not yet supported.
+  backend's 101 are not lost (prefix buffer). The tunnel reaches both `http://` and TLS backends
+  (`https://`/`wss://`) through the same connector (`proxy.rs` → `proxy_tls.rs`), verified by
+  `tools/https_backend_e2e.py`.
+- **https / wss backends**: `proxy_pass https://…` (and `wss://…` upgrades) terminate TLS to the
+  upstream with a pure-Rust rustls client over one pooled connector shared with plain-HTTP backends
+  (`proxy_tls.rs::ProxyConnector` implements `tower_service::Service<Uri>`; `ProxyStream` is either a
+  bare `TcpStream` or a rustls `TlsStream`, so hyper pools both by scheme+authority). Directives
+  mirror nginx: `proxy_ssl_verify on|off` (default on), `proxy_ssl_trusted_certificate <path>` (a PEM
+  CA bundle, resolved relative to the conf dir), `proxy_ssl_name <host>` (override SNI / the name the
+  cert is checked against), `proxy_ssl_server_name on|off`. The TLS policy is part of the pool key, so
+  a `proxy_ssl_verify off` location can never leak its no-verify connector into another. Verified by
+  `tools/https_backend_e2e.py` (GET/POST through a verified https backend, a `wss` 101 tunnel, and a
+  `verify on`-without-CA location that correctly 502s). **Limitations**: this is an offline, pure-Rust
+  build, so there is **no system trust store** — `proxy_ssl_verify on` requires an explicit
+  `proxy_ssl_trusted_certificate`, and a missing one fails with a clear `proxy_ssl_trusted_certificate`
+  error rather than a silent accept; ALPN is pinned to `http/1.1` (no h2 upstreams); the proxy
+  forwards to a TLS backend by DNS name (rustls derives SNI from it), so `proxy_ssl_verify off` is the
+  path for arbitrary/self-signed backends while `verify on` needs the CA + a matching SAN.
 - **gzip response compression**: `gzip on;` + `gzip_min_length` / `gzip_comp_level` / `gzip_types`
   stream-compress eligible 2xx responses (flate2, pure-Rust). Respects `Accept-Encoding` (including
   `q=0` decline), skips HEAD and non-listed content types, enforces the length threshold via the

@@ -1148,6 +1148,7 @@ async fn process(
                 read: Duration::from_secs(loc.proxy_read_timeout),
             },
             next_upstream: &loc.proxy_next_upstream,
+            tls: &loc.proxy_tls,
         };
 
         // ---- proxy_cache：仅幂等方法 + 缓冲请求体时参与缓存（流式体无法回放）----
@@ -2316,6 +2317,7 @@ async fn handle_upgrade(
         set_headers: &set_headers_ref,
         timeouts,
         next_upstream: &location.proxy_next_upstream,
+        tls: &location.proxy_tls,
     };
 
     let tunnel = match state.proxy.upgrade(&mut ctx, &proxy_pass, &opts).await {
@@ -2358,15 +2360,16 @@ async fn handle_upgrade(
     resp
 }
 
-/// 先吐出一段缓存字节、再透传底层 TCP 流的读包装：
+/// 先吐出一段缓存字节、再透传后端流的读包装：
 /// 后端可能在 101 头之后立刻抢跑发了 WS 帧，这些前导字节不能丢。
+/// `inner` 是 `ProxyStream`（明文 TCP 或 wss/https 后端的 TLS 流）。
 struct PrefixedTcp {
     prefix: std::io::Cursor<Vec<u8>>,
-    inner: tokio::net::TcpStream,
+    inner: crate::proxy_tls::ProxyStream,
 }
 
 impl PrefixedTcp {
-    fn new(prefix: Vec<u8>, inner: tokio::net::TcpStream) -> Self {
+    fn new(prefix: Vec<u8>, inner: crate::proxy_tls::ProxyStream) -> Self {
         Self {
             prefix: std::io::Cursor::new(prefix),
             inner,

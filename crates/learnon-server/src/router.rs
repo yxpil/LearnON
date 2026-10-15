@@ -29,6 +29,7 @@ use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
 use crate::engine::{HandlerSpec, Phase, ReturnAction, RewriteFlag, RewriteRule};
 use crate::limit::{ConnRule, ReqRule};
 use crate::lua_engine::LuaSource;
+use crate::proxy_tls::TlsPolicy;
 use crate::AppError;
 
 // ---------- location 匹配 ----------
@@ -137,6 +138,8 @@ pub struct Location {
     pub proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     /// `proxy_cache_min_uses N`（默认 1）：同一 key 第 N 次起才写入
     pub proxy_cache_min_uses: u32,
+    /// `proxy_ssl_*`：https/wss 后端的客户端 TLS 策略
+    pub proxy_tls: TlsPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +216,7 @@ struct ServerTemplate {
     proxy_cache_methods: Vec<String>,
     proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     proxy_cache_min_uses: u32,
+    proxy_tls: TlsPolicy,
     limit_conn: Vec<ConnRule>,
     access_rules: Vec<crate::access::AccessRule>,
     auth_basic_realm: Option<String>,
@@ -350,6 +354,45 @@ fn parse_on_off(v: &str) -> Option<bool> {
     }
 }
 
+/// 解析 `proxy_ssl_*`：把 https/wss 后端的客户端 TLS 策略就地应用到 `policy`。
+/// server 与 location 级共用；未写的指令保持传入值（location 缺省继承 server 级）。
+/// - `proxy_ssl_verify on|off`（默认 on）：off → 不校验后端证书（自签/内网）
+/// - `proxy_ssl_server_name on|off`（默认 on）：本实现下 rustls 客户端总会发 SNI，故仅作记录
+/// - `proxy_ssl_name <host>`：覆盖 SNI/校验主机名（默认取 proxy_pass 的 host）
+/// - `proxy_ssl_trusted_certificate <path>`：PEM CA 束（verify on 时必需；相对 conf 目录解析）
+fn parse_proxy_ssl_directives(
+    d: &Directive,
+    base_dir: &PathBuf,
+    warnings: &mut Vec<String>,
+    policy: &mut TlsPolicy,
+) {
+    if let Some(v) = d.find("proxy_ssl_verify").and_then(|x| x.arg(0)) {
+        match parse_on_off(v) {
+            Some(b) => policy.verify = b,
+            None => warnings.push(format!(
+                "proxy_ssl_verify 只接受 on/off（收到 '{v}'），保持 {}",
+                if policy.verify { "on" } else { "off" }
+            )),
+        }
+    }
+    if let Some(v) = d.find("proxy_ssl_server_name").and_then(|x| x.arg(0)) {
+        match parse_on_off(v) {
+            Some(b) => policy.send_sni = b,
+            None => warnings.push(format!(
+                "proxy_ssl_server_name 只接受 on/off（收到 '{v}'），保持 {}",
+                if policy.send_sni { "on" } else { "off" }
+            )),
+        }
+    }
+    if let Some(v) = d.find("proxy_ssl_name").and_then(|x| x.arg(0)) {
+        policy.server_name = Some(v.to_string());
+    }
+    if let Some(v) = d.find("proxy_ssl_trusted_certificate").and_then(|x| x.arg(0)) {
+        let p = crate::resolve_path(v, base_dir);
+        policy.trusted_cert = Some(p.to_string_lossy().into_owned());
+    }
+}
+
 /// `proxy_cache*` 指令的解析产物：字段用 Option 表示"本块是否显式指定"，
 /// 以便 location 缺省时继承 server 级（nginx 的 location 可覆盖 http/server 值）。
 struct CacheSettings {
@@ -473,6 +516,7 @@ impl Router {
                    "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
                    "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
                    "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
+                   "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version", "ssl_protocols",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
@@ -677,6 +721,7 @@ impl Router {
             proxy_cache_methods: vec!["GET".to_string(), "HEAD".to_string()],
             proxy_cache_valid: Vec::new(),
             proxy_cache_min_uses: 1,
+            proxy_tls: TlsPolicy::default(),
             limit_conn: Vec::new(),
             access_rules: Vec::new(),
             auth_basic_realm: None,
@@ -781,6 +826,7 @@ impl Router {
                 )),
             }
         }
+        parse_proxy_ssl_directives(d, base_dir, warnings, &mut tmpl.proxy_tls);
         let cs = parse_cache_directives(d, warnings);
         if let Some(z) = cs.zone {
             tmpl.proxy_cache = z;
@@ -860,6 +906,7 @@ impl Router {
             proxy_cache_methods: tmpl.proxy_cache_methods.clone(),
             proxy_cache_valid: tmpl.proxy_cache_valid.clone(),
             proxy_cache_min_uses: tmpl.proxy_cache_min_uses,
+            proxy_tls: tmpl.proxy_tls.clone(),
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
             root: None,
@@ -882,6 +929,7 @@ impl Router {
                "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
                "proxy_request_buffering",
                "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
+               "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
                "root",
                "alias", "index", "try_files", "autoindex", "error_page", "add_header",
                "limit_req", "internal", "client_max_body_size", "content_by_lua",
@@ -963,6 +1011,7 @@ impl Router {
                 )),
             }
         }
+        parse_proxy_ssl_directives(d, base_dir, warnings, &mut loc.proxy_tls);
         let lcs = parse_cache_directives(d, warnings);
         if let Some(z) = lcs.zone {
             loc.proxy_cache = z;
@@ -1553,6 +1602,47 @@ mod tests {
         let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
         assert!(Router::match_location(&s, "/").unwrap().proxy_request_buffering, "非法取值应回落默认 on");
         assert!(r.warnings.iter().any(|w| w.contains("proxy_request_buffering")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn proxy_ssl_directives_parse_and_inherit() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; proxy_ssl_verify off;
+                 proxy_ssl_name from-server;
+                 location /inherited { proxy_pass https://127.0.0.1:1; }
+                 location /override { proxy_pass https://127.0.0.1:1;
+                     proxy_ssl_verify on; proxy_ssl_name from-loc; } }
+            server { listen 127.0.0.1:18081; location / { proxy_pass http://127.0.0.1:1; } }"#,
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        // server 级 off + name 被 location 继承
+        let inh = Router::match_location(&s, "/inherited").unwrap();
+        assert!(!inh.proxy_tls.verify);
+        assert_eq!(inh.proxy_tls.server_name.as_deref(), Some("from-server"));
+        // location 级覆盖 server 级
+        let ovr = Router::match_location(&s, "/override").unwrap();
+        assert!(ovr.proxy_tls.verify);
+        assert_eq!(ovr.proxy_tls.server_name.as_deref(), Some("from-loc"));
+        // 未声明时默认 verify on、发 SNI、无覆盖名/无 trusted cert
+        let s2 = r.match_server("127.0.0.1:18081".parse().unwrap(), None).unwrap().clone();
+        let dflt = Router::match_location(&s2, "/").unwrap();
+        assert!(dflt.proxy_tls.verify);
+        assert!(dflt.proxy_tls.send_sni);
+        assert_eq!(dflt.proxy_tls.server_name, None);
+        assert_eq!(dflt.proxy_tls.trusted_cert, None);
+    }
+
+    #[test]
+    fn proxy_ssl_rejects_bad_verify_value_keeps_default() {
+        let r = build(
+            "server { listen 127.0.0.1:18080; proxy_ssl_verify maybe; location / { proxy_pass https://127.0.0.1:1; } }",
+        );
+        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        assert!(
+            Router::match_location(&s, "/").unwrap().proxy_tls.verify,
+            "非法取值应回落默认 verify on"
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("proxy_ssl_verify")), "{:?}", r.warnings);
     }
 
     #[test]

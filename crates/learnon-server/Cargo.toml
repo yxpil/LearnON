@@ -45,6 +45,9 @@ thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+# 反向代理 https/wss 后端的连接器实现 tower_service::Service<Uri>（hyper legacy
+# Connect 的公开逃生口）；已在依赖图中（hyper-util 传递依赖），非新增加密栈。
+tower-service = "0.3"
 rcgen.workspace = true
 crossbeam-channel.workspace = true
 socket2.workspace = true

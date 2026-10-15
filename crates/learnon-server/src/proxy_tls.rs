@@ -1,0 +1,325 @@
+//! 反向代理**客户端** TLS 层：让 `proxy_pass https://…` / `wss://…` 能作为客户端连到加密后端。
+//!
+//! 与 `tls.rs`（服务端握手）相对，这里面向 rustls **ClientConfig**，并把"明文 TCP"和
+//! "TLS over TCP"两种后端流统一成一个 `ProxyStream`，实现 hyper legacy 客户端要求的
+//! `Service<Uri>` + `Connection`，于是 http/https 后端**共用同一套连接池**（hyper 按 URI
+//! 的 scheme+authority 自然分池）。
+//!
+//! 纯 Rust：根证书来自 `proxy_ssl_trusted_certificate`（rustls-pemfile 解析）；`proxy_ssl_verify off`
+//! 走 `AcceptAll` danger verifier（自签/内网常用）。**不引入 webpki-roots/native-certs**——本机离线
+//! registry 里只有 rustls/rustls-pemfile，故系统根证书库未链接（README 已说明该限制）。
+
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use http::Uri;
+use hyper_util::client::legacy::connect::{Connection, Connected};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::ring::default_provider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+/// hyper 与后端之间统一的流：明文 TCP 或 rustls 客户端 TLS 流。
+/// Box TLS 变体以保证 `Unpin`（连接池/隧道要求）。
+pub enum ProxyStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ProxyStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Connection for ProxyStream {
+    fn connected(&self) -> Connected {
+        // 统一宣告 http/1.1：ALPN 已在 ClientConfig 钉死 h1，h2 后端暂不作为代理目标。
+        Connected::new()
+    }
+}
+
+// hyper 的 legacy `Connect` 要求连接类型实现 hyper 自己的 `rt::Read`/`rt::Write`
+// （而非 tokio 的 trait），故把已实现的 tokio AsyncRead/AsyncWrite 桥接过去。
+impl hyper::rt::Read for ProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        // 与 hyper_util::rt::TokioIo 同构：把游标的未填充区交给 tokio ReadBuf，
+        // 读后再据实推进游标。
+        let n = unsafe {
+            let mut tbuf = ReadBuf::uninit(buf.as_mut());
+            match AsyncRead::poll_read(self, cx, &mut tbuf) {
+                Poll::Ready(Ok(())) => tbuf.filled().len(),
+                other => return other,
+            }
+        };
+        unsafe {
+            buf.advance(n);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for ProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write(self, cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_shutdown(self, cx)
+    }
+}
+
+/// `proxy_ssl_*` 指令的解析产物；决定 https/wss 后端握手时的证书校验策略与 SNI。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsPolicy {
+    /// `proxy_ssl_verify on|off`（默认 on）。
+    pub verify: bool,
+    /// `proxy_ssl_server_name on|off`（默认 on）——关闭则不发 SNI。
+    pub send_sni: bool,
+    /// `proxy_ssl_name <host>`：覆盖 SNI/校验用的主机名（默认取 URI host）。
+    pub server_name: Option<String>,
+    /// `proxy_ssl_trusted_certificate <path>`：PEM CA 束，构建根证书库。
+    pub trusted_cert: Option<String>,
+}
+
+impl Default for TlsPolicy {
+    fn default() -> Self {
+        TlsPolicy {
+            verify: true,
+            send_sni: true,
+            server_name: None,
+            trusted_cert: None,
+        }
+    }
+}
+
+impl TlsPolicy {
+    /// 连接池分组用的指纹：同一 (超时,keepalive) 下，TLS 策略不同必须分池，
+    /// 否则 A location 的"verify off"会污染 B location 的连接器。
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.verify.hash(&mut h);
+        self.send_sni.hash(&mut h);
+        self.server_name.hash(&mut h);
+        self.trusted_cert.hash(&mut h);
+        h.finish()
+    }
+
+    /// 构建 rustls 客户端配置。`verify on` 且无 trusted cert → 明确报错（本机未链接系统根库）。
+    pub fn build_client_config(&self) -> Result<Arc<ClientConfig>, String> {
+        let provider = Arc::new(default_provider());
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .map_err(|e| format!("TLS 协议版本配置失败: {e}"))?;
+        let mut cfg: ClientConfig = if !self.verify {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAll))
+                .with_no_client_auth()
+        } else {
+            let mut store = RootCertStore::empty();
+            if let Some(path) = &self.trusted_cert {
+                let data = std::fs::read(path)
+                    .map_err(|e| format!("读取 proxy_ssl_trusted_certificate {path} 失败: {e}"))?;
+                let mut cur = data.as_slice();
+                for c in rustls_pemfile::certs(&mut cur) {
+                    let c = c.map_err(|e| format!("解析 CA PEM 失败: {e}"))?;
+                    store.add_parsable_certificates([c]);
+                }
+            }
+            if store.is_empty() {
+                return Err(
+                    "proxy_ssl_verify on 需要 proxy_ssl_trusted_certificate 指定可信 CA 束 \
+                     （本构建为纯 Rust 离线，未链接系统根证书库）；或改用 proxy_ssl_verify off"
+                        .to_string(),
+                );
+            }
+            builder
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        };
+        // 只谈 HTTP/1.1：hyper legacy 客户端只说 h1，ALPN 必须与之相符。
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Arc::new(cfg))
+    }
+}
+
+/// `proxy_ssl_verify off` 用的不做校验的 verifier（自签/内网常见需求）。
+#[derive(Debug)]
+struct AcceptAll;
+
+impl ServerCertVerifier for AcceptAll {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        // 声称全支持即可（校验被跳过）；覆盖常见签名套件。
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// hyper legacy 客户端连接器：按 URI scheme 选择明文 TCP 或 rustls-over-TCP。
+/// `Clone` 以便连接池复用；`Service<Uri>` 是 hyper `Connect` 的公开实现口。
+#[derive(Clone)]
+pub struct ProxyConnector {
+    pub connect_timeout: Duration,
+    /// https/wss 时才需要；None 表示本连接器不带 TLS（纯 http）。
+    pub tls: Option<Arc<ClientConfig>>,
+    sni_override: Option<String>,
+}
+
+impl ProxyConnector {
+    pub fn new(
+        connect_timeout: Duration,
+        tls: Option<Arc<ClientConfig>>,
+        policy: &TlsPolicy,
+    ) -> Self {
+        ProxyConnector {
+            connect_timeout,
+            tls,
+            sni_override: policy.server_name.clone(),
+        }
+    }
+}
+
+impl tower_service::Service<Uri> for ProxyConnector {
+    type Response = ProxyStream;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<ProxyStream, io::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let tls = self.tls.clone();
+        let timeout = self.connect_timeout;
+        let sni_override = self.sni_override.clone();
+        Box::pin(async move {
+            let is_https = dst.scheme_str() == Some("https");
+            let host = dst
+                .host()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "后端 URI 无主机名"))?
+                .to_string();
+            let port = dst.port_u16().unwrap_or(if is_https { 443 } else { 80 });
+            let tcp = tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), port)))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接后端超时"))?
+                .map_err(|e| {
+                    io::Error::new(e.kind(), format!("连接后端失败 {host}:{port}: {e}"))
+                })?;
+            let _ = tcp.set_nodelay(true);
+            if !is_https {
+                return Ok(ProxyStream::Plain(tcp));
+            }
+            let cfg = tls.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "https 后端缺少 TLS 配置（需 proxy_ssl_trusted_certificate 或 proxy_ssl_verify off）",
+                )
+            })?;
+            let sni_host = sni_override.clone().unwrap_or_else(|| host.clone());
+            // rustls 客户端必须携带一个 DNS 形 ServerName（IP 字面量不能作 SNI）。
+            // 注：proxy_ssl_server_name off 在本实现里是"接受但无效"——纯 Rust rustls 客户端总会发
+            //     SNI；需要连 IP 型 https 后端时请用 hostname（README 已注明该限制）。
+            let name = ServerName::try_from(sni_host.clone())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("非法 SNI 主机名 {sni_host}: {e}")))?
+                .to_owned();
+            let connector = TlsConnector::from(cfg);
+            let stream = connector
+                .connect(name, tcp)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("后端 TLS 握手失败 {sni_host}: {e}"),
+                    )
+                })?;
+            Ok(ProxyStream::Tls(Box::new(stream)))
+        })
+    }
+}

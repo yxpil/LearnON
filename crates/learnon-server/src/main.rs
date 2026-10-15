@@ -30,6 +30,7 @@ mod lua_engine;
 mod metrics;
 mod proxy;
 mod proxy_cache;
+mod proxy_tls;
 mod router;
 mod server;
 mod settings;
