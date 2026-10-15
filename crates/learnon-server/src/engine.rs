@@ -566,6 +566,156 @@ fn resolve_split(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     Some(pick_split_bucket(&def, id))
 }
 
+// ---------- nginx `sub_filter`（响应体文本替换输出过滤器） ----------
+
+/// 一条 sub_filter 匹配目标：字面串或（不）区分大小写的正则。
+#[derive(Debug, Clone)]
+pub enum SubPattern {
+    Literal(String),
+    Regex(regex::Regex),
+}
+
+/// `sub_filter <match> <replacement>;` 一条规则。替换串中的 `&` 代表本次匹配到的原文，
+/// `\&`/`\\` 为转义（对齐 ngx_http_sub_filter_module 的转义语义）。
+#[derive(Debug, Clone)]
+pub struct SubFilter {
+    pub pattern: SubPattern,
+    pub replacement: String,
+}
+
+/// location 级 sub_filter 配置：规则 + 是否只替换首个（默认 true）+ 生效的响应类型。
+#[derive(Debug, Clone)]
+pub struct SubFilterConf {
+    pub filters: Vec<SubFilter>,
+    pub once: bool,
+    /// 生效 MIME 列表（默认 `["text/html"]`）；含 `*`/`all` 表示对任意类型生效。
+    pub types: Vec<String>,
+}
+
+/// 响应 Content-Type 是否落在 sub_filter_types 内（取 `;` 前的 MIME，大小写不敏感，
+/// 支持 `text/*` 通配子类型）。
+pub fn sub_filter_applies(content_type: Option<&str>, types: &[String]) -> bool {
+    if types.iter().any(|t| t == "*" || t.eq_ignore_ascii_case("all")) {
+        return true;
+    }
+    let ct = match content_type {
+        Some(c) => c,
+        None => return false,
+    };
+    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    types.iter().any(|t| {
+        let tl = t.to_ascii_lowercase();
+        match tl.split_once('/') {
+            Some((base, "*")) => mime.split_once('/').map(|(b, _)| b == base).unwrap_or(false),
+            _ => tl == mime,
+        }
+    })
+}
+
+/// 把替换模板里的 `&`（本次匹配原文）与反斜杠转义展开成实际写入内容。
+fn expand_sub_replacement(template: &str, matched: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) => out.push(n),
+                None => out.push('\\'),
+            }
+        } else if c == '&' {
+            out.push_str(matched);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 字面串替换：命中即写入替换串并从匹配之后继续（不会重扫替换结果），`once` 时只替换第一处。
+fn replace_sub_literal(body: &str, needle: &str, repl: &str, once: bool) -> String {
+    if needle.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        match rest.find(needle) {
+            Some(pos) => {
+                out.push_str(&rest[..pos]);
+                out.push_str(&expand_sub_replacement(repl, &rest[pos..pos + needle.len()]));
+                rest = &rest[pos + needle.len()..];
+                if once {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 正则替换：逐个非重叠匹配替换（同样展开 `&`），`once` 时只替换第一处。
+fn replace_sub_regex(body: &str, re: &regex::Regex, repl: &str, once: bool) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for m in re.find_iter(body) {
+        out.push_str(&body[last..m.start()]);
+        out.push_str(&expand_sub_replacement(repl, m.as_str()));
+        last = m.end();
+        if once {
+            break;
+        }
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// 单条规则应用到整串。
+fn apply_one_sub(body: &str, f: &SubFilter, once: bool) -> String {
+    match &f.pattern {
+        SubPattern::Literal(n) => replace_sub_literal(body, n, &f.replacement, once),
+        SubPattern::Regex(re) => replace_sub_regex(body, re, &f.replacement, once),
+    }
+}
+
+/// 输出过滤器主入口：按声明顺序依次对响应体应用每条规则（前一条的结果作为后一条输入）。
+/// 仅在 `conf` 有规则且响应类型命中 `types` 时改写；非 UTF-8 体（二进制）原样返回。
+/// 返回新字节（内容长度由调用方按新体重算 Content-Length）。
+pub fn apply_sub_filter(
+    conf: Option<&SubFilterConf>,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> Vec<u8> {
+    let conf = match conf {
+        Some(c) if !c.filters.is_empty() => c,
+        _ => return body,
+    };
+    if !sub_filter_applies(content_type, &conf.types) {
+        return body;
+    }
+    let text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return body,
+    };
+    let mut cur = text.to_string();
+    for f in &conf.filters {
+        cur = apply_one_sub(&cur, f, conf.once);
+    }
+    cur.into_bytes()
+}
+
+/// 从 `(name,value)` 响应头切片里取 content-type（大小写不敏感）。
+pub fn header_lookup_content_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+}
+
 // ---------- rewrite / return ----------
 
 #[derive(Debug, Clone)]
@@ -1010,6 +1160,76 @@ mod tests {
             "203.0.113.7curl/8"
         );
         assert_eq!(expand_split_key(&ctx, "$remote_addr-$no_such", 0), "203.0.113.7-");
+    }
+
+    #[test]
+    fn sub_filter_literal_replaces_all_or_once() {
+        let conf = SubFilterConf {
+            filters: vec![SubFilter {
+                pattern: SubPattern::Literal("foo".into()),
+                replacement: "bar".into(),
+            }],
+            once: false,
+            types: vec!["text/html".into()],
+        };
+        let out = apply_sub_filter(Some(&conf), Some("text/html; charset=utf-8"), b"a foo b foo c".to_vec());
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "a bar b bar c");
+        // once=只替换第一处
+        let once = SubFilterConf { once: true, ..conf.clone() };
+        let out = apply_sub_filter(Some(&once), Some("text/html"), b"a foo b foo c".to_vec());
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "a bar b foo c");
+    }
+
+    #[test]
+    fn sub_filter_amp_expands_to_matched_text_and_gates_by_type() {
+        // `&` = 匹配原文；类型不匹配 text/html 时不改写
+        let conf = SubFilterConf {
+            filters: vec![SubFilter {
+                pattern: SubPattern::Literal("cat".into()),
+                replacement: "[&]".into(),
+            }],
+            once: false,
+            types: vec!["text/html".into()],
+        };
+        let out = apply_sub_filter(Some(&conf), Some("text/html"), b"the cat sat".to_vec());
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "the [cat] sat");
+        let out2 = apply_sub_filter(Some(&conf), Some("application/json"), b"the cat sat".to_vec());
+        assert_eq!(&out2, b"the cat sat");
+    }
+
+    #[test]
+    fn sub_filter_regex_ci_and_wildcard_type() {
+        let conf = SubFilterConf {
+            filters: vec![SubFilter {
+                pattern: SubPattern::Regex(
+                    regex::RegexBuilder::new("he[l]{2,}o").case_insensitive(true).build().unwrap(),
+                ),
+                replacement: "HI".into(),
+            }],
+            once: false,
+            types: vec!["text/*".into()],
+        };
+        let out = apply_sub_filter(Some(&conf), Some("text/plain"), b"Hello hELLo hlo".to_vec());
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "HI HI hlo");
+    }
+
+    #[test]
+    fn sub_filter_sequential_rules_chain_and_binary_untouched() {
+        // 规则按序：第二条作用于第一条的结果
+        let conf = SubFilterConf {
+            filters: vec![
+                SubFilter { pattern: SubPattern::Literal("a".into()), replacement: "b".into() },
+                SubFilter { pattern: SubPattern::Literal("b".into()), replacement: "c".into() },
+            ],
+            once: false,
+            types: vec!["*".into()],
+        };
+        let out = apply_sub_filter(Some(&conf), Some("text/html"), b"aaa".to_vec());
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "ccc");
+        // 非 UTF-8 字节（二进制）原样返回
+        let bin = vec![0xff_u8, 0xfe, 0x00, b'a'];
+        let out = apply_sub_filter(Some(&conf), Some("text/html"), bin.clone());
+        assert_eq!(out, bin);
     }
 
     #[test]

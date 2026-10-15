@@ -1205,8 +1205,8 @@ async fn process(
             .await
         {
             Ok(upstream_resp) => {
-                // 未启用缓存：若声明了 header_filter_by_lua/body_filter_by_lua，则缓冲代理响应并
-                // 运行过滤器（对齐 nginx：响应过滤器对代理响应同样生效，代价是关闭流式）；
+                // 未启用缓存：若声明了 header_filter_by_lua/body_filter_by_lua/sub_filter，则缓冲代理
+                // 响应并运行过滤器（对齐 nginx：响应过滤器对代理响应同样生效，代价是关闭流式）；
                 // 否则保持既有流式转发路径。
                 if lookup.is_none() {
                     let hf = loc
@@ -1217,7 +1217,7 @@ async fn process(
                         .lua_phases
                         .iter()
                         .find(|(p, n, _)| *p == Phase::Content && n.starts_with("body_filter_by_lua"));
-                    if hf.is_none() && bf.is_none() {
+                    if hf.is_none() && bf.is_none() && loc.sub_filter.is_none() {
                         return convert_upstream_response(upstream_resp, loc, server);
                     }
                     // 过滤器需要整体缓冲：收集状态/头/体灌入 ctx 供 Lua 读写
@@ -1573,6 +1573,17 @@ async fn serve_static_flow(
             let status = match (code, window) {
                 (200, Some(_)) => StatusCode::PARTIAL_CONTENT,
                 (c, _) => StatusCode::from_u16(c).unwrap_or(StatusCode::OK),
+            };
+            // sub_filter：仅对完整体（非 Range 切片）按响应类型改写；Range/206 不改（对齐 nginx：
+            // 无法在字节区间上安全替换）。
+            let content = if window.is_none() && loc.sub_filter.is_some() {
+                crate::engine::apply_sub_filter(
+                    loc.sub_filter.as_ref(),
+                    Some(mime.as_str()),
+                    content,
+                )
+            } else {
+                content
             };
             let total = meta.as_ref().map(|m| m.size).unwrap_or(content.len() as u64);
             let mut builder = Response::builder()
@@ -2177,6 +2188,15 @@ fn build_buffered_response(
             }
         }
     }
+    // sub_filter 输出过滤器：改写缓冲好的响应体（Content-Length 之后按新体重算）。
+    let body = if loc.sub_filter.is_some() {
+        let ct = crate::engine::header_lookup_content_type(headers);
+        let replaced =
+            crate::engine::apply_sub_filter(loc.sub_filter.as_ref(), ct.as_deref(), body.to_vec());
+        Bytes::from(replaced)
+    } else {
+        body
+    };
     let len = body.len();
     let resp = builder.body(full_body(body));
     match resp {
@@ -2201,7 +2221,18 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 /// Lua / Rust 处理器产出的响应：resp_headers + add_header + Server 头
 fn finish_response(ctx: &RequestCtx, server: &Server, loc: Option<&Location>) -> BoxResponse {
     let status = StatusCode::from_u16(ctx.status).unwrap_or(StatusCode::OK);
-    let body = ctx.body.clone().unwrap_or_default();
+    // sub_filter 输出过滤器（content_by_lua / return 产出的响应体）。
+    let body = match loc.and_then(|l| l.sub_filter.as_ref()) {
+        Some(_) => {
+            let ct = crate::engine::header_lookup_content_type(&ctx.resp_headers);
+            crate::engine::apply_sub_filter(
+                loc.and_then(|l| l.sub_filter.as_ref()),
+                ct.as_deref(),
+                ctx.body.clone().unwrap_or_default(),
+            )
+        }
+        None => ctx.body.clone().unwrap_or_default(),
+    };
     let mut builder = Response::builder().status(status);
     {
         let hm = builder.headers_mut().unwrap();

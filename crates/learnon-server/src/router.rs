@@ -143,6 +143,8 @@ pub struct Location {
     pub proxy_cache_min_uses: u32,
     /// `proxy_ssl_*`：https/wss 后端的客户端 TLS 策略
     pub proxy_tls: TlsPolicy,
+    /// `sub_filter ...`：响应体文本替换输出过滤器（None=未启用）
+    pub sub_filter: Option<crate::engine::SubFilterConf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1119,6 +1121,7 @@ impl Router {
             access_rules: Vec::new(),
             auth_basic_realm: None,
             auth_basic_user_file: None,
+            sub_filter: None,
         };
         Self::warn_unknown(
             d,
@@ -1136,7 +1139,8 @@ impl Router {
                "log_by_lua", "log_by_lua_file",
                "balancer_by_lua", "balancer_by_lua_file",
                "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
-               "allow", "deny", "auth_basic", "auth_basic_user_file"],
+               "allow", "deny", "auth_basic", "auth_basic_user_file",
+               "sub_filter", "sub_filter_once", "sub_filter_types"],
             &format!("location '{}'", loc.pattern),
             warnings,
         );
@@ -1180,6 +1184,51 @@ impl Router {
         loc.auth_basic_realm = realm;
         loc.auth_basic_user_file = user_file;
         loc.error_pages = parse_error_pages(d);
+        // sub_filter：收集多条规则 + once + types，有任一规则才启用
+        {
+            use crate::engine::{SubFilter, SubFilterConf, SubPattern};
+            let mut filters: Vec<SubFilter> = Vec::new();
+            for sf in d.block.iter().filter(|x| x.name == "sub_filter") {
+                let (m, r) = match (sf.arg(0), sf.arg(1)) {
+                    (Some(m), Some(r)) => (m.to_string(), r.to_string()),
+                    _ => {
+                        return Err(AppError::Other(format!(
+                            "sub_filter 需要匹配串与替换串两个参数（第 {} 行）",
+                            sf.line
+                        )))
+                    }
+                };
+                let pattern = if let Some(pat) = m.strip_prefix("~*") {
+                    let re = regex::RegexBuilder::new(pat)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| AppError::Other(format!("sub_filter 正则错误 {pat}: {e}")))?;
+                    SubPattern::Regex(re)
+                } else if let Some(pat) = m.strip_prefix('~') {
+                    let re = regex::Regex::new(pat)
+                        .map_err(|e| AppError::Other(format!("sub_filter 正则错误 {pat}: {e}")))?;
+                    SubPattern::Regex(re)
+                } else {
+                    SubPattern::Literal(m)
+                };
+                filters.push(SubFilter { pattern, replacement: r });
+            }
+            if !filters.is_empty() {
+                let once = match d
+                    .find("sub_filter_once")
+                    .and_then(|x| x.arg(0))
+                    .and_then(parse_on_off)
+                {
+                    Some(b) => b,
+                    None => true, // nginx 默认 on
+                };
+                let types = match d.find("sub_filter_types") {
+                    Some(t) if !t.args.is_empty() => t.args.clone(),
+                    _ => vec!["text/html".to_string()], // nginx 默认 text/html
+                };
+                loc.sub_filter = Some(SubFilterConf { filters, once, types });
+            }
+        }
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
             loc.proxy_pass = Some(pp.to_string());
         }
@@ -1654,6 +1703,56 @@ mod tests {
         assert!(Router::parse_geos(&cfg(bad_ip), &mut Vec::new()).is_err());
         let bad_prefix = "geo $g { default x; 10.0.0.0/33 v; } server{listen 18196;}";
         assert!(Router::parse_geos(&cfg(bad_prefix), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn parse_sub_filter_directives() {
+        let conf = r#"
+            server {
+                listen 127.0.0.1:18193;
+                location / {
+                    sub_filter "foo" "bar";
+                    sub_filter ~*^h/el+lo$ "hi";
+                    sub_filter_once off;
+                    sub_filter_types text/html application/json;
+                    return 200 ok;
+                }
+            }
+        "#;
+        let r = build(conf);
+        let loc = &r.groups[&"127.0.0.1:18193".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0]
+            .locations[0];
+        let sf = loc.sub_filter.as_ref().expect("sub_filter 应启用");
+        assert!(!sf.once, "sub_filter_once off 应被解析");
+        assert_eq!(sf.types, vec!["text/html".to_string(), "application/json".to_string()]);
+        assert_eq!(sf.filters.len(), 2);
+        assert!(matches!(
+            &sf.filters[0].pattern,
+            crate::engine::SubPattern::Literal(s) if s == "foo"
+        ));
+        assert!(matches!(&sf.filters[1].pattern, crate::engine::SubPattern::Regex(_)));
+        assert_eq!(sf.filters[1].replacement, "hi");
+    }
+
+    #[test]
+    fn sub_filter_defaults_once_and_html_and_rejects_bad_regex() {
+        // 未写 once/types：默认 once=true、types=["text/html"]
+        let conf = r#"
+            server { listen 127.0.0.1:18192; location / { sub_filter a b; return 200 ok; } }
+        "#;
+        let r = build(conf);
+        let loc = &r.groups[&"127.0.0.1:18192".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0]
+            .locations[0];
+        let sf = loc.sub_filter.as_ref().unwrap();
+        assert!(sf.once);
+        assert_eq!(sf.types, vec!["text/html".to_string()]);
+        // 非法正则应报错
+        let bad = r#"
+            server { listen 127.0.0.1:18191; location / { sub_filter ~"[" x; return 200 ok; } }
+        "#;
+        assert!(Router::build(&cfg(bad), &PathBuf::from(".")).is_err());
     }
 
     #[test]

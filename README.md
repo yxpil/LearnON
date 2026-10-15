@@ -75,6 +75,7 @@ all gateway logic is hand-written.
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
 | `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
 | `split_clients <key> $dst { … }` weighted-derived variables | MurmurHash2 over an interpolated key template, `%` buckets (fractional allowed) + `*` catch-all, same shared resolver | `engine.rs`, `router.rs` |
+| `sub_filter <m> <r>;` response rewrite | literal + `~`/`~*` regex match, `&` back-reference in the replacement, `sub_filter_once`/`sub_filter_types`, applied on buffered proxy/cache/static/Lua bodies | `engine.rs`, `server.rs`, `router.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -295,6 +296,20 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   bucket for fixed keys, a 1200-request distribution giving ~25/25/25/25 and ~10%-with-`*`-catch-all
   splits, and cross-path agreement) + unit tests `murmur_hash2_*`, `pick_split_bucket_*`,
   `expand_split_key_*` and `parse_splits_*`.
+- Response rewrite — the nginx `sub_filter` output filter. `sub_filter <match> <replacement>;`
+  (repeatable) substitutes into the buffered response body; the match may be a literal string or a
+  `~regex` / `~*case-insensitive regex`, and the replacement expands `&` to the just-matched text
+  (`\&`, `\\` escape). `sub_filter_once on|off` (default `on` = replace only the first occurrence)
+  and `sub_filter_types …` (default `text/html`; `*`/`all` or a `type/*` wildcard accepted) gate it.
+  It runs as a pure `engine::apply_sub_filter` over three output seams — buffered proxy/cache
+  responses (`build_buffered_response`), static files (`serve_static_flow`, complete bodies only:
+  a `Range`/206 slice is left byte-exact, matching nginx), and `content_by_lua` / `return` bodies
+  (`finish_response`). Declaring `sub_filter` in a proxied location forces the response to buffer
+  (the same streaming tradeoff as `body_filter_by_lua`); non-UTF-8 bodies are never touched. Verified
+  by `tools/sub_filter_e2e.py` (8 checks: literal multi-replacement, `sub_filter_once` first-only,
+  regex + `&` back-reference, `application/json` left alone under the default `text/html` gate, the
+  `content_by_lua` path, a static file fully rewritten, and the same file's `Range` slice kept
+  un-rewritten) + unit tests `sub_filter_*` and `parse_sub_filter_directives`.
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into
