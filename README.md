@@ -207,8 +207,14 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   ngx_lua's error sentinel). Verified by `tools/subrequest_e2e.py`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
-  sha1_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
-  against RFC 1321 / RFC 2202 / the CRC-32 `0xCBF43926` vector
+  sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
+  against RFC 1321 / RFC 2202 / FIPS 180-4 / the CRC-32 `0xCBF43926` vector
+- `resty.*` Lua modules (loaded with `require`, registered via `package.preload`; original pure-Lua
+  implementations, not vendored OpenResty source): `resty.string` (`to_hex / sha256_hex / md5_hex`,
+  layered on the native digests) and `resty.lock` (`new(dict, {timeout,exptime}) / lock(key) / unlock()`,
+  a shared-dict `add`-based mutex with `ngx.sleep` backoff polling and a monotonic owner token so an
+  expired lock is never unlocked by the wrong holder). Verified by `tools/resty_e2e.py`, including N-way
+  concurrent `resty.lock` critical sections where the shared counter is exact (no lost updates) across VMs.
 - Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
   (IMF + Netscape-cookie formats, `parse_http_time` returns `nil` on garbage)
 - Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)

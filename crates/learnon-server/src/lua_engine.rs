@@ -1265,6 +1265,13 @@ fn sha1_bin(data: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// SHA-256 原始 32 字节摘要（resty.string.sha256_hex 的底层）。
+fn sha256_bin(data: &[u8]) -> Vec<u8> {
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .to_vec()
+}
+
 /// ngx.hmac_sha1(key, str) —— 原始 20 字节 HMAC
 fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
@@ -1394,6 +1401,8 @@ impl LuaEngine {
                     &op_counter,
                     &subreq_slot,
                 )?;
+                crate::lua_resty::install_modules(&guard)
+                    .map_err(|e| AppError::Other(format!("注册 resty.* 模块失败: {e}")))?;
                 for (name, code) in &inits {
                     guard.load(code).set_name(name).exec()?;
                 }
@@ -2338,6 +2347,16 @@ impl LuaEngine {
             }
         })?;
         ngx.set("sha1_bin", sha1_bin_f)?;
+        // ngx.sha256_bin(str[, hex]) —— 默认原始 32 字节；第二参 true 返回十六进制
+        let sha256_bin_f = lua.create_function(|lua, (s, hex): (LuaString, Option<bool>)| {
+            let raw = sha256_bin(&s.as_bytes().to_vec());
+            if hex.unwrap_or(false) {
+                Ok(LuaValue::String(lua.create_string(hex_lower(&raw))?))
+            } else {
+                Ok(LuaValue::String(lua.create_string(raw)?))
+            }
+        })?;
+        ngx.set("sha256_bin", sha256_bin_f)?;
         // ngx.hmac_sha1(secret, str) —— 原始 20 字节 HMAC-SHA1（OpenResty 语义）
         let hmac = lua.create_function(|lua, (key, data): (LuaString, LuaString)| {
             let mac = hmac_sha1(&key.as_bytes().to_vec(), &data.as_bytes().to_vec());
@@ -2974,6 +2993,20 @@ mod tests {
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
         assert_eq!(sha1_bin(b"abc").len(), 20);
+    }
+
+    #[test]
+    fn sha256_bin_matches_known_digest() {
+        // FIPS 180-4 测试向量
+        assert_eq!(
+            hex_lower(&sha256_bin(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex_lower(&sha256_bin(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sha256_bin(b"abc").len(), 32);
     }
 
     #[test]

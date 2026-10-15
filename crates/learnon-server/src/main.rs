@@ -27,6 +27,7 @@ mod engine;
 mod limit;
 mod log;
 mod lua_engine;
+mod lua_resty;
 mod metrics;
 mod proxy;
 mod proxy_cache;
