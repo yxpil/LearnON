@@ -232,6 +232,14 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   selection; `set_timeouts` cutting a 3 s backend down to a ~0.4 s 502; a shared-dict counter giving an
   exact 5/5 round-robin split of real traffic). Engine-level unit test `balancer_lua_phase_stashes_peer_on_ctx`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
+- Variables: `ngx.var` (metatable-backed nginx variables read off the live request) — `$uri /
+  $request_uri / $args / $query_string / $is_args / $method→request_method / $scheme / $host /
+  $remote_addr / $remote_port / $server_port / $content_type / $status / $body_bytes_sent /
+  $request_length / $http_<name> (request header) / $sent_http_<name> (response header)`, all returned
+  as strings with `nil` for undefined vars (OpenResty semantics). `$uri` (rewrites the path) and
+  `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
+  checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
+  `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`.
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
   against RFC 1321 / RFC 2202 / FIPS 180-4 / the CRC-32 `0xCBF43926` vector

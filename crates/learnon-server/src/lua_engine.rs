@@ -2767,6 +2767,103 @@ impl LuaEngine {
         )?;
         ngx.set("balancer", balancer)?;
 
+        // ngx.var —— nginx 变量的 Lua 只读访问（OpenResty ngx.var 表）。全部以字符串返回，
+        // 未定义的变量返回 nil（对齐 ngx_lua）。$uri / $args / $status 可写。
+        let var = lua.create_table()?;
+        let var_mt = lua.create_table()?;
+        let var_index = lua.create_function(move |lua, (_t, name): (LuaTable, String)| {
+            let h = get_ctx(lua)?;
+            let ctx = h.0.lock().unwrap();
+            // 统一算出 owned 的 Option<String>，最后一次性转成 Lua 值（字符串或 nil）
+            let val: Option<String> = if let Some(hdr) = name.strip_prefix("http_") {
+                let want = hdr.replace('_', "-");
+                ctx.req_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+                    .map(|(_, v)| v.clone())
+            } else if let Some(hdr) = name.strip_prefix("sent_http_") {
+                let want = hdr.replace('_', "-");
+                ctx.resp_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+                    .map(|(_, v)| v.clone())
+            } else {
+                match name.as_str() {
+                    "remote_addr" => Some(ctx.remote_addr.clone()),
+                    "remote_port" => Some(ctx.remote_port.to_string()),
+                    "server_port" => Some(ctx.server_port.to_string()),
+                    "scheme" => Some(ctx.scheme.clone()),
+                    "request_method" => Some(ctx.method.clone()),
+                    "request_uri" => Some(ctx.uri.clone()),
+                    "uri" => Some(ctx.effective_path().to_string()),
+                    "args" | "query_string" => Some(ctx.query.clone()),
+                    "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
+                    "host" => ctx.host.clone(),
+                    "status" => Some(ctx.status.to_string()),
+                    "body_bytes_sent" => Some(ctx.body.as_ref().map(|b| b.len()).unwrap_or(0).to_string()),
+                    "content_type" => ctx
+                        .req_headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone()),
+                    "request_length" => Some(
+                        (ctx.uri.len()
+                            + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
+                            .to_string(),
+                    ),
+                    _ => None,
+                }
+            };
+            Ok(match val {
+                Some(v) => LuaValue::String(lua.create_string(v)?),
+                None => LuaValue::Nil,
+            })
+        })?;
+        let var_newindex = lua.create_function(move |lua, (_t, (name, value)): (LuaTable, (String, LuaValue))| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            // LuaString → owned String（避免 BorrowedStr 生命周期问题）
+            let as_str = |v: &LuaValue| -> Option<String> {
+                match v {
+                    LuaValue::String(s) => Some(String::from_utf8_lossy(&s.as_bytes()).into_owned()),
+                    _ => None,
+                }
+            };
+            match name.as_str() {
+                "uri" => {
+                    if let Some(p) = as_str(&value) {
+                        ctx.rewritten_path = Some(if p.starts_with('/') { p } else { format!("/{p}") });
+                    }
+                }
+                "args" => {
+                    match &value {
+                        LuaValue::Nil => ctx.query = String::new(),
+                        _ => {
+                            if let Some(q) = as_str(&value) {
+                                ctx.query = q;
+                            }
+                        }
+                    }
+                }
+                "status" => {
+                    if let Some(n) = value.as_integer() {
+                        ctx.status = n as u16;
+                    } else if let Some(s) = as_str(&value) {
+                        if let Ok(n) = s.parse::<u16>() {
+                            ctx.status = n;
+                        }
+                    }
+                }
+                // 其它 nginx 变量在本实现里只读；对齐"不可写变量被忽略"的最保守语义
+                _ => {}
+            }
+            Ok(())
+        })?;
+        var_mt.set("__index", var_index)?;
+        var_mt.set("__newindex", var_newindex)?;
+        var.set_metatable(Some(var_mt));
+        ngx.set("var", var)?;
+
         // ngx.* 常量 —— 日志级别（OpenResty 取值）+ 控制值 + 常用 HTTP 状态码
         for (name, val) in [
             ("STDERR", -1i64), ("EMERG", 0), ("ALERT", 1), ("CRIT", 2), ("ERR", 3),
@@ -3772,5 +3869,64 @@ mod tests {
         assert_eq!(c.balancer_timeouts, Some((1000, 2000, 3000)));
         assert_eq!(c.balancer_more_failures, Some((2, 502, false)));
         assert!(!c.balancer_recreate_request);
+    }
+
+    // ngx.var —— 读取当前请求的 nginx 变量；未定义返回 nil；$uri 可写。
+    #[tokio::test]
+    async fn ngx_var_reads_and_writes() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let mut ctx = RequestCtx::default();
+        ctx.method = "POST".into();
+        ctx.path = "/a b".into();
+        ctx.uri = "/a%20b?x=1".into();
+        ctx.query = "x=1".into();
+        ctx.host = Some("h.example".into());
+        ctx.remote_addr = "1.2.3.4".into();
+        ctx.remote_port = 5555;
+        ctx.scheme = "https".into();
+        ctx.req_headers.push(("user-agent".into(), "curl/8".into()));
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            ngx.say('uri=' .. ngx.var.uri)
+            ngx.say('request_uri=' .. ngx.var.request_uri)
+            ngx.say('method=' .. ngx.var.request_method)
+            ngx.say('args=' .. ngx.var.args)
+            ngx.say('is_args=' .. ngx.var.is_args)
+            ngx.say('host=' .. ngx.var.host)
+            ngx.say('ua=' .. ngx.var.http_user_agent)
+            ngx.say('remote=' .. ngx.var.remote_addr .. ':' .. ngx.var.remote_port)
+            ngx.say('scheme=' .. ngx.var.scheme)
+            ngx.say('missing=' .. tostring(ngx.var.no_such_var))
+            -- 写 $uri 后应立刻可读回
+            ngx.var.uri = '/new'
+            ngx.say('rewritten=' .. ngx.var.uri)
+            -- 写 $status
+            ngx.var.status = 201
+            ngx.say('status=' .. tostring(ngx.var.status))
+        "#
+        .into();
+        engine
+            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("ngx.var content phase 执行失败");
+        let c = shared.lock().unwrap();
+        let body = String::from_utf8_lossy(c.body.as_deref().unwrap_or(&[])).to_string();
+        assert!(body.contains("uri=/a b"), "{body}");
+        assert!(body.contains("request_uri=/a%20b?x=1"), "{body}");
+        assert!(body.contains("method=POST"), "{body}");
+        assert!(body.contains("args=x=1"), "{body}");
+        assert!(body.contains("is_args=?"), "{body}");
+        assert!(body.contains("host=h.example"), "{body}");
+        assert!(body.contains("ua=curl/8"), "{body}");
+        assert!(body.contains("remote=1.2.3.4:5555"), "{body}");
+        assert!(body.contains("scheme=https"), "{body}");
+        assert!(body.contains("missing=nil"), "{body}");
+        assert!(body.contains("rewritten=/new"), "{body}");
+        assert!(body.contains("status=201"), "{body}");
+        // 写回 ctx：$uri 改写落 rewritten_path，$status 落 status
+        assert_eq!(c.rewritten_path.as_deref(), Some("/new"));
+        assert_eq!(c.status, 201);
     }
 }
