@@ -2061,13 +2061,15 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 .get(&key)
                 .map(|b| LuaValue::String(lua.create_string(&b).unwrap())))
         });
-        // d:get_stale(key) -> string | nil（含过期项）
+        // d:get_stale(key) -> value, stale（含过期项；第二返回值标记是否已过期，对标 ngx_lua）
         methods.add_method("get_stale", |lua, this, key: String| {
-            Ok(this
-                .get_stale(&key)
-                .map(|b| LuaValue::String(lua.create_string(&b).unwrap())))
+            let (val, stale) = this.get_stale_flagged(&key);
+            let v = match val {
+                Some(b) => LuaValue::String(lua.create_string(&b)?),
+                None => LuaValue::Nil,
+            };
+            Ok((v, LuaValue::Boolean(stale)))
         });
-        // d:set(key, value, ex?) / safe_set —— value 支持 string/number/boolean
         // d:set(key, value, ex?) -> true | nil, "no memory"
         methods.add_method(
             "set",
@@ -2075,8 +2077,8 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
                 match this.set(&key, bytes, ex) {
-                    Ok(()) => Ok(LuaValue::Boolean(true)),
-                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                    Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
                 }
             },
         );
@@ -2087,8 +2089,8 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
                 match this.safe_set(&key, bytes, ex) {
-                    Ok(()) => Ok(LuaValue::Boolean(true)),
-                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                    Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
                 }
             },
         );
@@ -2099,8 +2101,8 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
                 match this.add(&key, bytes, ex) {
-                    Ok(ok) => Ok(LuaValue::Boolean(ok)),
-                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                    Ok(ok) => Ok((LuaValue::Boolean(ok), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
                 }
             },
         );
@@ -2111,8 +2113,8 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 let bytes = lua_value_to_bytes(&value)
                     .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
                 match this.replace(&key, bytes, ex) {
-                    Ok(ok) => Ok(LuaValue::Boolean(ok)),
-                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                    Ok(ok) => Ok((LuaValue::Boolean(ok), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
                 }
             },
         );
@@ -2126,8 +2128,8 @@ impl LuaUserData for crate::shared_dict::SharedZone {
             "incr",
             |lua, this, (key, delta, init): (String, i64, Option<i64>)| {
                 match this.incr(&key, delta, init) {
-                    Ok(v) => Ok(LuaValue::Integer(v)),
-                    Err(e) => { let seq = lua.create_sequence_from([LuaValue::Nil, LuaValue::String(lua.create_string(e)?)])?; Ok(LuaValue::Table(seq)) },
+                    Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
                 }
             },
         );
@@ -2146,6 +2148,91 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         methods.add_method("capacity", |_, this, ()| Ok(this.capacity()));
         // d:free_space() -> 剩余可用空间（字节）
         methods.add_method("free_space", |_, this, ()| Ok(this.free_space()));
+
+        // ---------- Batch 2：补齐 OpenResty ngx.shared.DICT 方法面 ----------
+        // d:get_plus(key) -> value, flags（LearnON 存无类型字节，flags 恒 0=string）
+        methods.add_method("get_plus", |lua, this, key: String| {
+            let v = match this.get(&key) {
+                Some(b) => LuaValue::String(lua.create_string(&b)?),
+                None => LuaValue::Nil,
+            };
+            Ok((v, LuaValue::Integer(0)))
+        });
+        // d:get2(key) -> (value | nil, need_mask, stale, flags, expire)
+        methods.add_method("get2", |lua, this, key: String| {
+            let (val, stale) = this.get_stale_flagged(&key);
+            let ttl = this.ttl(&key).unwrap_or(-1.0);
+            let v = match val {
+                Some(b) => LuaValue::String(lua.create_string(&b)?),
+                None => LuaValue::Nil,
+            };
+            Ok((
+                v,
+                LuaValue::Boolean(false), // need_mask
+                LuaValue::Boolean(stale),
+                LuaValue::Integer(0), // flags：无类型存储
+                LuaValue::Number(ttl),
+            ))
+        });
+        // d:size() -> 存活值字节总和
+        methods.add_method("size", |_, this, ()| Ok(this.size()));
+        // d:len() -> 总条目数（对标 OpenResty len，等价 num）
+        methods.add_method("len", |_, this, ()| Ok(this.num()));
+        // d:key_present(key) -> boolean
+        methods.add_method("key_present", |_, this, key: String| Ok(this.key_present(&key)));
+        // d:force_set(key, value, ex?) -> true | nil, "no memory"（始终覆盖，必要时 LRU 淘汰）
+        methods.add_method(
+            "force_set",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+                let bytes = lua_value_to_bytes(&value)
+                    .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
+                match this.force_set(&key, bytes, ex) {
+                    Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+                }
+            },
+        );
+        // d:force_add(key, value, ex?) -> true | false | nil, "no memory"
+        methods.add_method(
+            "force_add",
+            |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
+                let bytes = lua_value_to_bytes(&value)
+                    .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
+                match this.force_add(&key, bytes, ex) {
+                    Ok(ok) => Ok((LuaValue::Boolean(ok), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+                }
+            },
+        );
+        // d:decr(key, minus, init?) -> new_value | nil, err
+        methods.add_method(
+            "decr",
+            |lua, this, (key, minus, init): (String, i64, Option<i64>)| {
+                match this.decr(&key, minus, init) {
+                    Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+                }
+            },
+        );
+        // d:bump(key, inc?) -> new_value | nil, err（允许累加已过期项，不新建）
+        methods.add_method("bump", |lua, this, (key, inc): (String, Option<i64>)| {
+            match this.bump(&key, inc.unwrap_or(1)) {
+                Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
+                Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+            }
+        });
+        // d:set_auto(key, value, expiry?, flags?) —— 无类型存储，flags 被接受但忽略
+        methods.add_method(
+            "set_auto",
+            |lua, this, (key, value, expiry, _flags): (String, LuaValue, Option<f64>, Option<i64>)| {
+                let bytes = lua_value_to_bytes(&value)
+                    .ok_or_else(|| mlua::Error::external("值类型不支持"))?;
+                match this.set(&key, bytes, expiry) {
+                    Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
+                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+                }
+            },
+        );
     }
 }
 

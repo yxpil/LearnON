@@ -175,14 +175,15 @@ impl SharedZone {
         None
     }
 
-    /// 含过期项的读取（对标 get_stale）
-    pub fn get_stale(&self, key: &str) -> Option<Vec<u8>> {
+    /// 含过期项的读取，附带 stale 标志（对标 get_stale 的 (value, stale) 双返回值）
+    pub fn get_stale_flagged(&self, key: &str) -> (Option<Vec<u8>>, bool) {
+        let now = now_epoch();
         let mut map = self.inner.shard(key).lock().unwrap();
         if let Some(e) = map.get_mut(key) {
             e.last_used = self.inner.tick();
-            return Some(e.value.clone());
+            return (Some(e.value.clone()), !e.alive(now));
         }
-        None
+        (None, false)
     }
 
     /// 写入：空间不足时 LRU 淘汰；单项超过整区容量时返回 Err("no memory")
@@ -454,6 +455,94 @@ impl SharedZone {
             .capacity
             .saturating_sub(self.inner.used.load(Ordering::Relaxed))
     }
+
+    /// key 是否存在且未过期（对标 key_present）
+    pub fn key_present(&self, key: &str) -> bool {
+        let now = now_epoch();
+        let map = self.inner.shard(key).lock().unwrap();
+        map.get(key).is_some_and(|e| e.alive(now))
+    }
+
+    /// 值存储占用字节数（所有存活项的 value 长度之和，对标 size()）
+    pub fn size(&self) -> usize {
+        let now = now_epoch();
+        self.inner
+            .shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap()
+                    .values()
+                    .filter(|e| e.alive(now))
+                    .map(|e| e.value.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// force_set：始终覆盖，必要时 LRU 淘汰腾空间；单项超过整区容量时静默不落（对标 force_set）
+    pub fn force_set(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> Result<(), String> {
+        let cost = key.len() + value.len() + NODE_OVERHEAD;
+        if self.inner.capacity > 0 && cost > self.inner.capacity {
+            return Ok(()); // force：放不下也不报错，best-effort
+        }
+        self.set(key, value, ex)
+    }
+
+    /// force_add：仅在 key 不存在/已过期时写入，空间不足会 LRU 淘汰（对标 force_add）
+    pub fn force_add(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> Result<bool, String> {
+        let now = now_epoch();
+        let cost = key.len() + value.len() + NODE_OVERHEAD;
+        if self.inner.capacity > 0 && cost > self.inner.capacity {
+            return Err("no memory".to_string());
+        }
+        // 先释放分片锁检查存在性，再 make_room（会锁全部分片），最后重新加锁写入
+        if self.key_present(key) {
+            return Ok(false);
+        }
+        if !self.inner.make_room(cost) {
+            return Err("no memory".to_string());
+        }
+        let shard = self.inner.shard(key);
+        let mut map = shard.lock().unwrap();
+        if map.get(key).is_some_and(|e| e.alive(now)) {
+            return Ok(false); // 竞争窗口里已被写入
+        }
+        let tick = self.inner.tick();
+        map.insert(
+            key.to_string(),
+            Entry {
+                value,
+                expires_at: ex.map(|t| now + t),
+                last_used: tick,
+                cost,
+            },
+        );
+        self.inner.used.fetch_add(cost, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// decr：decr(key, minus, init?) —— 语义为 incr 取负（init 命中时结果 = init - minus）
+    pub fn decr(&self, key: &str, minus: i64, init: Option<i64>) -> Result<i64, String> {
+        self.incr(key, -minus, init)
+    }
+
+    /// bump：把值当整数累加，允许累加已过期项（不检查存活、不新建），返回新值或 Err("not found")
+    pub fn bump(&self, key: &str, by: i64) -> Result<i64, String> {
+        let shard = self.inner.shard(key);
+        let mut map = shard.lock().unwrap();
+        let Some(e) = map.get_mut(key) else {
+            return Err(format!("bump: '{key}' not found"));
+        };
+        let text = String::from_utf8_lossy(&e.value).trim().to_string();
+        let cur: i64 = text
+            .parse()
+            .map_err(|_| format!("bump: '{key}' 的值不是数字 ({text})"))?;
+        let new = cur + by;
+        e.value = new.to_string().into_bytes();
+        e.last_used = self.inner.tick();
+        Ok(new)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -598,6 +687,65 @@ mod tests {
         assert_eq!(z.capacity(), 1000);
         z.set("k", b"v".to_vec(), None).unwrap();
         assert!(z.free_space() < 1000);
+    }
+
+    #[test]
+    fn get_stale_flagged_marks_expiry() {
+        let z = zone(1024);
+        z.set("k", b"v".to_vec(), Some(0.02)).unwrap();
+        let (v, stale) = z.get_stale_flagged("k");
+        assert_eq!(v.as_deref(), Some(&b"v"[..]));
+        assert!(!stale);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let (v2, stale2) = z.get_stale_flagged("k");
+        assert_eq!(v2.as_deref(), Some(&b"v"[..])); // 过期项仍能读到
+        assert!(stale2); // 且标记为 stale
+    }
+
+    #[test]
+    fn key_present_and_size() {
+        let z = zone(1024);
+        assert!(!z.key_present("a"));
+        z.set("a", b"hello".to_vec(), None).unwrap();
+        assert!(z.key_present("a"));
+        assert_eq!(z.size(), 5);
+        z.set("b", b"xy".to_vec(), None).unwrap();
+        assert_eq!(z.size(), 7);
+        z.delete("b");
+        assert_eq!(z.size(), 5);
+    }
+
+    #[test]
+    fn force_add_evicts_but_rejects_existing() {
+        let z = zone(1024);
+        assert_eq!(z.force_add("k", b"1".to_vec(), None), Ok(true));
+        assert_eq!(z.force_add("k", b"2".to_vec(), None), Ok(false));
+        assert_eq!(z.get("k"), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn force_set_oversized_is_best_effort() {
+        let z = zone(10); // 单项 cost 远超容量
+        // force_set 不报错、也不落库（对标 force 语义）
+        assert!(z.force_set("big", vec![0u8; 100], None).is_ok());
+        assert!(!z.key_present("big"));
+    }
+
+    #[test]
+    fn decr_mirrors_incr_sign() {
+        let z = zone(1024);
+        assert_eq!(z.decr("c", 2, Some(10)), Ok(8)); // init - minus
+        assert_eq!(z.decr("c", 3, None), Ok(5));
+        assert_eq!(z.incr("c", 5, None), Ok(10));
+    }
+
+    #[test]
+    fn bump_accumulates_even_when_expired_and_rejects_missing() {
+        let z = zone(1024);
+        assert!(z.bump("missing", 1).is_err());
+        z.set("n", b"5".to_vec(), None).unwrap();
+        assert_eq!(z.bump("n", 3), Ok(8));
+        assert_eq!(z.bump("n", -1), Ok(7));
     }
 
     #[test]
