@@ -60,6 +60,14 @@ pub struct RequestCtx {
     pub listener: Option<SocketAddr>,
     /// 子请求嵌套深度（ngx.location.capture 的循环/超深防护）
     pub capture_depth: u8,
+    /// balancer_by_lua：Lua 选定的上游节点 (host, port)；非空时转发绕开 upstream 负载均衡直连此节点
+    pub balancer_peer: Option<(String, u16)>,
+    /// balancer_by_lua set_timeouts：连接/发送/读取超时（毫秒），非空时覆盖 location 的 proxy_*_timeout
+    pub balancer_timeouts: Option<(u64, u64, u64)>,
+    /// balancer_by_lua set_more_failures：{failures, return_code, escalate}，记录供健康上报参考
+    pub balancer_more_failures: Option<(u32, u32, bool)>,
+    /// balancer_by_lua recreate_request(true)：本次转发是否重建发往后端的请求
+    pub balancer_recreate_request: bool,
 }
 
 impl RequestCtx {
@@ -95,6 +103,10 @@ impl RequestCtx {
             filter_eof: false,
             listener: None,
             capture_depth: 0,
+            balancer_peer: None,
+            balancer_timeouts: None,
+            balancer_more_failures: None,
+            balancer_recreate_request: false,
         }
     }
 
@@ -226,6 +238,8 @@ pub struct HandlerRegistry {
 pub enum Phase {
     Rewrite,
     Access,
+    /// BALANCER：balancer_by_lua，在 proxy_pass 转发前运行，由 Lua 选定上游节点
+    Balancer,
     Content,
     /// LOG：响应完成后运行（log_by_lua / log_by_rust），其输出被丢弃、不影响已发送的响应
     Log,

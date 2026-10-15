@@ -823,6 +823,10 @@ async fn handle_request(
         filter_eof: false,
         listener: Some(meta.listener),
         capture_depth: 0,
+        balancer_peer: None,
+        balancer_timeouts: None,
+        balancer_more_failures: None,
+        balancer_recreate_request: false,
     };
 
     // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
@@ -1019,6 +1023,10 @@ pub async fn run_capture(
         filter_eof: false,
         listener: Some(listener),
         capture_depth: parent.capture_depth + 1,
+        balancer_peer: None,
+        balancer_timeouts: None,
+        balancer_more_failures: None,
+        balancer_recreate_request: false,
     };
 
     let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None)).await;
@@ -1140,6 +1148,8 @@ async fn process(
 
     // ---- CONTENT ----
     if let Some(target) = &loc.proxy_pass {
+        // BALANCER：balancer_by_lua 在转发前运行，Lua 可经 ngx.balancer 选定上游节点/超时
+        let _ = run_phases(state, ctx, loc, Phase::Balancer, server).await;
         let headers = router::effective_proxy_headers(loc, server);
         let opts = ProxyOpts {
             set_headers: &headers,
@@ -2302,6 +2312,10 @@ async fn handle_upgrade(
         filter_eof: false,
         listener: Some(meta.listener),
         capture_depth: 0,
+        balancer_peer: None,
+        balancer_timeouts: None,
+        balancer_more_failures: None,
+        balancer_recreate_request: false,
     };
 
     let timeouts = ProxyTimeouts {

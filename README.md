@@ -217,6 +217,20 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   interleave `ABABAB`). `ngx.on_abort(handler)` additionally accepts and stores a per-request abort
   callback (API-compatible); the disconnect-driven *invocation* hook is not yet wired to the server's
   connection-liveness path and is on the roadmap.
+- Balancer phase: `balancer_by_lua` / `balancer_by_lua_file` + `ngx.balancer`
+  (`set_current_peer(host, port) / get_current_peer() / set_timeouts(connect_ms, send_ms, read_ms) /
+  set_more_failures({failures,return_code,escalate}) / recreate_request(bool?)`) — the phase runs just
+  before `proxy_pass` forwarding, reading the request via `ngx.req.get_uri_args()` / `ngx.req.get_headers()`
+  and, on `set_current_peer`, routing the connection to the Lua-selected `host:port` *instead of* the
+  upstream's load balancer (so Lua drives dynamic peer selection / service discovery). `set_timeouts`
+  overrides the location's connect/read timeouts for that hop. All five functions return OpenResty's
+  `true` / `nil, err` convention; `set_current_peer('')` and negative timeouts reject. Tradeoff vs
+  ngx_lua: the balancer runs once per request (not once per retry attempt), so a Lua-chosen peer is a
+  single hop without in-upstream failover, and the `send` timeout / `set_upstream_*` log variables are
+  not yet enforced. Verified by `tools/balancer_e2e.py` (11 checks: a `proxy_pass` to a dead upstream
+  502s on its own but the balancer re-routes it to live backends; query- and header-driven A/B
+  selection; `set_timeouts` cutting a 3 s backend down to a ~0.4 s 502; a shared-dict counter giving an
+  exact 5/5 round-robin split of real traffic). Engine-level unit test `balancer_lua_phase_stashes_peer_on_ctx`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
@@ -473,7 +487,8 @@ Remaining tradeoffs / roadmap:
   (see the API section and `tools/sock_ext_e2e.py`). `ngx.socket.udp` (datagram I/O) is covered too
   (`tools/sock_udp_e2e.py`), as is `sock:tlshandshake` — the stream upgrades to a rustls client TLS
   connection and all receive variants run over it (`tools/sock_tls_e2e.py`). Still open:
-  `balancer_by_lua`.
-  `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open.
+  `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open. `balancer_by_lua` +
+  `ngx.balancer` is now implemented (see the API section and `tools/balancer_e2e.py`); its remaining
+  gap is per-retry-attempt re-execution and `send`-timeout / `set_upstream_*` log-variable enforcement.
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).

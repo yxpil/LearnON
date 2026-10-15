@@ -2685,6 +2685,88 @@ impl LuaEngine {
 
         ngx.raw_set("version", env!("CARGO_PKG_VERSION"))?;
 
+        // ngx.balancer —— balancer_by_lua 阶段用于 Lua 选定上游节点（对齐 OpenResty 的 ngx.balancer）。
+        // 成功返回 true，失败返回 (nil, err)。set_current_peer 选定的节点会绕开 upstream 负载均衡直连。
+        let balancer = lua.create_table()?;
+        // balancer.set_current_peer(host, port)
+        balancer.set(
+            "set_current_peer",
+            lua.create_function(move |lua, (host, port): (String, u16)| {
+                if host.is_empty() {
+                    return Ok((LuaValue::Nil, LuaValue::String(lua.create_string("invalid 'host'")?)));
+                }
+                let h = get_ctx(lua)?;
+                h.0.lock().unwrap().balancer_peer = Some((host, port));
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?,
+        )?;
+        // balancer.get_current_peer() -> host, port（未设置时返回 nil）
+        balancer.set(
+            "get_current_peer",
+            lua.create_function(move |lua, ()| {
+                let h = get_ctx(lua)?;
+                let peer = h.0.lock().unwrap().balancer_peer.clone();
+                match peer {
+                    Some((host, port)) => Ok((
+                        LuaValue::String(lua.create_string(&host)?),
+                        LuaValue::Integer(port as i64),
+                    )),
+                    None => Ok((LuaValue::Nil, LuaValue::Nil)),
+                }
+            })?,
+        )?;
+        // balancer.set_timeouts(connect_ms, send_ms, read_ms)
+        balancer.set(
+            "set_timeouts",
+            lua.create_function(move |lua, (connect, send, read): (i64, i64, i64)| {
+                if connect < 0 || send < 0 || read < 0 {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("timeout should be a valid number")?),
+                    ));
+                }
+                let h = get_ctx(lua)?;
+                h.0.lock().unwrap().balancer_timeouts =
+                    Some((connect as u64, send as u64, read as u64));
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?,
+        )?;
+        // balancer.set_more_failures({failures=?, return_code=?, escalate=?})
+        balancer.set(
+            "set_more_failures",
+            lua.create_function(move |lua, opts: LuaTable| {
+                let failures: i64 = opts.raw_get("failures").unwrap_or(0);
+                let return_code: i64 = opts.raw_get("return_code").unwrap_or(-1);
+                let escalate: bool = opts.raw_get("escalate").unwrap_or(false);
+                if failures < 1 {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("invalid 'failures' field")?),
+                    ));
+                }
+                if return_code < 0 {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("invalid 'return_code' field")?),
+                    ));
+                }
+                let h = get_ctx(lua)?;
+                h.0.lock().unwrap().balancer_more_failures =
+                    Some((failures as u32, return_code as u32, escalate));
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?,
+        )?;
+        // balancer.recreate_request([boolean]) —— 默认 true；本次转发是否重建发往后端的请求
+        balancer.set(
+            "recreate_request",
+            lua.create_function(move |lua, flag: Option<bool>| {
+                let h = get_ctx(lua)?;
+                h.0.lock().unwrap().balancer_recreate_request = flag.unwrap_or(true);
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            })?,
+        )?;
+        ngx.set("balancer", balancer)?;
+
         // ngx.* 常量 —— 日志级别（OpenResty 取值）+ 控制值 + 常用 HTTP 状态码
         for (name, val) in [
             ("STDERR", -1i64), ("EMERG", 0), ("ALERT", 1), ("CRIT", 2), ("ERR", 3),
@@ -3657,5 +3739,38 @@ mod tests {
                 mlua::Value::Function(_)
             ), "missing ngx.thread.{name}");
         }
+    }
+
+    // balancer_by_lua 端到端（引擎级）：Lua 里 ngx.balancer 的选择结果应落到 RequestCtx，
+    // 供 proxy::forward 绕开 upstream 负载均衡直连该节点。
+    #[tokio::test]
+    async fn balancer_lua_phase_stashes_peer_on_ctx() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let ctx = Arc::new(Mutex::new(RequestCtx::default()));
+        let code: Arc<str> = r#"
+            local b = ngx.balancer
+            assert(b.set_current_peer('10.1.2.3', 8080))
+            assert(b.set_timeouts(1000, 2000, 3000))
+            assert(b.set_more_failures({failures = 2, return_code = 502}))
+            assert(b.recreate_request(false))
+            local host, port = b.get_current_peer()
+            assert(host == '10.1.2.3' and port == 8080)
+            -- 空 host 应返回 nil,err
+            local ok, err = b.set_current_peer('', 80)
+            assert(ok == nil and err)
+        "#
+        .into();
+        let src = LuaSource::Inline(code);
+        engine
+            .run_phase("balancer_by_lua", &src, Arc::clone(&ctx))
+            .await
+            .expect("balancer phase 执行失败");
+        let c = ctx.lock().unwrap();
+        assert_eq!(c.balancer_peer, Some(("10.1.2.3".to_string(), 8080)));
+        assert_eq!(c.balancer_timeouts, Some((1000, 2000, 3000)));
+        assert_eq!(c.balancer_more_failures, Some((2, 502, false)));
+        assert!(!c.balancer_recreate_request);
     }
 }

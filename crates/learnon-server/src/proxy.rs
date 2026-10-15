@@ -184,7 +184,12 @@ impl ProxyEngine {
         let mut max_attempts = 2;
         // 命具 named upstream 时套用其 keepalive 调优；直连目标走默认（hyper 池默认）。
         let mut keepalive = KeepaliveOpts::default();
-        let backend = if let Some(up) = self.pool.get(&host_part) {
+        let backend = if let Some((bh, bp)) = ctx.balancer_peer.clone() {
+            // balancer_by_lua 显式选定节点：绕开 upstream 负载均衡，直连该 host:port。
+            // 单跳转发（Lua 已在对端选择逻辑里自行处理节点，不在这里做组内 failover）。
+            max_attempts = 1;
+            format!("{bh}:{bp}")
+        } else if let Some(up) = self.pool.get(&host_part) {
             max_attempts = up.server_count().max(1).min(8);
             keepalive = up.keepalive;
             match up.acquire(&ctx.remote_addr, &tried) {
@@ -287,6 +292,15 @@ impl ProxyEngine {
         let idempotent = is_idempotent(&ctx.method);
 
         let mut backend = backend;
+        // balancer_by_lua set_timeouts 覆盖 location 的连接/读超时（send 目前不单独强制，对齐既有 ProxyTimeouts）
+        let eff_connect = ctx
+            .balancer_timeouts
+            .map(|t| std::time::Duration::from_millis(t.0))
+            .unwrap_or(opts.timeouts.connect);
+        let eff_read = ctx
+            .balancer_timeouts
+            .map(|t| std::time::Duration::from_millis(t.2))
+            .unwrap_or(opts.timeouts.read);
         let mut last_err = String::new();
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -330,9 +344,9 @@ impl ProxyEngine {
                 .map_err(|e| e.to_string())?;
             *req.headers_mut() = headers.clone();
 
-            let client = self.client(opts.timeouts.connect, keepalive, opts.tls, is_https)?;
+            let client = self.client(eff_connect, keepalive, opts.tls, is_https)?;
             // 整体作为"连接+发送+等响应头"一次等待；read 超时单独判定以便区分错误类型
-            match tokio::time::timeout(opts.timeouts.read, client.request(req)).await {
+            match tokio::time::timeout(eff_read, client.request(req)).await {
                 Ok(Ok(r)) => {
                     note(&guard_holder, true);
                     return Ok(r);
@@ -347,7 +361,7 @@ impl ProxyEngine {
                 }
                 Err(_) => {
                     note(&guard_holder, false);
-                    last_err = format!("proxy_read_timeout ({:?}) 超时: {backend}", opts.timeouts.read);
+                    last_err = format!("proxy_read_timeout ({:?}) 超时: {backend}", eff_read);
                     if idempotent && on_timeout && attempt + 1 < max_attempts {
                         continue;
                     }
@@ -714,6 +728,10 @@ mod tests {
             filter_eof: false,
             listener: None,
             capture_depth: 0,
+            balancer_peer: None,
+            balancer_timeouts: None,
+            balancer_more_failures: None,
+            balancer_recreate_request: false,
         }
     }
 

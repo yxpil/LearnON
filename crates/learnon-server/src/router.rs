@@ -937,6 +937,7 @@ impl Router {
                "rewrite_by_lua_file", "header_filter_by_lua", "header_filter_by_lua_file",
                "body_filter_by_lua", "body_filter_by_lua_file",
                "log_by_lua", "log_by_lua_file",
+               "balancer_by_lua", "balancer_by_lua_file",
                "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
                "allow", "deny", "auth_basic", "auth_basic_user_file"],
             &format!("location '{}'", loc.pattern),
@@ -1116,12 +1117,15 @@ impl Router {
             "body_filter_by_lua_file",
             "log_by_lua",
             "log_by_lua_file",
+            "balancer_by_lua",
+            "balancer_by_lua_file",
         ] {
             if let Some(dir) = d.find(name) {
                 let phase = match name.split('_').next().unwrap() {
                     "rewrite" => Phase::Rewrite,
                     "access" => Phase::Access,
                     "log" => Phase::Log,
+                    "balancer" => Phase::Balancer,
                     _ => Phase::Content,
                 };
                 if let Some(src) = LuaSource::from_directive(dir, base_dir) {
