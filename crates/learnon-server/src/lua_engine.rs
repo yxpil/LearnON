@@ -2811,6 +2811,13 @@ impl LuaEngine {
                             + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
                             .to_string(),
                     ),
+                    // 上游指标（代理转发后由 forward 记录；未经代理时 addr 为空、status 为 0）
+                    "upstream_addr" => Some(ctx.upstream_addr.clone()),
+                    "upstream_status" => Some(ctx.upstream_status.to_string()),
+                    // 后端响应头到达耗时；本实现对齐 header_time（响应体流式返回，不再单独测总时长）
+                    "upstream_header_time" | "upstream_response_time" => {
+                        Some(format!("{:.3}", ctx.upstream_header_time))
+                    }
                     _ => None,
                 }
             };

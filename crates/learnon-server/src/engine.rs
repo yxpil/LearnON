@@ -68,6 +68,12 @@ pub struct RequestCtx {
     pub balancer_more_failures: Option<(u32, u32, bool)>,
     /// balancer_by_lua recreate_request(true)：本次转发是否重建发往后端的请求
     pub balancer_recreate_request: bool,
+    /// 代理转发实际选定的后端 host:port（供 $upstream_addr / log_by_lua 读取）
+    pub upstream_addr: String,
+    /// 代理转发收到的后端响应状态码（0 = 未取得；供 $upstream_status）
+    pub upstream_status: u16,
+    /// 后端"连接+发送+等到响应头"的耗时秒数（供 $upstream_header_time / $upstream_response_time）
+    pub upstream_header_time: f64,
 }
 
 impl RequestCtx {
@@ -107,6 +113,9 @@ impl RequestCtx {
             balancer_timeouts: None,
             balancer_more_failures: None,
             balancer_recreate_request: false,
+            upstream_addr: String::new(),
+            upstream_status: 0,
+            upstream_header_time: 0.0,
         }
     }
 

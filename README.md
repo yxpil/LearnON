@@ -226,8 +226,9 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   overrides the location's connect/read timeouts for that hop. All five functions return OpenResty's
   `true` / `nil, err` convention; `set_current_peer('')` and negative timeouts reject. Tradeoff vs
   ngx_lua: the balancer runs once per request (not once per retry attempt), so a Lua-chosen peer is a
-  single hop without in-upstream failover, and the `send` timeout / `set_upstream_*` log variables are
-  not yet enforced. Verified by `tools/balancer_e2e.py` (11 checks: a `proxy_pass` to a dead upstream
+  single hop without in-upstream failover, and the `send` timeout / `ngx.balancer.set_upstream_*`
+  override APIs remain (though the `$upstream_addr / $upstream_status / $upstream_header_time` log
+  variables are now recorded by the proxy path — see "Upstream metrics"). Verified by `tools/balancer_e2e.py` (11 checks: a `proxy_pass` to a dead upstream
   502s on its own but the balancer re-routes it to live backends; query- and header-driven A/B
   selection; `set_timeouts` cutting a 3 s backend down to a ~0.4 s 502; a shared-dict counter giving an
   exact 5/5 round-robin split of real traffic). Engine-level unit test `balancer_lua_phase_stashes_peer_on_ctx`.
@@ -235,11 +236,20 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Variables: `ngx.var` (metatable-backed nginx variables read off the live request) — `$uri /
   $request_uri / $args / $query_string / $is_args / $method→request_method / $scheme / $host /
   $remote_addr / $remote_port / $server_port / $content_type / $status / $body_bytes_sent /
-  $request_length / $http_<name> (request header) / $sent_http_<name> (response header)`, all returned
+  $request_length / $http_<name> (request header) / $sent_http_<name> (response header) /
+  $upstream_addr / $upstream_status / $upstream_header_time(≡$upstream_response_time)`, all returned
   as strings with `nil` for undefined vars (OpenResty semantics). `$uri` (rewrites the path) and
   `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
   checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
   `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`.
+- Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
+  writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
+  failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into
+  `$upstream_header_time`. These surface to Lua through `ngx.var` (above) so `log_by_lua` can harvest
+  per-request upstream timing/status. Verified by `tools/upstream_e2e.py` (10 checks: `$upstream_addr`
+  = the live backend, a backend-emitted 503 is both passed through and logged as `$upstream_status=503`,
+  and a 0.6s backend yields `$upstream_header_time ≥ 0.55` — real round-trip, not a placeholder) +
+  unit test `forward_records_upstream_metrics_on_failure`.
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
   against RFC 1321 / RFC 2202 / FIPS 180-4 / the CRC-32 `0xCBF43926` vector
@@ -497,6 +507,8 @@ Remaining tradeoffs / roadmap:
   connection and all receive variants run over it (`tools/sock_tls_e2e.py`). Still open:
   `ngx.location.capture`'s `share_all_vars`/`ctx` option passing remain open. `balancer_by_lua` +
   `ngx.balancer` is now implemented (see the API section and `tools/balancer_e2e.py`); its remaining
-  gap is per-retry-attempt re-execution and `send`-timeout / `set_upstream_*` log-variable enforcement.
+  gap is per-retry-attempt re-execution and `send`-timeout / `ngx.balancer.set_upstream_*` override
+  APIs. The `$upstream_addr / $upstream_status / $upstream_header_time` log variables are recorded by
+  the proxy path and exposed through `ngx.var` (`tools/upstream_e2e.py`).
 - **`ngx.sleep` inside `ngx.timer` callbacks**: timer callbacks run synchronously under the VM lock,
   outside a scheduler coroutine, so `ngx.sleep` there is not yet a yield point (request-phase Lua is).

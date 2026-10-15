@@ -827,6 +827,9 @@ async fn handle_request(
         balancer_timeouts: None,
         balancer_more_failures: None,
         balancer_recreate_request: false,
+        upstream_addr: String::new(),
+        upstream_status: 0,
+        upstream_header_time: 0.0,
     };
 
     // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
@@ -1027,6 +1030,9 @@ pub async fn run_capture(
         balancer_timeouts: None,
         balancer_more_failures: None,
         balancer_recreate_request: false,
+        upstream_addr: String::new(),
+        upstream_status: 0,
+        upstream_header_time: 0.0,
     };
 
     let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None)).await;
@@ -2316,6 +2322,9 @@ async fn handle_upgrade(
         balancer_timeouts: None,
         balancer_more_failures: None,
         balancer_recreate_request: false,
+        upstream_addr: String::new(),
+        upstream_status: 0,
+        upstream_header_time: 0.0,
     };
 
     let timeouts = ProxyTimeouts {

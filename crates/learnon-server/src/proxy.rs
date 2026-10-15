@@ -161,7 +161,7 @@ impl ProxyEngine {
     /// 与 upstream 名匹配时走负载均衡，否则当作 host:port 直连。
     pub async fn forward(
         &self,
-        ctx: &RequestCtx,
+        ctx: &mut RequestCtx,
         target: &str,
         loc_prefix: &str,
         opts: &ProxyOpts<'_>,
@@ -345,14 +345,20 @@ impl ProxyEngine {
             *req.headers_mut() = headers.clone();
 
             let client = self.client(eff_connect, keepalive, opts.tls, is_https)?;
+            // 记录本次尝试选定的后端（供 $upstream_addr，重试时覆盖为最后尝试的节点）
+            ctx.upstream_addr = backend.clone();
             // 整体作为"连接+发送+等响应头"一次等待；read 超时单独判定以便区分错误类型
+            let t0 = std::time::Instant::now();
             match tokio::time::timeout(eff_read, client.request(req)).await {
                 Ok(Ok(r)) => {
                     note(&guard_holder, true);
+                    ctx.upstream_status = r.status().as_u16();
+                    ctx.upstream_header_time = t0.elapsed().as_secs_f64();
                     return Ok(r);
                 }
                 Ok(Err(e)) => {
                     note(&guard_holder, false);
+                    ctx.upstream_status = 0;
                     last_err = format!("代理请求失败 {backend}: {e} | 根因: {}", error_root(&e));
                     if idempotent && on_error && attempt + 1 < max_attempts {
                         continue;
@@ -361,6 +367,7 @@ impl ProxyEngine {
                 }
                 Err(_) => {
                     note(&guard_holder, false);
+                    ctx.upstream_status = 0;
                     last_err = format!("proxy_read_timeout ({:?}) 超时: {backend}", eff_read);
                     if idempotent && on_timeout && attempt + 1 < max_attempts {
                         continue;
@@ -732,6 +739,9 @@ mod tests {
             balancer_timeouts: None,
             balancer_more_failures: None,
             balancer_recreate_request: false,
+            upstream_addr: String::new(),
+            upstream_status: 0,
+            upstream_header_time: 0.0,
         }
     }
 
@@ -847,7 +857,7 @@ mod tests {
     async fn https_backend_needs_trusted_cert_when_verify_on() {
         let pool = Arc::new(UpstreamPool::default());
         let e = ProxyEngine::new(pool);
-        let c = ctx();
+        let mut c = ctx();
         // 纯 Rust 离线构建未链接系统根库：verify on 且无 CA 束应给出明确错误，
         // 而非静默连上或裸 TLS 失败。
         let tls = TlsPolicy {
@@ -864,10 +874,38 @@ mod tests {
             tls: &tls,
         };
         let err = e
-            .forward(&c, "https://example.com", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(&mut c, "https://example.com", "/api", &opts, ProxyBody::Buffered(None))
             .await
             .unwrap_err();
         assert!(err.contains("proxy_ssl_trusted_certificate"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn forward_records_upstream_metrics_on_failure() {
+        // 直连一个无监听端口 → forward 返回 Err，但 ctx 仍记录被试后端与 status=0，
+        // 供 $upstream_addr / log_by_lua 观察（对照 nginx：失败也会记 upstream_addr）。
+        let pool = Arc::new(UpstreamPool::default());
+        let e = ProxyEngine::new(pool);
+        let mut c = ctx();
+        let tls = TlsPolicy {
+            verify: false,
+            ..Default::default()
+        };
+        let opts = ProxyOpts {
+            set_headers: &[],
+            timeouts: ProxyTimeouts {
+                connect: Duration::from_millis(300),
+                read: Duration::from_millis(300),
+            },
+            next_upstream: &[],
+            tls: &tls,
+        };
+        let r = e
+            .forward(&mut c, "http://127.0.0.1:1", "/api", &opts, ProxyBody::Buffered(None))
+            .await;
+        assert!(r.is_err(), "无监听端口应转发失败");
+        assert_eq!(c.upstream_addr, "127.0.0.1:1");
+        assert_eq!(c.upstream_status, 0);
     }
 
     #[test]
