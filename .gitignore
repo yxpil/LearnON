@@ -6,6 +6,7 @@
 /certs/
 /certs_scenario/
 /certs_https/
+/certs_mtls/
 
 # 运行日志
 /logs/

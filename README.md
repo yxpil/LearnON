@@ -70,7 +70,7 @@ all gateway logic is hand-written.
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
 | `proxy_cache` response caching | in-memory named zones, `proxy_cache_valid`/key/methods/min_uses, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
-| `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name`, TLS policy in the pool key | `proxy_tls.rs`, `proxy.rs` |
+| `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name` + `proxy_ssl_certificate`/`_certificate_key` (mTLS client cert), TLS policy incl. client cert in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
 | `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
@@ -401,7 +401,15 @@ Already done (previously listed as gaps, now implemented):
   cert is checked against), `proxy_ssl_server_name on|off`. The TLS policy is part of the pool key, so
   a `proxy_ssl_verify off` location can never leak its no-verify connector into another. Verified by
   `tools/https_backend_e2e.py` (GET/POST through a verified https backend, a `wss` 101 tunnel, and a
-  `verify on`-without-CA location that correctly 502s). **Limitations**: this is an offline, pure-Rust
+  `verify on`-without-CA location that correctly 502s). **Mutual TLS (client certs)**: `proxy_ssl_certificate
+  <path>` + `proxy_ssl_certificate_key <path>` make the gateway present a client certificate during the
+  upstream handshake (rustls `with_client_auth_cert`; the cert chain is parsed with `rustls_pemfile::certs`,
+  the key as PKCS8/RSA/EC), for backends that enforce `CERT_REQUIRED`. Both paths resolve relative to the
+  conf dir; the pair is folded into the pool fingerprint so an mTLS location never reuses a cert-less
+  connector (and vice-versa). Verified by `tools/mtls_upstream_e2e.py`: an https backend that requires a
+  client cert echoes the verified client CN back for GET and POST through `/mtls/`, while a cert-less
+  `/nomtls/` location against the same backend fails the handshake and 502s. **Limitations**: this is an
+  offline, pure-Rust
   build, so there is **no system trust store** — `proxy_ssl_verify on` requires an explicit
   `proxy_ssl_trusted_certificate`, and a missing one fails with a clear `proxy_ssl_trusted_certificate`
   error rather than a silent accept; ALPN is pinned to `http/1.1` (no h2 upstreams); the proxy

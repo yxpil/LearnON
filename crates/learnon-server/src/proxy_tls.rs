@@ -129,6 +129,10 @@ pub struct TlsPolicy {
     pub server_name: Option<String>,
     /// `proxy_ssl_trusted_certificate <path>`：PEM CA 束，构建根证书库。
     pub trusted_cert: Option<String>,
+    /// `proxy_ssl_certificate <path>`：客户端证书链 PEM（向后端出示，实现 mTLS）。
+    pub client_cert: Option<String>,
+    /// `proxy_ssl_certificate_key <path>`：客户端私钥 PEM（PKCS8/RSA/EC）。
+    pub client_key: Option<String>,
 }
 
 impl Default for TlsPolicy {
@@ -138,6 +142,8 @@ impl Default for TlsPolicy {
             send_sni: true,
             server_name: None,
             trusted_cert: None,
+            client_cert: None,
+            client_key: None,
         }
     }
 }
@@ -152,20 +158,23 @@ impl TlsPolicy {
         self.send_sni.hash(&mut h);
         self.server_name.hash(&mut h);
         self.trusted_cert.hash(&mut h);
+        self.client_cert.hash(&mut h);
+        self.client_key.hash(&mut h);
         h.finish()
     }
 
     /// 构建 rustls 客户端配置。`verify on` 且无 trusted cert → 明确报错（本机未链接系统根库）。
+    /// 若同时给出 `proxy_ssl_certificate` + `proxy_ssl_certificate_key`，则向后端出示客户端证书（mTLS）。
     pub fn build_client_config(&self) -> Result<Arc<ClientConfig>, String> {
         let provider = Arc::new(default_provider());
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
             .map_err(|e| format!("TLS 协议版本配置失败: {e}"))?;
-        let mut cfg: ClientConfig = if !self.verify {
+        // 先得到"待选客户端证书"阶段的 builder（两种证书校验分支返回同一类型）。
+        let wants_cert = if !self.verify {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAll))
-                .with_no_client_auth()
         } else {
             let mut store = RootCertStore::empty();
             if let Some(path) = &self.trusted_cert {
@@ -184,9 +193,32 @@ impl TlsPolicy {
                         .to_string(),
                 );
             }
-            builder
-                .with_root_certificates(store)
-                .with_no_client_auth()
+            builder.with_root_certificates(store)
+        };
+        // 客户端证书（mTLS）：两者都给才启用；缺任一按 nginx 语义忽略客户端证书（只服务端认证）。
+        let mut cfg: ClientConfig = match (&self.client_cert, &self.client_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_data = std::fs::read(cert_path)
+                    .map_err(|e| format!("读取 proxy_ssl_certificate {cert_path} 失败: {e}"))?;
+                let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+                let mut cur = cert_data.as_slice();
+                for c in rustls_pemfile::certs(&mut cur) {
+                    certs.push(c.map_err(|e| format!("解析客户端证书 PEM 失败: {e}"))?);
+                }
+                if certs.is_empty() {
+                    return Err(format!("proxy_ssl_certificate {cert_path} 未含任何证书"));
+                }
+                let key_data = std::fs::read(key_path)
+                    .map_err(|e| format!("读取 proxy_ssl_certificate_key {key_path} 失败: {e}"))?;
+                let mut kcur = key_data.as_slice();
+                let key = rustls_pemfile::private_key(&mut kcur)
+                    .map_err(|e| format!("解析客户端私钥 PEM 失败: {e}"))?
+                    .ok_or_else(|| "proxy_ssl_certificate_key 未含可用私钥（PKCS8/RSA/EC）".to_string())?;
+                wants_cert
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| format!("配置客户端证书失败: {e}"))?
+            }
+            _ => wants_cert.with_no_client_auth(),
         };
         // 只谈 HTTP/1.1：hyper legacy 客户端只说 h1，ALPN 必须与之相符。
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -355,5 +387,75 @@ impl tower_service::Service<Uri> for ProxyConnector {
                 })?;
             Ok(ProxyStream::Tls(Box::new(stream)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用 rcgen 生成一对自签（证书+私钥）写入临时目录，返回路径。
+    fn write_client_pair(dir: &std::path::Path, tag: &str) -> (String, String) {
+        let cert = rcgen::generate_simple_self_signed(vec!["client.test".to_string()])
+            .expect("rcgen 生成客户端证书");
+        let cp = dir.join(format!("{tag}-cert.pem"));
+        let kp = dir.join(format!("{tag}-key.pem"));
+        std::fs::write(&cp, cert.cert.pem()).unwrap();
+        std::fs::write(&kp, cert.key_pair.serialize_pem()).unwrap();
+        (
+            cp.to_string_lossy().into_owned(),
+            kp.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("learnon-mtls-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn mtls_client_cert_config_builds_and_splits_pool() {
+        let dir = tmp_dir("build");
+        let (cp, kp) = write_client_pair(&dir, "c");
+        // verify off + 客户端证书 → 应能构建（走 with_client_auth_cert）
+        let policy = TlsPolicy {
+            verify: false,
+            client_cert: Some(cp.clone()),
+            client_key: Some(kp.clone()),
+            ..Default::default()
+        };
+        assert!(policy.build_client_config().is_ok(), "mTLS 客户端配置应构建成功");
+
+        // 仅差客户端证书的策略，指纹必须不同（否则会串池）
+        let plain = TlsPolicy {
+            verify: false,
+            ..Default::default()
+        };
+        assert_ne!(plain.fingerprint(), policy.fingerprint());
+
+        // 只给 cert 不给 key → 按 nginx 语义忽略客户端证书（仍能构建，走 no_client_auth）
+        let cert_only = TlsPolicy {
+            verify: false,
+            client_cert: Some(cp),
+            client_key: None,
+            ..Default::default()
+        };
+        assert!(cert_only.build_client_config().is_ok());
+        // 且与两者皆无的指纹不同（cert 路径已参与指纹）
+        assert_ne!(plain.fingerprint(), cert_only.fingerprint());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtls_missing_client_cert_file_errors() {
+        let policy = TlsPolicy {
+            verify: false,
+            client_cert: Some("no-such-client-cert.pem".into()),
+            client_key: Some("no-such-client-key.pem".into()),
+            ..Default::default()
+        };
+        let err = policy.build_client_config().unwrap_err();
+        assert!(err.contains("proxy_ssl_certificate"), "{err}");
     }
 }

@@ -396,6 +396,14 @@ fn parse_proxy_ssl_directives(
         let p = crate::resolve_path(v, base_dir);
         policy.trusted_cert = Some(p.to_string_lossy().into_owned());
     }
+    if let Some(v) = d.find("proxy_ssl_certificate").and_then(|x| x.arg(0)) {
+        let p = crate::resolve_path(v, base_dir);
+        policy.client_cert = Some(p.to_string_lossy().into_owned());
+    }
+    if let Some(v) = d.find("proxy_ssl_certificate_key").and_then(|x| x.arg(0)) {
+        let p = crate::resolve_path(v, base_dir);
+        policy.client_key = Some(p.to_string_lossy().into_owned());
+    }
 }
 
 /// `proxy_cache*` 指令的解析产物：字段用 Option 表示"本块是否显式指定"，
@@ -716,6 +724,7 @@ impl Router {
                    "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
                    "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
                    "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
+                   "proxy_ssl_certificate", "proxy_ssl_certificate_key",
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version", "ssl_protocols",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
@@ -1130,6 +1139,7 @@ impl Router {
                "proxy_request_buffering",
                "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
                "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
+                   "proxy_ssl_certificate", "proxy_ssl_certificate_key",
                "root",
                "alias", "index", "try_files", "autoindex", "error_page", "add_header",
                "limit_req", "internal", "client_max_body_size", "content_by_lua",
