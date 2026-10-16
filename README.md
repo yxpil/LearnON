@@ -78,6 +78,7 @@ all gateway logic is hand-written.
 | `sub_filter <m> <r>;` response rewrite | literal + `~`/`~*` regex match, `&` back-reference in the replacement, `sub_filter_once`/`sub_filter_types`, applied on buffered proxy/cache/static/Lua bodies | `engine.rs`, `server.rs`, `router.rs` |
 | `set_real_ip_from` + `real_ip_header`/`real_ip_recursive` | realip module: trust the client IP from a header only when the direct peer is in a trusted CIDR, XFF chain right-most (off) / recursive-trusted-skip (on); overrides `$remote_addr` before geo/limit/auth | `realip.rs`, `router.rs`, `server.rs` |
 | `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path` | rewrite upstream `Location`/`Refresh` (literal prefix, `~regex` with captures, or `default` = origin→location-prefix relative form) and `Set-Cookie` `domain=`/`path=` (literal/regex, `none` deletes, path prefix-preserving); applied on both proxy seams (streaming + buffered), multi `Set-Cookie` preserved | `resp_rewrite.rs`, `router.rs`, `server.rs` |
+| `stream { server { … } }` L4 proxy + `ssl_preread` | byte-transparent TCP tunnel (no TLS termination, no protocol parsing); optional `ssl_preread` peeks the first TLS record and parses SNI from the ClientHello (a self-contained offset-walk, best-effort: non-TLS/incomplete/no-SNI still wires to the default), routing by `sni_match <name> <target>` (exact or `*.suffix` single-label wildcard; target = named `upstream` reusing the L7 pool, or a literal `host:port`), falling back to `proxy_pass`; peeked bytes are replayed to the backend so the handshake is untouched; separate accept loop shares only the shutdown signal + upstream pool with HTTP | `stream.rs`, `router.rs`, `main.rs` |
 | `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
@@ -114,6 +115,7 @@ rust/
             ├── shared_dict.rs # ngx.shared.DICT shared dict
             ├── lua_engine.rs# Lua VM + ngx.* API
             ├── access_log.rs# combined access log
+            ├── stream.rs    # L4 stream{} proxy + ssl_preread SNI routing (byte-transparent TCP)
             └── server.rs    # HTTP pipeline: rewrite -> access -> content -> log
 ```
 
@@ -344,6 +346,23 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   capture, `none` deleting `domain` across **two** Set-Cookie that both survive, the all-`off` pass-through
   control, and the buffered `sub_filter` seam rewriting headers while leaving the body byte-exact) + pure
   unit tests in `resp_rewrite.rs` and router tests `parse_proxy_redirect_and_cookie_directives`.
+- L4 `stream{}` proxy + `ssl_preread` — a transport-layer path entirely separate from the HTTP request core
+  (`stream.rs`). Each `stream { server { … } }` block binds its own TCP listener with its own accept loop and
+  shares only the shutdown signal and the upstream pool with L7. A client connection is wired byte-for-byte to
+  a backend — **no TLS termination, no protocol parsing** — so any TCP protocol passes through. With
+  `ssl_preread on;`, the first TLS record is peeked (bounded by `preread_timeout`, capped at 16KB) and the SNI
+  is extracted from the ClientHello by a self-contained offset walk over the record/handshake/extension
+  headers; a non-TLS, truncated or SNI-less hello simply yields `None` and still wires to the default. Routing
+  uses `sni_match <name> <target>` (repeatable, first match wins; `name` is an exact case-insensitive host or a
+  `*.suffix` wildcard matching exactly one extra label, so `*.e.com` hits `a.e.com` but not `e.com`/`x.y.e.com`),
+  and the target is a named `upstream` (reusing the L7 weighted-RR/health-check pool via `acquire`) or a literal
+  `host:port`; no match falls back to `proxy_pass`. The peeked prefix is replayed to the backend before relaying,
+  so the handshake is never disturbed, and `relay` splits each direction onto its own task with an idle
+  (`proxy_timeout`) bound. Verified by `tools/stream_ssl_preread_e2e.py` (6 checks driven by **real Python TLS
+  clients**: full handshake through the tunnel proves byte transparency, exact SNI `alpha.test` → the named
+  upstream, wildcard `foo.wild.test` → `*.wild.test` backend, `wild.test`/`a.b.wild.test` correctly *not* matched
+  and `other.test` unmatched all fall back to `proxy_pass`, plus a no-preread plain TCP echo) + pure unit tests in
+  `stream.rs` (ClientHello SNI parse, truncation/garbage → `None`, exact+wildcard matcher, first-match-wins).
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into

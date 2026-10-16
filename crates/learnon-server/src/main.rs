@@ -39,6 +39,7 @@ mod server;
 mod settings;
 mod shared_dict;
 mod sockpool;
+mod stream;
 mod tls;
 mod upstream;
 
@@ -341,7 +342,9 @@ async fn run(
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();
-    if listener_specs.is_empty() {
+    let stream_specs: Vec<Arc<router::StreamServer>> =
+        router.stream.clone().into_iter().map(Arc::new).collect();
+    if listener_specs.is_empty() && stream_specs.is_empty() {
         return Err(AppError::Other("配置中没有任何 listen 指令".into()));
     }
 
@@ -372,6 +375,22 @@ async fn run(
                 // 已经绑定成功的先关掉（随进程退出释放），错误信息里带上是哪一个
                 return Err(e);
             }
+        }
+    }
+    // 四层 stream 监听：合成一个纯 TCP Listener（无 TLS/h2/quic），同样先绑定再服务。
+    let mut bound_stream: Vec<(Arc<router::StreamServer>, tokio::net::TcpListener)> = Vec::new();
+    for s in &stream_specs {
+        let l = router::Listener {
+            addr: s.listen,
+            tls: None,
+            http2: false,
+            quic: false,
+            backlog: None,
+            ipv6only: None,
+        };
+        match server::bind_listener(&l, settings.accept_backlog) {
+            Ok(tcp) => bound_stream.push((Arc::clone(s), tcp)),
+            Err(e) => return Err(e),
         }
     }
 
@@ -437,10 +456,15 @@ async fn run(
         }
         tasks.spawn(server::serve(state, l, tcp, rx.clone()));
     }
+    // 四层 stream 隧道：与 HTTP 共用停机信号，接受同一个 shutdown watch。
+    for (s, tcp) in bound_stream {
+        tasks.spawn(stream::serve_stream(Arc::clone(&pool), s, tcp, rx.clone()));
+    }
 
     println!(
-        "[learnon] 启动完成：{} 个监听，{workers} 个 worker 线程，配置 {conf_display}",
-        listener_specs.len()
+        "[learnon] 启动完成：{} 个监听（含 {} 个 stream），{workers} 个 worker 线程，配置 {conf_display}",
+        listener_specs.len() + stream_specs.len(),
+        stream_specs.len()
     );
     for line in state.routing().describe_listeners() {
         log_info!("监听 {line}");

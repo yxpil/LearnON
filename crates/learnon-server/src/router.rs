@@ -195,6 +195,43 @@ pub struct Listener {
     pub ipv6only: Option<bool>,
 }
 
+/// `stream{}` 里一条 SNI 路由：命中 pattern（精确或 `*.suffix` 通配）→ 转发到 target。
+#[derive(Debug, Clone)]
+pub struct SniMatch {
+    pub pattern: String,
+    pub target: String,
+}
+
+/// 顶层 `stream{ server{...} }` 解析出的一条四层监听配置（由 stream.rs 在运行时消费）。
+#[derive(Debug, Clone)]
+pub struct StreamServer {
+    pub listen: SocketAddr,
+    pub ssl_preread: bool,
+    pub sni_matches: Vec<SniMatch>,
+    /// `proxy_pass` 的默认目标（命名 upstream 或 host:port）；也是 SNI 未命中的回落。
+    pub default_target: Option<String>,
+    pub connect_timeout: std::time::Duration,
+    /// 空闲超时（任一方向无活动超过它即断开；0=不限）。
+    pub proxy_timeout: std::time::Duration,
+    /// 窥探 ClientHello 的读超时。
+    pub pread_timeout: std::time::Duration,
+}
+
+impl Default for StreamServer {
+    fn default() -> Self {
+        use std::time::Duration;
+        StreamServer {
+            listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            ssl_preread: false,
+            sni_matches: Vec::new(),
+            default_target: None,
+            connect_timeout: Duration::from_secs(60),
+            proxy_timeout: Duration::from_secs(600),
+            pread_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// 某监听地址上的一组虚拟主机；`servers[0]` 是默认 vhost
 #[derive(Debug)]
 pub struct AddrGroup {
@@ -206,6 +243,8 @@ pub struct Router {
     pub groups: HashMap<SocketAddr, AddrGroup>,
     pub listeners: Vec<Listener>,
     pub warnings: Vec<String>,
+    /// 顶层 `stream{}` 解析出的四层监听配置（HTTP 路由之外，由 stream.rs 独立服务）。
+    pub stream: Vec<StreamServer>,
 }
 
 /// 一个 server 块里除 listen 之外的所有配置模板
@@ -886,11 +925,93 @@ impl Router {
             ));
         }
 
+        let stream = Self::parse_streams(config, &mut warnings)?;
+
         Ok(Router {
             groups: out_groups,
             listeners: listener_override.unwrap_or(listeners),
             warnings,
+            stream,
         })
+    }
+
+    /// 解析顶层 `stream { server { listen …; proxy_pass …; [ssl_preread on;] [sni_match …;] } }`。
+    /// 每个 stream server 的每条 listen 生成一个 `StreamServer`（四层，独立于 HTTP 路由）。
+    fn parse_streams(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<StreamServer>, AppError> {
+        let mut out = Vec::new();
+        for sd in config.root.block.iter().filter(|d| d.name == "stream") {
+            for srv in sd.block.iter().filter(|x| x.name == "server") {
+                Self::warn_unknown(
+                    srv,
+                    &["listen", "ssl_preread", "proxy_pass", "sni_match",
+                       "proxy_connect_timeout", "proxy_timeout", "preread_timeout"],
+                    "stream server",
+                    warnings,
+                );
+                let mut base = StreamServer::default();
+                for v in srv.block.iter().filter(|x| x.name == "ssl_preread").take(1) {
+                    match v.arg(0).and_then(parse_on_off) {
+                        Some(b) => base.ssl_preread = b,
+                        None => warnings.push(format!(
+                            "ssl_preread 需要 on|off，已忽略 '{:?}'（第 {} 行）",
+                            v.arg(0), v.line
+                        )),
+                    }
+                }
+                base.default_target = srv
+                    .block
+                    .iter()
+                    .find(|x| x.name == "proxy_pass")
+                    .and_then(|x| x.arg(0))
+                    .map(|s| s.trim_matches('"').to_string());
+                for m in srv.block.iter().filter(|x| x.name == "sni_match") {
+                    match (m.arg(0), m.arg(1)) {
+                        (Some(p), Some(t)) => base
+                            .sni_matches
+                            .push(SniMatch { pattern: p.trim_matches('"').to_string(), target: t.trim_matches('"').to_string() }),
+                        _ => warnings.push(format!(
+                            "sni_match 需要 <name> <target> 两个参数（第 {} 行）",
+                            m.line
+                        )),
+                    }
+                }
+                for (name, slot) in [
+                    ("proxy_connect_timeout", &mut base.connect_timeout),
+                    ("proxy_timeout", &mut base.proxy_timeout),
+                    ("preread_timeout", &mut base.pread_timeout),
+                ] {
+                    if let Some(v) = srv.block.iter().find(|x| x.name == name).and_then(|x| x.arg(0)) {
+                        match crate::settings::parse_duration(v) {
+                            Some(d) => *slot = d,
+                            None => warnings.push(format!("{name} 时间值无法解析 '{v}'（已忽略）")),
+                        }
+                    }
+                }
+                let mut listens: Vec<SocketAddr> = Vec::new();
+                for l in srv.block.iter().filter(|x| x.name == "listen") {
+                    let (addr, _flags) = parse_listen(l)?;
+                    listens.push(addr);
+                }
+                if listens.is_empty() {
+                    return Err(AppError::Other(format!(
+                        "stream server（第 {} 行）没有 listen 指令",
+                        srv.line
+                    )));
+                }
+                for addr in listens {
+                    let mut s = base.clone();
+                    s.listen = addr;
+                    if s.default_target.is_none() && s.sni_matches.is_empty() {
+                        return Err(AppError::Other(format!(
+                            "stream {addr}（第 {} 行）既无 proxy_pass 也无 sni_match，无转发目标",
+                            srv.line
+                        )));
+                    }
+                    out.push(s);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// 未知指令告警：拼错的指令静默失效是网关最难排查的一类故障
